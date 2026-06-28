@@ -1,0 +1,18 @@
+{
+  "name": "tps-kanban",
+  "version": "0.0.1",
+  "description": "TPS Kanban (Dev) - simple kanban plugin",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "node --test scripts/test-tps-contracts.mjs && node --test scripts/test-kanban-utils.mjs && npm run build"
+  },
+  "devDependencies": {
+    "builtin-modules": "3.3.0",
+    "esbuild": "^0.19.3",
+    "obsidian": "latest",
+    "typescript": "~5.3.0"
+  }
+}
