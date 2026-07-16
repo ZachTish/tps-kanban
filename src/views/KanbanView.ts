@@ -5,10 +5,30 @@ import { openNativeNotePreview } from '../preview';
 import {
   extractGroupValues as extractKanbanGroupValues,
   getFrontmatterPropNameFromId as getKanbanFrontmatterPropNameFromId,
-  normalizeGroupToken as normalizeKanbanGroupToken,
 } from '../kanban-utils';
-import { TPS_EVENTS, TPS_LEGACY_EVENTS } from '../tps-contracts';
+import {
+  buildKanbanRootTaskLine,
+  normalizeKanbanTaskTargetPath,
+  resolveKanbanLaneAddPresentation,
+  resolveKanbanRootTaskTargetPath,
+} from '../task-creation-utils';
+import {
+  getKanbanCheckboxStateForStatus,
+  getKanbanStatusForCheckboxState,
+  getKanbanToggleCheckboxState,
+  normalizeKanbanCheckboxState,
+  replaceKanbanTaskLineCheckboxState,
+} from '../task-checkbox-utils';
+import {
+  buildKanbanTaskDropLine,
+  normalizeKanbanWritableTaskTag,
+  parseKanbanLineItem,
+} from '../task-drop-utils';
 import { emitFilesUpdated, shouldForceBaseLinkPreview } from '../tps-gcm-api';
+import { flow, flowError, flowWarn } from '../logger';
+import { isBareSemanticKindFilter, parseBareSemanticKindExpression } from '../filter-kind-utils';
+import { composeEffectiveFilterRoots, extractPersistedFilterRoots } from '../base-filter-roots';
+import { getMarkdownIndentColumns } from '../task-indent-utils';
 
 export const KANBAN_VIEW_TYPE = 'tps-kanban';
 
@@ -24,6 +44,20 @@ type TaskRenderItem = {
   file: TFile;
   task: OpenTaskSubitem;
   laneId: string;
+};
+
+type TpsSortDescriptor = {
+  prop: string;
+  direction: 'asc' | 'desc';
+};
+
+type TaskPropertyDisplay = {
+  text: string;
+  title?: string;
+  kind?: string;
+  editable?: boolean;
+  propName?: string;
+  rawValue?: string;
 };
 
 type ActiveTaskPointerDrag = {
@@ -70,6 +104,8 @@ type OpenTaskSubitem = {
   itemKind?: 'task' | 'bullet';
   internalId?: string;
   line: number;
+  indent?: number;
+  parentLine?: number;
   checkboxState?: string;
   text: string;
   displayText?: string;
@@ -182,6 +218,7 @@ class LaneRenameModal extends Modal {
   }
 
   onOpen(): void {
+    this.modalEl.addClass("tps-keyboard-aware-modal");
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl('h3', { text: `Rename lane: ${this.baseLabel}` });
@@ -250,6 +287,7 @@ class TaskDropConfirmModal extends Modal {
   }
 
   onOpen(): void {
+    this.modalEl.addClass("tps-keyboard-aware-modal");
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl('h3', { text: this.title });
@@ -309,6 +347,7 @@ class LaneValueSelectModal extends Modal {
   }
 
   onOpen(): void {
+    this.modalEl.addClass("tps-keyboard-aware-modal");
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl('h3', { text: this.titleText });
@@ -360,6 +399,7 @@ class TaskTitleModal extends Modal {
   }
 
   onOpen(): void {
+    this.modalEl.addClass("tps-keyboard-aware-modal");
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl('h3', { text: `Add task to ${this.cardTitle}` });
@@ -470,14 +510,26 @@ export class KanbanView extends BasesView {
     baseFileName?: string,
     frontmatterProcessor?: (frontmatter: Record<string, unknown>) => void,
   ): Promise<void> {
+    if (this.runCreateCommandOverride()) return;
     const taskFilter = this.getTaskRootFilterFromBaseFilters();
-    if (taskFilter.mode === 'tasks') {
+    flow('CreateFile', 'start', {
+      baseFileName: baseFileName || '',
+      taskFilterMode: taskFilter.mode,
+      viewType: this.type,
+      viewName: this.getConfiguredBaseViewName(),
+    });
+    if (this.getPriorityResolvedCreationMode(taskFilter) === 'tasks') {
+      flow('CreateFile', 'route-root-task', {
+        reason: 'task-filter-mode',
+        viewName: this.getConfiguredBaseViewName(),
+      });
       await this.createRootTaskForLane(null, { id: 'ungrouped', label: 'Ungrouped', groups: [], laneIds: ['ungrouped'] }, taskFilter);
       return;
     }
 
     const creationDefaults = this.getNoteCreationDefaultsFromBaseFilters();
     if (!baseFileName && creationDefaults.blockedReason) {
+      flowWarn('CreateFile', 'blocked', { reason: creationDefaults.blockedReason });
       new Notice(creationDefaults.blockedReason);
       return;
     }
@@ -485,16 +537,106 @@ export class KanbanView extends BasesView {
       Object.assign(frontmatter, creationDefaults.frontmatter);
       frontmatterProcessor?.(frontmatter);
     };
+    flow('CreateFile', 'route-note', {
+      baseFileName: baseFileName ?? creationDefaults.baseFileName ?? '',
+      defaultKeys: Object.keys(creationDefaults.frontmatter || {}),
+    });
     await super.createFileForView(baseFileName ?? creationDefaults.baseFileName ?? undefined, mergedProcessor);
   }
 
   private resolveCardAddMode(taskFilter: KanbanTaskRootFilter = this.getTaskRootFilterFromBaseFilters()): 'note' | 'task' {
-    const forcedMode = taskFilter.mode === 'tasks'
+    const priorityMode = this.getPriorityResolvedCreationMode(taskFilter);
+    const forcedMode = priorityMode === 'tasks'
       ? 'task'
-      : taskFilter.mode === 'notes'
+      : priorityMode === 'notes'
         ? 'note'
         : null;
     return forcedMode ?? (this.plugin.settings?.cardAddButtonDefault ?? 'note');
+  }
+
+  private getPriorityResolvedCreationMode(taskFilter: KanbanTaskRootFilter): TaskCreationDefaults['mode'] {
+    for (const root of this.getBaseFilterRoots()) {
+      const mode = this.inferPriorityCreationModeFromFilterNode(root);
+      if (mode) return mode;
+    }
+    return taskFilter.mode;
+  }
+
+  private inferPriorityCreationModeFromFilterNode(node: unknown): TaskCreationDefaults['mode'] | null {
+    if (!node) return null;
+    if (typeof node === 'string') {
+      if (parseBareSemanticKindExpression(node)) return 'notes';
+      const match = node.trim().match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=|is|equals?)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
+      const value = String(match?.[1] || '').toLowerCase();
+      return value.startsWith('task') ? 'tasks'
+        : value.startsWith('bullet') ? 'bullets'
+          : value.startsWith('note') ? 'notes'
+            : value ? 'mixed' : null;
+    }
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const mode = this.inferPriorityCreationModeFromFilterNode(child);
+        if (mode) return mode;
+      }
+      return null;
+    }
+    if (typeof node !== 'object') return null;
+    const record = node as Record<string, unknown>;
+    for (const branchKey of ['or', 'any']) {
+      if (!Object.prototype.hasOwnProperty.call(record, branchKey)) continue;
+      for (const child of this.asArray(record[branchKey])) {
+        const mode = this.inferPriorityCreationModeFromFilterNode(child);
+        if (mode) return mode;
+      }
+      return null;
+    }
+    for (const groupKey of ['and', 'all', 'filters', 'children', 'data']) {
+      if (!Object.prototype.hasOwnProperty.call(record, groupKey)) continue;
+      const mode = this.inferPriorityCreationModeFromFilterNode(record[groupKey]);
+      if (mode) return mode;
+    }
+    const propRaw = String(record.property ?? record.field ?? '').trim();
+    const values = this.readFilterObjectValues(record);
+    if (isBareSemanticKindFilter(propRaw, values)) return 'notes';
+    const normalizedProp = this.normalizeInlinePropertyKey(propRaw.replace(/^(?:tps|kanban)\./i, ''));
+    if (!['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) return null;
+    const value = String(values[0] || '').trim().toLowerCase();
+    return value.startsWith('task') ? 'tasks'
+      : value.startsWith('bullet') ? 'bullets'
+        : value.startsWith('note') ? 'notes'
+          : ['all', 'mixed'].includes(value) ? 'mixed' : null;
+  }
+
+  private getCreateCommandOverride(): { id: string; name: string } | null {
+    const rawAction = this.getConfigValue('createAction') ?? (this.getConfigValue('create') as any)?.action;
+    if (String(rawAction || '').trim().toLowerCase() !== 'command') return null;
+    const commandId = String(this.getConfigValue('createCommandId') ?? (this.getConfigValue('create') as any)?.commandId ?? '').trim();
+    if (!commandId) return null;
+    const commands = (this.app as any)?.commands;
+    const command = commands?.findCommand?.(commandId);
+    return { id: commandId, name: String(command?.name || commandId) };
+  }
+
+  private getConfigValue(key: string): unknown {
+    const getterValue = this.config?.get?.(key);
+    if (getterValue != null) return getterValue;
+    return (this.config as any)?.[key];
+  }
+
+  private runCreateCommandOverride(): boolean {
+    const command = this.getCreateCommandOverride();
+    if (!command) return false;
+    const commands = (this.app as any)?.commands;
+    if (typeof commands?.executeCommandById !== 'function') return false;
+    const executed = commands.executeCommandById(command.id);
+    if (!executed) new Notice(`Command not found: ${command.id}`);
+    flow('CreateCommandOverride', 'run', {
+      commandId: command.id,
+      executed: !!executed,
+      viewType: this.type,
+      viewName: this.getConfiguredBaseViewName(),
+    });
+    return true;
   }
 
   private getGcmApi(): any {
@@ -502,6 +644,7 @@ export class KanbanView extends BasesView {
   }
 
   private getGcmPlugin(): any {
+    if (this.plugin?.gcmPlugin) return this.plugin.gcmPlugin;
     const plugins = (this.app as any)?.plugins;
     return (
       plugins?.getPlugin?.('tps-global-context-menu') ||
@@ -569,6 +712,19 @@ export class KanbanView extends BasesView {
     return taskLineContextMenuService.handleContextMenu(evt);
   }
 
+  private openTaskQuickEditor(event: Event, taskEl: HTMLElement, sourceEl: HTMLElement | null = taskEl): boolean {
+    const plugin = this.getGcmPlugin();
+    const service = plugin?.taskLineContextMenuService || this.getGcmApi()?.taskLineContextMenuService;
+    if (typeof service?.openQuickEditorForElement !== 'function') return false;
+    event.preventDefault();
+    event.stopPropagation();
+    if ('stopImmediatePropagation' in event && typeof event.stopImmediatePropagation === 'function') {
+      event.stopImmediatePropagation();
+    }
+    void service.openQuickEditorForElement(taskEl, sourceEl);
+    return true;
+  }
+
   private getGcmSettings(): any {
     const plugin = this.getGcmPlugin();
     return plugin?.settings || this.getGcmApi()?.settings || null;
@@ -613,33 +769,11 @@ export class KanbanView extends BasesView {
   }
 
   private normalizeCheckboxState(rawState: string): string {
-    const raw = String(rawState ?? '').trim();
-    if (raw.startsWith('[') && raw.endsWith(']')) return raw;
-    return `[${raw}]`;
+    return normalizeKanbanCheckboxState(rawState);
   }
 
   private getStatusForCheckboxState(rawState: string): string {
-    const state = this.normalizeCheckboxState(rawState);
-    const mapping = this.getGcmCheckboxMappings().find((entry) => entry.checkboxState === state);
-    if (mapping?.statuses?.[0]) return mapping.statuses[0];
-    const marker = state.slice(1, -1).trim().toLowerCase();
-    if (!marker) return 'todo';
-    if (marker === 'x') return 'complete';
-    if (marker === '/' || marker === '\\') return 'working';
-    if (marker === '?') return 'holding';
-    if (marker === '-' || marker === '~') return 'wont-do';
-    return marker;
-  }
-
-  private getCheckboxIconName(rawState: string): string {
-    const state = this.normalizeCheckboxState(rawState);
-    const marker = state.slice(1, -1).trim().toLowerCase();
-    if (!marker) return 'square';
-    if (marker === 'x') return 'square-check-big';
-    if (marker === '/' || marker === '\\' || marker === '>') return 'square-play';
-    if (marker === '?' || marker === '!') return 'square-help';
-    if (marker === '-' || marker === '~') return 'square-minus';
-    return 'square-dot';
+    return getKanbanStatusForCheckboxState(rawState, this.getGcmCheckboxMappings());
   }
 
   private getLaneIdForStatus(status: string | null): string {
@@ -648,24 +782,11 @@ export class KanbanView extends BasesView {
   }
 
   private getCheckboxStateForStatus(rawStatus: string | null): string | null {
-    const status = String(rawStatus ?? '').trim().toLowerCase();
-    if (!status) return null;
-    const mapping = this.getGcmCheckboxMappings().find((entry) => entry.statuses.includes(status));
-    if (mapping?.checkboxState) return mapping.checkboxState;
-    if (status === 'complete') return '[x]';
-    if (status === 'working') return '[\\]';
-    if (status === 'holding') return '[?]';
-    if (status === 'wont-do') return '[-]';
-    if (status === 'todo') return '[ ]';
-    return null;
+    return getKanbanCheckboxStateForStatus(rawStatus, this.getGcmCheckboxMappings());
   }
 
   private getToggleCheckboxStateForTask(task: OpenTaskSubitem): string {
-    const currentState = this.normalizeCheckboxState(task.checkboxState || '[ ]');
-    const currentStatus = this.getStatusForCheckboxState(currentState);
-    const mapping = this.getGcmCheckboxMappings().find((entry) => entry.checkboxState === currentState || entry.statuses.includes(currentStatus));
-    const targetStatus = String(mapping?.toggleTargetStatus || '').trim().toLowerCase();
-    return this.getCheckboxStateForStatus(targetStatus) || (this.getDoneStatuses().has(currentStatus) ? '[ ]' : '[x]');
+    return getKanbanToggleCheckboxState(task.checkboxState || '[ ]', this.getGcmCheckboxMappings(), this.getDoneStatuses());
   }
 
   private async ensureParentSelfLink(parentFile: TFile): Promise<void> {
@@ -684,12 +805,12 @@ export class KanbanView extends BasesView {
   }
 
   private shouldPreviewCardClicks(): boolean {
-    return shouldForceBaseLinkPreview(this.app) || this.plugin.settings?.cardActivationMode === 'preview';
+    return shouldForceBaseLinkPreview(this.app);
   }
 
   private getBaseSourcePath(): string | null {
     const directFile = this.getRuntimeBaseFile();
-    if (directFile && this.getVirtualBaseEmbedHost()) return directFile.path;
+    if (directFile) return directFile.path;
 
     const activeFile = this.app.workspace.getActiveFile?.();
     if (this.isEmbeddedKanbanContext() && activeFile instanceof TFile && activeFile.extension === 'md') {
@@ -699,7 +820,6 @@ export class KanbanView extends BasesView {
     const embeddedMarkdownContext = this.getWorkspaceLeafMarkdownContextPath();
     if (embeddedMarkdownContext) return embeddedMarkdownContext;
 
-    if (directFile) return directFile.path;
     const controller: any = (this as any)?.controller;
     const queryController: any = (this as any)?.queryController;
     const sourcePath = [
@@ -736,6 +856,9 @@ export class KanbanView extends BasesView {
   }
 
   private getBaseContextFrontmatterValue(key: string): string | null {
+    const domContextValue = this.getDomBaseContextValue(key);
+    if (domContextValue) return domContextValue;
+
     const file = this.getBaseContextFile();
     if (!file) return null;
     const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
@@ -745,6 +868,14 @@ export class KanbanView extends BasesView {
     if (value == null) return null;
     if (value instanceof Date) return value.toISOString().slice(0, 10);
     return String(value).trim() || null;
+  }
+
+  private getDomBaseContextValue(key: string): string | null {
+    const normalizedKey = this.normalizeInlinePropertyKey(key);
+    if (normalizedKey !== 'scheduled') return null;
+    const host = this.containerEl?.closest('[data-tps-context-scheduled], [data-tps-context-date]') as HTMLElement | null;
+    const value = host?.dataset?.tpsContextScheduled || host?.dataset?.tpsContextDate || '';
+    return String(value || '').trim() || null;
   }
 
   private resolveBaseContextToken(rawValue: unknown): string | null {
@@ -796,10 +927,6 @@ export class KanbanView extends BasesView {
       }
     });
     return found;
-  }
-
-  private getVirtualBaseEmbedHost(): HTMLElement | null {
-    return this.containerEl?.closest('.tps-gcm-virtual-base-embed') as HTMLElement | null;
   }
 
   private getEmbeddedBasePathFromDom(): string | null {
@@ -956,10 +1083,16 @@ export class KanbanView extends BasesView {
         filters: extracted.filters,
       };
       if (previous?.path !== file.path || previous?.mtime !== mtime || previous?.viewName !== extracted.viewName || previous?.filters !== extracted.filters) {
+        flow('BaseFilters', 'loaded', {
+          path: file.path,
+          viewName: extracted.viewName,
+          viewCount: extracted.viewNames.length,
+          filterRoots: extracted.filters?.length || 0,
+        });
         this.refreshDebounced();
       }
     } catch (error) {
-      console.warn('[TPS Kanban] Failed to read base filters', file.path, error);
+      flowError('BaseFilters', 'read-failed', error, { path: file.path, viewName });
       this.baseFileFilterCache = { path: file.path, mtime, viewName, viewNames: [], filters: null };
     } finally {
       if (this.baseFileFiltersLoadingKey === loadingKey) this.baseFileFiltersLoadingKey = null;
@@ -970,29 +1103,7 @@ export class KanbanView extends BasesView {
     parsed: Record<string, unknown> | null | undefined,
     fallbackViewName = this.getCurrentBaseViewName(),
   ): { viewName: string; viewNames: string[]; filters: unknown[] | null } {
-    if (!parsed || typeof parsed !== 'object') return { viewName: fallbackViewName, viewNames: [], filters: null };
-    const roots: unknown[] = [];
-    const matchedViewFilters: unknown[] = [];
-
-    const views = Array.isArray(parsed.views) ? parsed.views : [];
-    const viewNames = views
-      .map((view) => typeof view === 'object' && view ? String((view as Record<string, unknown>).name || '').trim() : '')
-      .filter(Boolean);
-    const currentViewName = fallbackViewName || viewNames[0] || '';
-    for (const view of views) {
-      if (!view || typeof view !== 'object') continue;
-      const viewRecord = view as Record<string, unknown>;
-      const viewType = String(viewRecord.type || '').trim();
-      if (viewType !== KANBAN_VIEW_TYPE && viewType !== 'tps-kanban') continue;
-      const viewName = String(viewRecord.name || '').trim();
-      if (currentViewName && viewName && viewName !== currentViewName) continue;
-      if (viewRecord.filters) matchedViewFilters.push(viewRecord.filters);
-    }
-
-    if (matchedViewFilters.length) roots.push(...matchedViewFilters);
-    if (parsed.filters) roots.push(parsed.filters);
-
-    return { viewName: currentViewName, viewNames, filters: roots.length ? roots : null };
+    return extractPersistedFilterRoots(parsed, fallbackViewName, new Set([KANBAN_VIEW_TYPE, 'tps-kanban']));
   }
 
   private getCurrentBaseViewName(knownViewNames?: Set<string>): string {
@@ -1424,6 +1535,7 @@ export class KanbanView extends BasesView {
     const layoutMode = this.getLayoutMode();
     this.containerEl?.style.setProperty('--tps-kanban-scale', String(scale));
     this.containerEl?.setAttr('data-kanban-view-id', this.getLaneOrderViewId());
+    this.containerEl?.setAttr('data-kanban-view-type', this.type);
     this.containerEl?.classList.toggle('tps-kanban-container--list', layoutMode === 'list');
     const isEmbedded = this.isEmbeddedKanbanContext();
     const isReadingEmbed = this.isReadingEmbeddedKanbanContext();
@@ -1751,22 +1863,28 @@ export class KanbanView extends BasesView {
         );
         const openTasks = fallback.openTasks.map((task: OpenTaskSubitem) => {
           const enriched = gcmTasksByLine.get(task.line);
-          return {
+          const merged = {
             ...task,
             checkboxState: task.checkboxState || enriched?.checkboxState || '[ ]',
-            displayText: task.displayText || task.text,
             inlineFields: task.inlineFields?.length ? task.inlineFields : enriched?.inlineFields,
+          };
+          return {
+            ...merged,
+            displayText: this.getTaskVisibleTitle(merged),
           };
         });
         const openByLine = new Map<number, OpenTaskSubitem>(openTasks.map((task: OpenTaskSubitem) => [task.line, task]));
         const enrichedAllTasks = allTasks.map((task: OpenTaskSubitem) => {
           const openTask = openByLine.get(task.line);
-          return {
+          const merged = {
             ...task,
             ...(openTask ?? {}),
             checkboxState: task.checkboxState || openTask?.checkboxState || '[ ]',
-            displayText: task.displayText || openTask?.displayText || task.text,
             inlineFields: task.inlineFields?.length ? task.inlineFields : openTask?.inlineFields,
+          };
+          return {
+            ...merged,
+            displayText: this.getTaskVisibleTitle(merged),
           };
         });
         const overflowCount = Number(parsed?.overflowCount ?? fallback.overflowCount);
@@ -1781,10 +1899,9 @@ export class KanbanView extends BasesView {
       })
       .finally(() => {
         this.openTasksLoading.delete(file.path);
-        const taskFilter = this.getTaskRootFilterFromBaseFilters();
-        if (this.isVisibleFile(file.path) || this.isTaskSourceFile(file, taskFilter)) {
-          this.refreshDebounced();
-        }
+        // Vault-wide task views can read hundreds of source files at once.
+        // Repaint once when the batch settles instead of once per file.
+        if (this.openTasksLoading.size === 0) this.refreshDebounced();
       });
   }
 
@@ -1798,7 +1915,19 @@ export class KanbanView extends BasesView {
     const tasks: OpenTaskSubitem[] = [];
     const lines = content.split(/\r?\n/);
     const doneStatuses = this.getDoneStatuses();
+    const hierarchyStack: Array<{ line: number; indent: number }> = [];
     lines.forEach((line, index) => {
+      const lineNumber = index + 1;
+      const structuralItem = this.parseLineItem(line, true);
+      const indent = getMarkdownIndentColumns(line);
+      let parentLine: number | undefined;
+      if (structuralItem) {
+        while (hierarchyStack.length && hierarchyStack[hierarchyStack.length - 1].indent >= indent) hierarchyStack.pop();
+        parentLine = hierarchyStack[hierarchyStack.length - 1]?.line;
+        hierarchyStack.push({ line: lineNumber, indent });
+      } else if (line.trim() && indent === 0) {
+        hierarchyStack.length = 0;
+      }
       const parsed = this.parseLineItem(line, includeBullets);
       if (!parsed) return;
       const checkboxState = parsed.checkboxState;
@@ -1806,12 +1935,13 @@ export class KanbanView extends BasesView {
       if (parsed.itemKind === 'task' && !includeDone && doneStatuses.has(mappedStatus)) return;
       const text = this.cleanTaskText(parsed.text);
       if (!text) return;
-      const lineNumber = index + 1;
       const inlineFields = this.extractTaskInlineFields(text);
       tasks.push({
         itemKind: parsed.itemKind,
         internalId: `${filePath}:${lineNumber}`,
         line: lineNumber,
+        indent,
+        parentLine,
         checkboxState,
         text,
         displayText: this.cleanTaskDisplayText(this.stripTaskInlineFields(text)),
@@ -1825,25 +1955,11 @@ export class KanbanView extends BasesView {
   }
 
   private parseLineItem(line: string, includeBullets = true): { itemKind: 'task' | 'bullet'; checkboxState?: string; text: string } | null {
-    const taskMatch = line.match(/^\s*(?:[-*+]|\d+[.)])\s+\[([^\]]*)\]\s+(.+)$/);
-    if (taskMatch) {
-      return {
-        itemKind: 'task',
-        checkboxState: this.normalizeCheckboxState(taskMatch[1] ?? ''),
-        text: taskMatch[2] ?? '',
-      };
-    }
-    if (!includeBullets) return null;
-    const bulletMatch = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(?!\[[^\]]*\]\s+)(.+)$/);
-    if (!bulletMatch) return null;
-    return {
-      itemKind: 'bullet',
-      text: bulletMatch[1] ?? '',
-    };
+    return parseKanbanLineItem(line, includeBullets);
   }
 
   private cleanTaskText(text: string): string {
-    return text
+    return this.stripTaskHiddenMetadata(text)
       .replace(/\s+\^[A-Za-z0-9-]+$/u, '')
       .replace(/<!--.*?-->/gu, '')
       .trim();
@@ -1851,6 +1967,7 @@ export class KanbanView extends BasesView {
 
   private cleanTaskDisplayText(text: string): string {
     return this.cleanTaskText(text)
+      .replace(/(^|\s)#[\p{L}\p{N}/_-]+/gu, ' ')
       .replace(/!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/gu, '$1')
       .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/gu, '$2')
       .replace(/\[\[([^\]]+)\]\]/gu, '$1')
@@ -1860,6 +1977,21 @@ export class KanbanView extends BasesView {
       .replace(/[*_~]{1,3}([^*_~]+)[*_~]{1,3}/gu, '$1')
       .replace(/\s+/gu, ' ')
       .trim();
+  }
+
+  private stripTaskHiddenMetadata(text: string): string {
+    return String(text || '')
+      .replace(/<span\b[^>]*data-tps-inline-props="[^"]*"[^>]*>\s*<\/span>/giu, ' ')
+      .replace(/<!--\s*tps-inline-props:[\s\S]*?-->/giu, ' ')
+      .replace(/\s*%%\s*tps-inline-props:[\s\S]*?%%/giu, ' ')
+      .replace(/\[\^\s*tps-inline:[^\]]+\](?::\s*\S+)?/giu, ' ');
+  }
+
+  private getTaskVisibleTitle(task: Pick<OpenTaskSubitem, 'displayText' | 'text'>): string {
+    const display = this.cleanTaskDisplayText(this.stripTaskInlineFields(task.displayText || ''));
+    if (display) return display;
+    const text = this.cleanTaskDisplayText(this.stripTaskInlineFields(task.text || ''));
+    return text || 'Untitled task';
   }
 
   private extractTaskInlineFields(text: string): Array<{ key: string; value: string }> {
@@ -2158,7 +2290,10 @@ export class KanbanView extends BasesView {
     const isNegated = this.isNegatedFilterOperator(operator);
     let result: boolean | null = null;
 
-    if (['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) {
+    if (isBareSemanticKindFilter(propRaw, values)) {
+      const currentValues = this.getNoteComparableValues(file, propRaw);
+      result = values.some((value) => currentValues.includes(value.toLowerCase()));
+    } else if (['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) {
       result = values.some((value) => {
         const normalized = value.toLowerCase();
         return normalized.startsWith('note') || normalized === 'all' || normalized === 'mixed';
@@ -2169,7 +2304,9 @@ export class KanbanView extends BasesView {
       result = values.some((value) => value.toLowerCase().replace(/^\./, '') === file.extension.toLowerCase());
     } else if (['path', 'file', 'filepath'].includes(normalizedProp) || propRaw.toLowerCase() === 'file.path') {
       if (!this.isPathComparisonOperator(operator)) return null;
-      result = values.some((value) => this.taskFilePathMatches(file, value));
+      result = this.isStartsWithFilterOperator(operator)
+        ? values.some((value) => this.taskFilePathStartsWith(file, value))
+        : values.some((value) => this.taskFilePathMatches(file, value));
     } else {
       const currentValues = this.getNoteComparableValues(file, propRaw);
       if (this.isImplicitEmptyValueFilter(operator, values)) {
@@ -2317,15 +2454,23 @@ export class KanbanView extends BasesView {
     return groups;
   }
 
-  private getSortPropIds(): string[] {
-    const rawOrder = (this.config as any)?.order ?? (this.config as any)?.sort ?? (this.config as any)?.sortBy;
-    const values = Array.isArray(rawOrder) ? rawOrder : rawOrder ? [rawOrder] : [];
+  private getSortDescriptors(): TpsSortDescriptor[] {
+    const rawSort = (this.config as any)?.sort
+      ?? (this.config as any)?.getSort?.()
+      ?? this.getConfigValue('sortBy')
+      ?? [];
+    const values = Array.isArray(rawSort) ? rawSort : rawSort ? [rawSort] : [];
     return values
       .map((item: any) => {
-        if (typeof item === 'string') return item.trim();
-        return String(item?.property ?? item?.field ?? item?.key ?? '').trim();
+        const prop = typeof item === 'string'
+          ? item.trim()
+          : String(item?.property ?? item?.field ?? item?.key ?? '').trim();
+        if (!prop) return null;
+        const rawDirection = String(item?.direction ?? item?.dir ?? item?.order ?? '').trim().toLowerCase();
+        const direction = rawDirection === 'desc' || rawDirection === 'descending' ? 'desc' : 'asc';
+        return { prop, direction } satisfies TpsSortDescriptor;
       })
-      .filter(Boolean);
+      .filter((item): item is TpsSortDescriptor => !!item);
   }
 
   private getCardPropertyIds(groupPropName: string | null): string[] {
@@ -2362,15 +2507,15 @@ export class KanbanView extends BasesView {
   }
 
   private sortEntriesForView(entries: BasesEntry[]): BasesEntry[] {
-    const sortProps = this.getSortPropIds();
-    if (!sortProps.length) return entries;
+    const sortDescriptors = this.getSortDescriptors();
+    if (!sortDescriptors.length) return entries;
 
     return [...entries].sort((a, b) => {
-      for (const prop of sortProps) {
+      for (const { prop, direction } of sortDescriptors) {
         const av = this.sortValue(a, prop);
         const bv = this.sortValue(b, prop);
-        if (av < bv) return -1;
-        if (av > bv) return 1;
+        if (av < bv) return direction === 'desc' ? 1 : -1;
+        if (av > bv) return direction === 'desc' ? -1 : 1;
       }
       return a.file.path.localeCompare(b.file.path);
     });
@@ -2388,10 +2533,6 @@ export class KanbanView extends BasesView {
 
   private extractGroupValues(raw: unknown): string[] {
     return extractKanbanGroupValues(raw);
-  }
-
-  private normalizeGroupToken(value: string): string {
-    return normalizeKanbanGroupToken(value);
   }
 
   private keyLabel(group: BasesEntryGroup): string {
@@ -2577,16 +2718,22 @@ export class KanbanView extends BasesView {
   private async openOrFocusFile(file: TFile): Promise<WorkspaceLeaf | null> {
     const existingLeaf = this.findMainWorkspaceLeafForFile(file);
     if (existingLeaf) {
+      flow('OpenTarget', 'focus-existing', { path: file.path });
       this.app.workspace.setActiveLeaf(existingLeaf, { focus: true } as any);
       this.app.workspace.revealLeaf(existingLeaf);
       return existingLeaf;
     }
 
     const leaf = this.getTargetLeafForOpen();
-    if (!leaf) return null;
+    if (!leaf) {
+      flowWarn('OpenTarget', 'blocked', { reason: 'no-target-leaf', path: file.path });
+      return null;
+    }
+    flow('OpenTarget', 'open-new', { path: file.path });
     await leaf.openFile(file, { active: true } as any);
     this.app.workspace.setActiveLeaf(leaf, { focus: true } as any);
     this.app.workspace.revealLeaf(leaf);
+    flow('OpenTarget', 'open-done', { path: file.path });
     return leaf;
   }
 
@@ -2594,13 +2741,28 @@ export class KanbanView extends BasesView {
     const leaf = await this.openOrFocusFile(file);
     const view = leaf?.view as any;
     const editor = view?.editor;
-    if (!editor || typeof editor.setCursor !== 'function') return;
     const targetLine = Math.max(0, Number(line || 1) - 1);
+    if (!editor || typeof editor.setCursor !== 'function') {
+      flowWarn('OpenTaskLine', 'blocked', {
+        reason: 'missing-editor',
+        path: file.path,
+        line: targetLine + 1,
+      });
+      return;
+    }
+    flow('OpenTaskLine', 'scroll:start', {
+      path: file.path,
+      line: targetLine + 1,
+    });
     editor.setCursor({ line: targetLine, ch: 0 });
     if (typeof editor.scrollIntoView === 'function') {
       editor.scrollIntoView({ from: { line: targetLine, ch: 0 }, to: { line: targetLine, ch: 0 } }, true);
     }
     if (typeof editor.focus === 'function') editor.focus();
+    flow('OpenTaskLine', 'scroll:done', {
+      path: file.path,
+      line: targetLine + 1,
+    });
   }
 
   private findMainWorkspaceLeafForFile(file: TFile): WorkspaceLeaf | null {
@@ -2616,17 +2778,6 @@ export class KanbanView extends BasesView {
   }
 
   private getTargetLeafForOpen(): WorkspaceLeaf | null {
-    const workspaceAny = this.app.workspace as any;
-    const activeLeaf = workspaceAny?.activeLeaf as WorkspaceLeaf | null | undefined;
-    if (activeLeaf && this.isMainWorkspaceOpenTarget(activeLeaf) && !this.isPinnedLeaf(activeLeaf)) {
-      return activeLeaf;
-    }
-
-    const markdownLeaf = this.app.workspace
-      .getLeavesOfType('markdown')
-      .find((leaf) => this.isMainWorkspaceOpenTarget(leaf) && !this.isPinnedLeaf(leaf));
-    if (markdownLeaf) return markdownLeaf;
-
     return this.app.workspace.getLeaf('tab');
   }
 
@@ -2636,17 +2787,6 @@ export class KanbanView extends BasesView {
     if (containerEl?.closest('.workspace-split.mod-left-split, .workspace-split.mod-right-split')) return false;
     const viewType = leaf.view?.getViewType?.();
     return viewType !== KANBAN_VIEW_TYPE;
-  }
-
-  private isPinnedLeaf(leaf: WorkspaceLeaf | null | undefined): boolean {
-    const leafAny = leaf as any;
-    if (!leafAny) return false;
-    if (leafAny.pinned === true) return true;
-    try {
-      return leafAny.getViewState?.()?.pinned === true || leafAny.getEphemeralState?.()?.pinned === true;
-    } catch {
-      return false;
-    }
   }
 
   private getEntryValue(entry: BasesEntry, propName: string): unknown {
@@ -2785,6 +2925,10 @@ export class KanbanView extends BasesView {
   ): Map<string, TaskRenderItem[]> {
     const tasksByLane = new Map<string, TaskRenderItem[]>();
     if (taskFilter.mode === 'notes') return tasksByLane;
+    if (!this.isBaseFileFilterReady()) {
+      this.scheduleBaseFileFilterLoad();
+      return tasksByLane;
+    }
     const searchQuery = this.getActiveBasesSearchQuery();
     const explicitTaskSourceFiles = this.getExplicitTaskSourceFiles(taskFilter);
     const explicitTaskSourcePaths = new Set(explicitTaskSourceFiles.map((file) => file.path));
@@ -2858,6 +3002,7 @@ export class KanbanView extends BasesView {
     if (Array.isArray(node)) return node.some((child) => this.hasGlobalTaskMatchFilter(child));
     if (typeof node === 'string') {
       const expr = node.trim().replace(/^!+\s*/u, '');
+      if (parseBareSemanticKindExpression(expr)) return false;
       return /^(?:task\.)?(?:tags?|status|open|isopen|done|isdone|completed|complete)\b/i.test(expr)
         || /^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=|is|equals?)\s*["']?(?:task|tasks)["']?$/i.test(expr)
         || this.isSharedTaskValueFilterExpression(expr);
@@ -2865,6 +3010,7 @@ export class KanbanView extends BasesView {
     if (typeof node !== 'object') return false;
     const record = node as Record<string, unknown>;
     const propRaw = this.readFilterObjectProperty(record).toLowerCase();
+    if (isBareSemanticKindFilter(propRaw, this.readFilterObjectValues(record))) return false;
     const normalizedProp = this.normalizeInlinePropertyKey(propRaw.replace(/^(?:task|tps|kanban)\./i, ''));
     if (propRaw.startsWith('task.') && !['path', 'file', 'filepath', 'fileextension', 'fileext'].includes(normalizedProp)) return true;
     if (['itemtype', 'itemkind', 'kind', 'tags', 'tag', 'status', 'open', 'isopen', 'done', 'isdone', 'completed', 'complete'].includes(normalizedProp)) return true;
@@ -2877,6 +3023,7 @@ export class KanbanView extends BasesView {
     if (!prop) return false;
     const lower = prop.toLowerCase();
     if (lower.startsWith('note.') || lower.startsWith('file.')) return false;
+    if (parseBareSemanticKindExpression(expr)) return false;
     const normalized = this.normalizeInlinePropertyKey(lower.replace(/^(?:task|tps|kanban)\./i, ''));
     return !['path', 'file', 'filepath', 'fileextension', 'fileext', 'extension', 'ext'].includes(normalized);
   }
@@ -2983,13 +3130,6 @@ export class KanbanView extends BasesView {
     if (filter.mode === 'tasks' && task.itemKind === 'bullet') return false;
     if (filter.mode === 'bullets' && task.itemKind !== 'bullet') return false;
     if (task.itemKind === 'bullet' && structuredMatch !== true) return false;
-    if (structuredMatch === true) {
-      if (task.itemKind !== 'bullet') {
-        const status = this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
-        if (!filter.includeDone && this.getDoneStatuses().has(status)) return false;
-      }
-      return true;
-    }
 
     if (task.itemKind === 'bullet') {
       const taskTags = new Set(this.getTaskInlineValues(task, 'tags').map((tag) => tag.toLowerCase()));
@@ -3156,6 +3296,7 @@ export class KanbanView extends BasesView {
 
   private evaluateTaskFilterString(rawExpr: string, task: OpenTaskSubitem, file: TFile | null = null): boolean | null {
     const raw = String(rawExpr || '').trim();
+    if (parseBareSemanticKindExpression(raw)) return false;
     const isNegated = raw.startsWith('!');
     const expr = (isNegated ? raw.slice(1) : raw).trim();
     const result = this.evaluatePositiveTaskFilterString(expr, task, file);
@@ -3163,6 +3304,7 @@ export class KanbanView extends BasesView {
   }
 
   private evaluatePositiveTaskFilterString(expr: string, task: OpenTaskSubitem, file: TFile | null = null): boolean | null {
+    if (parseBareSemanticKindExpression(expr)) return false;
     const kindMatch = expr.match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=|is|equals?)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
     if (kindMatch?.[1]) {
       const value = kindMatch[1].toLowerCase();
@@ -3281,19 +3423,28 @@ export class KanbanView extends BasesView {
   }
 
   private evaluateTaskFileFilterExpression(expr: string, file: TFile | null): boolean | null {
-    const propPattern = `(?:task\\.)?(?:path|file|file\\.path)`;
-    const values = file ? [file.path, file.basename, file.name, file.path.replace(/\.md$/i, '')].map((value) => value.toLowerCase()) : [];
-    const quoted = (text: string) => this.extractQuotedStrings(text).map((value) => value.trim().toLowerCase()).filter(Boolean);
-    const normalizePathToken = (value: string) => value.replace(/\.md$/i, '').toLowerCase();
-    const containsMatch = expr.match(new RegExp(`^${propPattern}\\.contains\\((.*)\\)$`, 'i'));
-    if (containsMatch) {
-      const tokens = quoted(containsMatch[1] || '').map((token) => this.resolveBaseContextToken(token) || token);
-      return tokens.some((token) => values.some((value) => value.includes(token) || value.includes(normalizePathToken(token))));
+    const folderComparison = expr.match(/^file\.folder\s*(==|=|!=|!==|is|equals?)\s*(?:"([^"]*)"|'([^']*)'|(.+))$/i);
+    if (folderComparison) {
+      const expected = String(folderComparison[2] ?? folderComparison[3] ?? folderComparison[4] ?? '').trim();
+      const isNegated = String(folderComparison[1] || '').startsWith('!');
+      const matched = this.taskFileFolderMatches(file, expected, isNegated);
+      return isNegated ? !matched : matched;
     }
-    const equalsCallMatch = expr.match(new RegExp(`^${propPattern}\\.equals\\((.*)\\)$`, 'i'));
-    if (equalsCallMatch) {
-      const tokens = quoted(equalsCallMatch[1] || '').map((token) => this.resolveBaseContextToken(token) || token);
-      return tokens.some((token) => this.taskFilePathMatches(file, token));
+    if (/^file\.links?\.(?:isEmpty|empty)\(\)$/i.test(expr)) return true;
+    if (/^file\.links?\.(?:isNotEmpty|exists)\(\)$/i.test(expr)) return false;
+    const propPattern = `(?:task\\.)?(?:path|file|file\\.path)`;
+    const quoted = (text: string) => this.extractQuotedStrings(text).map((value) => value.trim().toLowerCase()).filter(Boolean);
+    const pathCallMatch = expr.match(new RegExp(`^${propPattern}\\.(contains|startsWith|equals)\\((.*)\\)$`, 'i'));
+    if (pathCallMatch) {
+      const operator = pathCallMatch[1].toLowerCase();
+      const tokens = quoted(pathCallMatch[2] || '').map((token) => this.resolveBaseContextToken(token) || token);
+      if (operator === 'startswith') return tokens.some((token) => this.taskFilePathStartsWith(file, token));
+      if (operator === 'equals') return tokens.some((token) => this.taskFilePathMatches(file, token));
+      const values = file ? [file.path, file.basename, file.name, file.path.replace(/\.md$/i, '')].map((value) => value.toLowerCase()) : [];
+      return tokens.some((token) => {
+        const normalized = String(token || '').replace(/\.md$/i, '').toLowerCase();
+        return values.some((value) => value.includes(String(token || '').toLowerCase()) || value.includes(normalized));
+      });
     }
     const comparisonMatch = expr.match(new RegExp(`^${propPattern}\\s*(==|=|!=|!==|is|equals?)\\s*(?:"([^"]+)"|'([^']+)'|(.+))$`, 'i'));
     if (comparisonMatch?.[2] || comparisonMatch?.[3] || comparisonMatch?.[4]) {
@@ -3342,9 +3493,21 @@ export class KanbanView extends BasesView {
     });
   }
 
+  private taskFilePathStartsWith(file: TFile | null, rawValue: string): boolean {
+    if (!file) return false;
+    const needle = String(rawValue || '').trim().replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+    if (!needle) return false;
+    return String(file.path || '').replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase().startsWith(needle);
+  }
+
   private isPathComparisonOperator(operator: string): boolean {
     const op = String(operator || '').trim().toLowerCase().replace(/\s+/g, '');
-    return !op || op === '=' || op === '==' || op === '!=' || op === '!==' || op === 'is' || op === 'equals' || op === 'equal' || op.includes('contains');
+    return !op || op === '=' || op === '==' || op === '!=' || op === '!==' || op === 'is' || op === 'equals' || op === 'equal' || op.includes('contains') || op.includes('startswith') || op === 'starts';
+  }
+
+  private isStartsWithFilterOperator(operator: string): boolean {
+    const op = String(operator || '').trim().toLowerCase().replace(/\s+/g, '');
+    return op.includes('startswith') || op === 'starts' || op === '!starts';
   }
 
   private readFilterObjectProperty(node: Record<string, unknown>): string {
@@ -3422,6 +3585,7 @@ export class KanbanView extends BasesView {
     const isNegated = this.isNegatedFilterOperator(operator);
     let result: boolean | null = null;
 
+    if (isBareSemanticKindFilter(propRaw, values)) return false;
     if (['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) {
       result = values.some((value) => {
         const normalized = value.toLowerCase();
@@ -3460,13 +3624,31 @@ export class KanbanView extends BasesView {
       result = false;
     } else if (['path', 'file', 'filepath'].includes(normalizedProp) || propRaw.toLowerCase() === 'file.path' || propRaw.toLowerCase() === 'task.file.path') {
       if (!this.isPathComparisonOperator(operator)) return null;
-      if (this.isContainsFilterOperator(operator)) {
+      if (this.isStartsWithFilterOperator(operator)) {
+        result = values.some((value) => this.taskFilePathStartsWith(file, value));
+      } else if (this.isContainsFilterOperator(operator)) {
         result = values.some((value) => {
           const token = String(value || '').trim().toLowerCase();
           return !!file && [file.path, file.basename, file.name].some((candidate) => String(candidate || '').toLowerCase().includes(token));
         });
       } else {
         result = values.some((value) => this.taskFilePathMatches(file, value));
+      }
+    } else if (propRaw.toLowerCase().startsWith('file.') || ['folder', 'folderpath', 'name', 'basename'].includes(normalizedProp)) {
+      const currentValues = this.getTaskFileComparableValues(file, propRaw);
+      if (this.isImplicitEmptyValueFilter(operator, values) || this.isEmptyFilterOperator(operator)) {
+        result = currentValues.length === 0;
+      } else if (this.isImplicitNotEmptyValueFilter(operator, values) || this.isExistsFilterOperator(operator)) {
+        result = currentValues.length > 0;
+      } else if (this.isContainsFilterOperator(operator)) {
+        result = values.some((value) => this.taskValuesContain(propRaw, currentValues, value));
+      } else if (
+        (propRaw.toLowerCase() === 'file.folder' || ['folder', 'folderpath'].includes(normalizedProp))
+        && ['!=', '!==', 'isnot', 'notequal', 'notequals', 'doesnotequal'].includes(operator.replace(/\s+/g, ''))
+      ) {
+        result = values.some((value) => this.taskFileFolderMatches(file, value, true));
+      } else {
+        result = values.some((value) => this.taskValuesMatch(propRaw, currentValues, value));
       }
     } else {
       const currentValues = this.getGenericTaskComparableValues(task, propRaw);
@@ -3488,6 +3670,33 @@ export class KanbanView extends BasesView {
     }
 
     return result == null ? null : isNegated ? !result : result;
+  }
+
+  private getTaskFileComparableValues(file: TFile | null, propRaw: string): string[] {
+    if (!file) return [];
+    const prop = String(propRaw || '').trim().toLowerCase().replace(/^file\./, '');
+    if (prop === 'folder' || prop === 'folderpath') return file.parent?.path ? [file.parent.path.toLowerCase()] : [];
+    if (prop === 'name') return [file.name.toLowerCase()];
+    if (prop === 'basename') return [file.basename.toLowerCase()];
+    if (prop === 'path') return [file.path.toLowerCase()];
+    if (prop === 'extension' || prop === 'ext') return [file.extension.toLowerCase()];
+    if (prop === 'links' || prop === 'link') {
+      // TPS task rows are synthesized Base records. Their source note is
+      // exposed separately through file.name/path/folder, but the task record
+      // itself has no file-links collection.
+      return [];
+    }
+    const cache = this.app.metadataCache.getFileCache(file) as any;
+    const rawValue = cache?.frontmatter?.[propRaw.slice(5)] ?? cache?.frontmatter?.[prop];
+    return this.asArray(rawValue).map((value) => String(value ?? '').trim().toLowerCase()).filter(Boolean);
+  }
+
+  private taskFileFolderMatches(file: TFile | null, rawValue: string, includeDescendants = false): boolean {
+    if (!file) return false;
+    const expected = String(rawValue || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase();
+    if (!expected) return false;
+    const actual = String(file.parent?.path || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase();
+    return actual === expected || (includeDescendants && actual.startsWith(`${expected}/`));
   }
 
   private getTaskLaneIds(task: OpenTaskSubitem, propName: string | null): string[] {
@@ -3624,19 +3833,43 @@ export class KanbanView extends BasesView {
     value: string | null,
     sourceLaneValues: string[] = [],
   ): Promise<void> {
+    flow('CardMove', 'frontmatter:start', {
+      path: file.path,
+      propName,
+      value,
+      sourceLaneValues,
+    });
     const isStatusProp = this.isStatusPropertyName(propName);
     if (this.normalizeInlinePropertyKey(propName) === 'tags') {
       await this.applyFrontmatterTags(file, propName, value, sourceLaneValues);
+      flow('CardMove', 'frontmatter:done', {
+        path: file.path,
+        propName,
+        value,
+        route: 'tags',
+      });
       return;
     }
     const gcmServices = this.getGcmServices();
     if (isStatusProp && typeof gcmServices?.status?.setFileStatus === 'function') {
       await gcmServices.status.setFileStatus(file, value);
+      flow('CardMove', 'frontmatter:done', {
+        path: file.path,
+        propName,
+        value,
+        route: 'gcm-status',
+      });
       return;
     }
     if (typeof gcmServices?.frontmatter?.setValues === 'function') {
       await gcmServices.frontmatter.setValues([file], { [propName]: value });
       emitFilesUpdated(this.app, [file.path], 'tps-kanban');
+      flow('CardMove', 'frontmatter:done', {
+        path: file.path,
+        propName,
+        value,
+        route: 'gcm-frontmatter',
+      });
       return;
     }
 
@@ -3663,6 +3896,12 @@ export class KanbanView extends BasesView {
       }
     });
     emitFilesUpdated(this.app, [file.path], 'tps-kanban');
+    flow('CardMove', 'frontmatter:done', {
+      path: file.path,
+      propName,
+      value,
+      route: 'native-frontmatter',
+    });
   }
 
   private async applyFrontmatterTags(
@@ -3710,21 +3949,6 @@ export class KanbanView extends BasesView {
     return tags;
   }
 
-  private async applyInlineTaskProperty(
-    file: TFile,
-    line: number,
-    propName: string,
-    value: string | null,
-    sourceLaneValues: string[] = [],
-  ): Promise<void> {
-    const plan = await this.buildTaskDropPlan(file, line, propName, value, sourceLaneValues);
-    await this.applyInlineTaskDropPlan(file, line, propName, value, sourceLaneValues, {
-      filterTags: plan.filterTags,
-      filterStatus: plan.filterStatus,
-      nextLine: plan.nextLine,
-    });
-  }
-
   private async confirmAndApplyInlineTaskDrop(
     file: TFile,
     line: number,
@@ -3734,15 +3958,47 @@ export class KanbanView extends BasesView {
   ): Promise<boolean> {
     const plan = await this.buildTaskDropPlan(file, line, propName, value, sourceLaneValues);
     if (!plan.changes.length) {
+      flowWarn('TaskDrop', 'no-change', {
+        reason: 'empty-plan',
+        path: file.path,
+        line,
+        propName,
+        value,
+      });
       new Notice('No line-item changes were inferred for this drop.');
       return false;
     }
     if (plan.nextLine === plan.currentLine) {
+      flowWarn('TaskDrop', 'no-change', {
+        reason: 'same-line',
+        path: file.path,
+        line,
+        propName,
+        value,
+        itemKind: plan.itemKind,
+      });
       new Notice(`No ${plan.itemKind} changes were inferred for this drop.`);
       return false;
     }
+    flow('TaskDrop', 'confirm:start', {
+      path: file.path,
+      line,
+      propName,
+      value,
+      itemKind: plan.itemKind,
+      changeCount: plan.changes.length,
+    });
     const confirmed = await this.confirmTaskDrop(plan.changes);
-    if (!confirmed) return false;
+    if (!confirmed) {
+      flow('TaskDrop', 'confirm:cancelled', {
+        path: file.path,
+        line,
+        propName,
+        value,
+        itemKind: plan.itemKind,
+      });
+      return false;
+    }
     await this.applyInlineTaskDropPlan(file, line, propName, value, sourceLaneValues, plan);
     return true;
   }
@@ -3775,7 +4031,6 @@ export class KanbanView extends BasesView {
       } else {
         const checkbox = this.getCheckboxStateForStatus(value);
         changes.push(`Set checkbox state for status "${displayValue}"${checkbox ? ` to ${checkbox}` : ''}.`);
-        nextLine = this.updateInlineTaskCheckboxState(nextLine, value);
       }
     } else if (normalizedProp === 'tags') {
       changes.push(`Move task tag lane to #${this.normalizeWritableTaskTag(String(value ?? '')) || displayValue}.`);
@@ -3783,27 +4038,33 @@ export class KanbanView extends BasesView {
         .map((sourceValue) => this.normalizeWritableTaskTag(sourceValue))
         .filter(Boolean);
       if (removed.length) changes.push(`Remove previous lane tag(s): ${removed.map((tag) => `#${tag}`).join(', ')}.`);
-      nextLine = this.updateInlineTaskPropertyText(nextLine, propName, value, sourceLaneValues);
     } else {
       changes.push(`Set inline field [${propName}:: ${displayValue}].`);
-      nextLine = this.updateInlineTaskPropertyText(nextLine, propName, value, sourceLaneValues);
     }
 
     for (const tag of filterTags) {
       if (normalizedProp === 'tags' && this.normalizeTaskTag(String(value ?? '')) === tag) continue;
       const displayTag = tag.startsWith('#') ? tag : `#${tag}`;
       changes.push(`Add Base filter tag ${displayTag}.`);
-      nextLine = this.updateInlineTaskTag(nextLine, tag, []);
     }
     if (filterStatus && itemKind !== 'bullet') {
       const checkbox = this.getCheckboxStateForStatus(filterStatus);
       changes.push(`Set checkbox state for Base status filter "${filterStatus}"${checkbox ? ` to ${checkbox}` : ''}.`);
-      nextLine = this.updateInlineTaskCheckboxState(nextLine, filterStatus);
     } else if (filterStatus && itemKind === 'bullet') {
       changes.push(`Base status filter "${filterStatus}" applies to tasks only; bullet status will remain empty.`);
     } else if (!this.isStatusPropertyName(propName) && filter.statuses.size > 1) {
       changes.push(`Base allows multiple statuses (${Array.from(filter.statuses).join(', ')}), so status will not be guessed.`);
     }
+    nextLine = buildKanbanTaskDropLine({
+      line: currentLine,
+      propName,
+      value,
+      sourceLaneValues,
+      filterTags,
+      filterStatus,
+      getCheckboxStateForStatus: (status) => this.getCheckboxStateForStatus(status),
+      isStatusPropertyName: (name) => this.isStatusPropertyName(name),
+    });
 
     changes.unshift(`${itemKind === 'bullet' ? 'Bullet' : 'Task'}: ${file.path}:${targetLine}`);
     changes.push(`Current line: ${currentLine}`);
@@ -3834,6 +4095,15 @@ export class KanbanView extends BasesView {
   ): Promise<void> {
     const targetLine = Math.max(1, Math.floor(Number(line || 1)));
     let changed = false;
+    flow('TaskDrop', 'apply:start', {
+      path: file.path,
+      line: targetLine,
+      propName,
+      value,
+      sourceLaneValues,
+      filterTags: plan.filterTags,
+      filterStatus: plan.filterStatus,
+    });
 
     await this.app.vault.process(file, (content) => {
       const lines = content.split(/\r?\n/);
@@ -3852,50 +4122,12 @@ export class KanbanView extends BasesView {
       this.clearTaskCachesForPath(file.path);
       emitFilesUpdated(this.app, [file.path], 'tps-kanban');
     }
-  }
-
-  private async applyParsedInlineTaskProperty(
-    taskFile: TFile,
-    parsed: { line: number },
-    propName: string,
-    value: string | null,
-    sourceLaneValues: string[] = [],
-  ): Promise<void> {
-    await this.applyInlineTaskProperty(
-      taskFile,
-      parsed.line,
+    flow('TaskDrop', changed ? 'apply:done' : 'apply:no-change', {
+      path: file.path,
+      line: targetLine,
       propName,
       value,
-      sourceLaneValues,
-    );
-  }
-
-  private updateInlineTaskPropertyText(
-    line: string,
-    propName: string,
-    value: string | null,
-    sourceLaneValues: string[] = [],
-  ): string {
-    const normalizedProp = this.normalizeInlinePropertyKey(propName);
-    const normalizedValue = String(value ?? '').trim();
-    if (normalizedProp === 'tags') {
-      return this.updateInlineTaskTag(line, normalizedValue, sourceLaneValues);
-    }
-
-    const escaped = propName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const inlineField = new RegExp(`\\s*(?:\\[|\\()${escaped}\\s*::\\s*[^\\]\\)]+(?:\\]|\\))`, 'i');
-    const withoutExisting = line.replace(inlineField, '').replace(/\s+$/u, '');
-    if (!normalizedValue) return withoutExisting;
-    return `${withoutExisting} [${propName}:: ${normalizedValue}]`;
-  }
-
-  private updateInlineTaskCheckboxState(line: string, status: string | null): string {
-    const checkboxState = status == null ? '[ ]' : this.getCheckboxStateForStatus(status);
-    if (!checkboxState) return line;
-    return line.replace(
-      /^(\s*(?:[-*+]|\d+[.)])\s+)\[[^\]]*\](\s+)/u,
-      `$1${checkboxState}$2`,
-    );
+    });
   }
 
   private getDisplayLaneWritableValues(displayLane: DisplayLaneGroup | null | undefined): string[] {
@@ -4000,7 +4232,7 @@ export class KanbanView extends BasesView {
       line: task.line,
       rawLine: '',
       checkboxState: task.itemKind === 'bullet' ? undefined : task.checkboxState || '[ ]',
-      text: task.displayText || task.text,
+      text: this.getTaskVisibleTitle(task),
       sourceLaneValues: this.getDisplayLaneWritableValues(displayLane),
       propName,
       displayLane,
@@ -4132,18 +4364,30 @@ export class KanbanView extends BasesView {
     const targetLine = Math.max(1, Math.floor(Number(line || 1)));
     const nextState = this.normalizeCheckboxState(checkboxState);
     let changed = false;
+    let blockedReason = '';
+    flow('TaskCheckbox', 'update:start', {
+      path: file.path,
+      line: targetLine,
+      nextState,
+    });
 
     await this.app.vault.process(file, (content) => {
       const lines = content.split(/\r?\n/);
       const index = targetLine - 1;
-      if (index < 0 || index >= lines.length) return content;
+      if (index < 0 || index >= lines.length) {
+        blockedReason = 'line-out-of-range';
+        return content;
+      }
       const current = lines[index];
-      if (!/^\s*(?:[-*+]|\d+[.)])\s+\[[^\]]*\]\s+/.test(current)) return content;
-      const next = current.replace(
-        /^(\s*(?:[-*+]|\d+[.)])\s+)\[[^\]]*\](\s+)/u,
-        `$1${nextState}$2`,
-      );
-      if (next === current) return content;
+      if (!/^\s*(?:[-*+]|\d+[.)])\s+\[[^\]]*\]\s+/.test(current)) {
+        blockedReason = 'not-task-line';
+        return content;
+      }
+      const next = replaceKanbanTaskLineCheckboxState(current, nextState);
+      if (next === current) {
+        blockedReason = 'unchanged';
+        return content;
+      }
       lines[index] = next;
       changed = true;
       return lines.join('\n');
@@ -4153,36 +4397,16 @@ export class KanbanView extends BasesView {
       this.clearTaskCachesForPath(file.path);
       emitFilesUpdated(this.app, [file.path], 'tps-kanban');
     }
+    flow('TaskCheckbox', changed ? 'update:done' : 'update:no-change', {
+      path: file.path,
+      line: targetLine,
+      nextState,
+      reason: changed ? undefined : blockedReason || 'unknown',
+    });
   }
 
   private normalizeWritableTaskTag(value: string): string {
-    return value
-      .replace(/^#+/u, '')
-      .replace(/[^\p{L}\p{N}/_-]+/gu, '-')
-      .replace(/^-+|-+$/gu, '');
-  }
-
-  private updateInlineTaskTag(line: string, value: string, sourceLaneValues: string[] = []): string {
-    const cleanTag = this.normalizeWritableTaskTag(value);
-    const sourceTags = sourceLaneValues
-      .map((sourceValue) => this.normalizeWritableTaskTag(sourceValue))
-      .filter((sourceTag) => sourceTag && sourceTag.toLowerCase() !== cleanTag.toLowerCase());
-
-    let nextLine = line;
-    for (const sourceTag of sourceTags) {
-      const escapedSource = sourceTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      nextLine = nextLine
-        .replace(new RegExp(`(^|\\s)#${escapedSource}(?=\\s|$)`, 'giu'), '$1')
-        .replace(/[ \t]{2,}/gu, ' ')
-        .replace(/\s+$/u, '');
-    }
-
-    if (!cleanTag) return nextLine;
-    const tag = `#${cleanTag}`;
-    if (new RegExp(`(^|\\s)${tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`, 'iu').test(nextLine)) {
-      return nextLine;
-    }
-    return `${nextLine.replace(/\s+$/u, '')} ${tag}`;
+    return normalizeKanbanWritableTaskTag(value);
   }
 
   /** Returns true if `ancestorPath` is a direct or transitive ancestor of `childPath`. */
@@ -4533,20 +4757,6 @@ export class KanbanView extends BasesView {
     return target || null;
   }
 
-  private extractLinkTarget(value: unknown): string | null {
-    if (value == null) return null;
-    const raw = String(value).trim();
-    if (!raw) return null;
-
-    const markdownMatch = raw.match(/^!?\[[^\]]*]\(([^)]+)\)$/);
-    if (markdownMatch?.[1]) return this.normalizeLinkTarget(markdownMatch[1]);
-
-    const wikiMatch = raw.match(/^!?\[\[([^[\]]+)]]$/);
-    if (wikiMatch?.[1]) return this.normalizeLinkTarget(wikiMatch[1]);
-
-    return this.normalizeLinkTarget(raw);
-  }
-
   private resolveLinkTargetToPath(rawTarget: string, sourcePath: string): string | null {
     const gcmResolved = this.getGcmServices()?.links?.resolveToPath?.(rawTarget, sourcePath);
     if (gcmResolved) return String(gcmResolved);
@@ -4879,15 +5089,9 @@ export class KanbanView extends BasesView {
   }
 
   private getBaseFilterRoots(): unknown[] {
-    const baseFile = this.getBaseFile();
-    if (baseFile) {
-      const fileRoots = this.getBaseFileFilterRoot();
-      return fileRoots?.length ? this.dedupeFilterRoots(fileRoots) : [];
-    }
-
-    const embeddedRoots = this.getEmbeddedBaseFilterRoot();
-    if (embeddedRoots?.length) return this.dedupeFilterRoots(embeddedRoots);
-
+    // Runtime roots include unsaved edits from Obsidian's Base filter editor. Keep
+    // them ahead of persisted roots so the custom view reacts immediately while
+    // still inheriting the Base-wide filters stored in the .base file.
     const runtimeRoots = this.extractFilterRootCandidates([
       this.config?.get?.('filters'),
       (this.config as any)?.filters,
@@ -4898,7 +5102,15 @@ export class KanbanView extends BasesView {
       (this as any)?.queryController?.query?.filters,
       (this as any)?.queryController?.queryState,
     ]);
-    return runtimeRoots.length ? this.dedupeFilterRoots(runtimeRoots) : [];
+    const baseFile = this.getBaseFile();
+    if (baseFile) {
+      const fileRoots = this.getBaseFileFilterRoot();
+      return composeEffectiveFilterRoots(runtimeRoots, fileRoots || []);
+    }
+
+    const embeddedRoots = this.getEmbeddedBaseFilterRoot();
+    if (embeddedRoots?.length) return composeEffectiveFilterRoots(runtimeRoots, embeddedRoots);
+    return composeEffectiveFilterRoots(runtimeRoots, []);
   }
 
   private getEmbeddedBaseFilterRoot(): unknown[] | null {
@@ -4943,7 +5155,7 @@ export class KanbanView extends BasesView {
             target.push(...extracted.filters);
           }
         } catch (error) {
-          console.warn('[TPS Kanban] Failed to parse embedded base block', file.path, error);
+          flowError('EmbeddedBaseFilters', 'parse-block-failed', error, { path: file.path, viewName });
         }
       }
       const roots = exactRoots.length ? exactRoots : fallbackRoots;
@@ -4956,15 +5168,16 @@ export class KanbanView extends BasesView {
         filters: roots.length ? roots : null,
       };
       if (previous?.path !== file.path || previous?.mtime !== mtime || previous?.viewName !== currentViewName || previous?.filters !== this.embeddedBaseFilterCache.filters) {
+        flow('EmbeddedBaseFilters', 'loaded', {
+          path: file.path,
+          viewName: currentViewName,
+          filterRoots: roots.length,
+        });
         this.refreshDebounced();
       }
     } finally {
       if (this.embeddedBaseFiltersLoadingKey === loadingKey) this.embeddedBaseFiltersLoadingKey = null;
     }
-  }
-
-  private embeddedBaseBlockMatchesCurrentKanbanView(parsed: Record<string, unknown> | null | undefined, viewName: string): boolean {
-    return !!this.getEmbeddedKanbanBlockMatch(parsed, viewName);
   }
 
   private getEmbeddedKanbanBlockMatch(parsed: Record<string, unknown> | null | undefined, viewName: string): 'exact' | 'fallback' | null {
@@ -4984,20 +5197,25 @@ export class KanbanView extends BasesView {
     return kanbanViews.length === 1 ? 'fallback' : null;
   }
 
-  private getCachedBaseFileFilterRoot(): unknown[] | null {
-    const file = this.getBaseFile();
-    if (!file) return null;
-    const mtime = Number(file.stat?.mtime || 0);
-    if (this.baseFileFilterCache?.path !== file.path || this.baseFileFilterCache.mtime !== mtime) return null;
-    return this.baseFileFilterCache.filters;
-  }
-
   private scheduleBaseFileFilterLoad(): void {
     const file = this.getBaseFile();
     if (!file) return;
     const mtime = Number(file.stat?.mtime || 0);
-    if (this.baseFileFilterCache?.path === file.path && this.baseFileFilterCache.mtime === mtime) return;
-    void this.loadBaseFileFilters(file, mtime, this.getConfiguredBaseViewName());
+    const viewName = this.getConfiguredBaseViewName();
+    if (this.baseFileFilterCache?.path === file.path
+      && this.baseFileFilterCache.mtime === mtime
+      && (!viewName || this.baseFileFilterCache.viewName === viewName)) return;
+    void this.loadBaseFileFilters(file, mtime, viewName);
+  }
+
+  private isBaseFileFilterReady(): boolean {
+    const file = this.getBaseFile();
+    if (!file) return true;
+    const cache = this.baseFileFilterCache;
+    const viewName = this.getConfiguredBaseViewName();
+    return cache?.path === file.path
+      && cache.mtime === Number(file.stat?.mtime || 0)
+      && (!viewName || cache.viewName === viewName);
   }
 
   private extractFilterRootCandidates(candidates: unknown[]): unknown[] {
@@ -5041,18 +5259,6 @@ export class KanbanView extends BasesView {
       return true;
     }
     return false;
-  }
-
-  private dedupeFilterRoots(roots: unknown[]): unknown[] {
-    const deduped: unknown[] = [];
-    const seen = new Set<string>();
-    for (const root of roots) {
-      const signature = this.stableFilterSignature(root);
-      if (!signature || seen.has(signature)) continue;
-      seen.add(signature);
-      deduped.push(root);
-    }
-    return deduped;
   }
 
   private getBaseFilterSignature(): string {
@@ -5357,6 +5563,7 @@ export class KanbanView extends BasesView {
     if (Array.isArray(node)) return node.some((child) => this.hasTaskDirectiveInFilterNode(child));
     if (typeof node === 'string') {
       const expr = node.trim().replace(/^!+\s*/u, '');
+      if (parseBareSemanticKindExpression(expr)) return false;
       return /^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\b/i.test(expr)
         || /^(?:task\.)?(?:status|tags?|open|isopen|done|isdone|completed|complete)\b/i.test(expr)
         || /^task\.(?:path|file|file\.path|file\.extension|file\.ext)\b/i.test(expr)
@@ -5367,6 +5574,7 @@ export class KanbanView extends BasesView {
     const propRaw = String(record.property ?? record.field ?? '').trim();
     const normalizedProp = this.normalizeInlinePropertyKey(propRaw.replace(/^(?:task|tps|kanban)\./i, ''));
     const propLower = propRaw.toLowerCase();
+    if (isBareSemanticKindFilter(propRaw, this.readFilterObjectValues(record))) return false;
     if (propLower.startsWith('task.')
       || ['itemtype', 'itemkind', 'kind', 'tag', 'tags', 'status', 'checkboxstatus', 'open', 'isopen', 'done', 'isdone', 'completed', 'complete'].includes(normalizedProp)
       || (propRaw && !propLower.startsWith('note.') && !propLower.startsWith('file.') && !['path', 'file', 'filepath', 'fileextension', 'fileext'].includes(normalizedProp))) return true;
@@ -5404,6 +5612,11 @@ export class KanbanView extends BasesView {
     const expr = (isNegated ? raw.slice(1) : raw).trim();
     if (!expr) return;
     const lower = expr.toLowerCase();
+
+    if (parseBareSemanticKindExpression(expr)) {
+      filter.mode = 'notes';
+      return;
+    }
 
     const kindMatch = lower.match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
     if (kindMatch?.[1]) {
@@ -5489,6 +5702,11 @@ export class KanbanView extends BasesView {
     const values = Array.isArray(rawValues) ? rawValues : rawValues == null ? [] : [rawValues];
     const operator = String(node.operator ?? node.op ?? '').trim().toLowerCase();
     const isNegated = parentNegated || operator.startsWith('!') || operator.includes('not') || operator === '!=' || operator === '!==';
+
+    if (isBareSemanticKindFilter(propRaw, values)) {
+      filter.mode = 'notes';
+      return;
+    }
 
     if (['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) {
       for (const raw of values) {
@@ -5973,6 +6191,7 @@ export class KanbanView extends BasesView {
       },
     });
     let lastPreviewOpenAt = 0;
+    let lastPreviewClickTimeStamp = 0;
     let lastTapAt = 0;
     let lastTapPath: string | null = null;
     const openCardFromEvent = (e: MouseEvent | PointerEvent) => {
@@ -5984,7 +6203,6 @@ export class KanbanView extends BasesView {
     };
     const shouldOpenFromRepeatedTap = (e: MouseEvent | PointerEvent) => {
       if ((e as MouseEvent).detail >= 2) return true;
-      if (!(e instanceof PointerEvent)) return false;
       const now = performance.now();
       const repeated = lastTapPath === entry.file.path && now - lastTapAt < 650;
       lastTapAt = now;
@@ -5996,11 +6214,16 @@ export class KanbanView extends BasesView {
       e.stopPropagation();
       e.stopImmediatePropagation();
       lastPreviewOpenAt = performance.now();
+      lastPreviewClickTimeStamp = e.timeStamp || 0;
       this.selectOnly(entry.file.path);
       this.openCardPreview(e, titleEl, entry.file);
     };
     const handleCardClick = (e: MouseEvent) => {
-      if (performance.now() - lastPreviewOpenAt < 300) {
+      const isSamePreviewClick = lastPreviewOpenAt > 0
+        && performance.now() - lastPreviewOpenAt < 300
+        && !!lastPreviewClickTimeStamp
+        && e.timeStamp === lastPreviewClickTimeStamp;
+      if (isSamePreviewClick) {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
@@ -6114,7 +6337,7 @@ export class KanbanView extends BasesView {
       const taskFilter = this.getTaskRootFilterFromBaseFilters();
       const mode = this.resolveCardAddMode(taskFilter);
       if (mode === 'task') {
-        void this.createTaskForEntry(entry.file);
+        void this.createTaskForEntry(entry.file, propName, displayLane, taskFilter);
       } else {
         void this.createSubitemForEntry(entry, propName, displayLane);
       }
@@ -6133,6 +6356,7 @@ export class KanbanView extends BasesView {
       const tasksEl = cardEl.createDiv({ cls: 'tps-kanban-card-tasks' });
       tasksEl.draggable = false;
       for (const task of previewTasks) {
+        const taskTitle = this.getTaskVisibleTitle(task);
         const taskEl = tasksEl.createDiv({
           cls: 'tps-kanban-card-task',
           attr: {
@@ -6157,7 +6381,7 @@ export class KanbanView extends BasesView {
           line: task.line,
           rawLine: '',
           checkboxState: task.itemKind === 'bullet' ? undefined : task.checkboxState || '[ ]',
-          text: task.displayText || task.text,
+          text: taskTitle,
           sourceLaneValues: this.getDisplayLaneWritableValues(displayLane),
         });
         const handleNestedTaskDragStart = (e: DragEvent) => {
@@ -6191,7 +6415,7 @@ export class KanbanView extends BasesView {
 
           const menu = new Menu();
           if (propName) {
-            menu.addItem(it => it.setTitle(`Open ${task.displayText || task.text}`).onClick(() => {
+            menu.addItem(it => it.setTitle(`Open ${taskTitle}`).onClick(() => {
               void this.openTaskLine(entry.file, task.line);
             }));
           } else {
@@ -6208,7 +6432,7 @@ export class KanbanView extends BasesView {
             role: 'button',
             tabindex: '0',
             draggable: 'true',
-            'aria-label': `Drag ${task.itemKind === 'bullet' ? 'bullet' : 'task'}: ${task.displayText || task.text}`,
+            'aria-label': `Drag ${task.itemKind === 'bullet' ? 'bullet' : 'task'}: ${taskTitle}`,
             title: task.itemKind === 'bullet' ? 'Drag bullet' : 'Drag task',
           },
         });
@@ -6242,7 +6466,7 @@ export class KanbanView extends BasesView {
           attr: {
             type: 'checkbox',
             role: 'checkbox',
-            'aria-label': `Toggle task: ${task.displayText || task.text}`,
+            'aria-label': `Toggle task: ${taskTitle}`,
             'data-checkbox-state': task.checkboxState || '[ ]',
             'data-checkbox-marker': this.getCheckboxMarker(task.checkboxState || '[ ]'),
           },
@@ -6261,7 +6485,7 @@ export class KanbanView extends BasesView {
           void this.updateTaskCheckboxState(entry.file, task.line, this.getToggleCheckboxStateForTask(task));
         });
         const taskContentEl = taskEl.createDiv({ cls: 'tps-kanban-card-task-content' });
-        taskContentEl.createSpan({ cls: 'tps-kanban-card-task-text', text: task.displayText || task.text });
+        taskContentEl.createSpan({ cls: 'tps-kanban-card-task-text', text: taskTitle });
         if (task.inlineFields?.length) {
           const fieldsEl = taskContentEl.createDiv({ cls: 'tps-kanban-card-task-fields' });
           task.inlineFields.forEach((field) => {
@@ -6420,16 +6644,36 @@ export class KanbanView extends BasesView {
       e.stopPropagation();
 
       const draggedFile = this.app.vault.getFileByPath(draggedPath);
-      if (!draggedFile) return;
+      if (!draggedFile) {
+        flowWarn('CardNest', 'blocked', {
+          reason: 'missing-dragged-file',
+          draggedPath,
+          targetPath: entry.file.path,
+        });
+        return;
+      }
 
       // Circular-parent guard: disallow if target is already a descendant of dragged
-      if (this.isDescendantOf(entry.file.path, draggedPath)) return;
+      if (this.isDescendantOf(entry.file.path, draggedPath)) {
+        flowWarn('CardNest', 'blocked', {
+          reason: 'circular-parent',
+          draggedPath,
+          targetPath: entry.file.path,
+        });
+        return;
+      }
 
       // Determine the parent key to write (prefer GCM-configured, else 'parent')
       const parentKeys = this.getParentLinkKeys();
       const parentKey = parentKeys[0] ?? 'parent';
 
       const existingParentPath = this.resolveParentPath(draggedFile);
+      flow('CardNest', 'drop:start', {
+        draggedPath,
+        targetPath: entry.file.path,
+        parentKey,
+        existingParentPath,
+      });
 
       if (existingParentPath === entry.file.path) {
         // Already a child of this card — toggle off (remove parent link)
@@ -6449,6 +6693,11 @@ export class KanbanView extends BasesView {
         // Auto-expand the target so the new child is immediately visible
         this.expandedSubtreePaths.add(entry.file.path);
       }
+      flow('CardNest', 'drop:done', {
+        draggedPath,
+        targetPath: entry.file.path,
+        action: existingParentPath === entry.file.path ? 'remove-parent' : 'set-parent',
+      });
       this.render();
     });
 
@@ -6463,6 +6712,7 @@ export class KanbanView extends BasesView {
 
   private createTaskLaneCard(item: TaskRenderItem, propName: string | null, displayLane: DisplayLaneGroup): HTMLElement {
     const { file, task } = item;
+    const taskTitle = this.getTaskVisibleTitle(task);
     const cardEl = document.createElement('div');
     cardEl.className = 'tps-kanban-card tps-kanban-task-card';
     cardEl.classList.toggle('tps-kanban-task-card--completed', this.isDoneTask(task));
@@ -6496,7 +6746,7 @@ export class KanbanView extends BasesView {
       line: task.line,
       rawLine: '',
       checkboxState: task.itemKind === 'bullet' ? undefined : task.checkboxState || '[ ]',
-      text: task.displayText || task.text,
+      text: taskTitle,
       sourceLaneValues: this.getDisplayLaneWritableValues(displayLane),
     });
     const handleRootTaskDragStart = (e: DragEvent) => {
@@ -6558,7 +6808,7 @@ export class KanbanView extends BasesView {
         role: 'button',
         tabindex: '0',
         draggable: 'true',
-        'aria-label': `Drag ${task.itemKind === 'bullet' ? 'bullet' : 'task'}: ${task.displayText || task.text}`,
+        'aria-label': `Drag ${task.itemKind === 'bullet' ? 'bullet' : 'task'}: ${taskTitle}`,
         title: task.itemKind === 'bullet' ? 'Drag bullet' : 'Drag task',
       },
     });
@@ -6580,7 +6830,7 @@ export class KanbanView extends BasesView {
         attr: {
           type: 'checkbox',
           role: 'checkbox',
-          'aria-label': `Toggle task: ${task.displayText || task.text}`,
+          'aria-label': `Toggle task: ${taskTitle}`,
           'data-checkbox-state': task.checkboxState || '[ ]',
           'data-checkbox-marker': this.getCheckboxMarker(task.checkboxState || '[ ]'),
         },
@@ -6600,7 +6850,7 @@ export class KanbanView extends BasesView {
       });
     }
     const titleEl = titleRow.createEl('span', {
-      text: task.displayText || task.text,
+      text: taskTitle,
       cls: 'tps-kanban-card-title tps-kanban-task-card-title',
       attr: { role: 'button', tabindex: '0', 'aria-label': `Open task in ${file.basename}` },
     });
@@ -6610,12 +6860,14 @@ export class KanbanView extends BasesView {
         e.stopPropagation();
         return;
       }
+      if (this.openTaskQuickEditor(e, cardEl, titleEl)) return;
       e.preventDefault();
       e.stopPropagation();
       void this.openTaskLine(file, task.line);
     });
     titleEl.addEventListener('keydown', (e: KeyboardEvent) => {
       if (e.key !== 'Enter' && e.key !== ' ') return;
+      if (this.openTaskQuickEditor(e, cardEl, titleEl)) return;
       e.preventDefault();
       e.stopPropagation();
       void this.openTaskLine(file, task.line);
@@ -6675,34 +6927,92 @@ export class KanbanView extends BasesView {
     return cardEl;
   }
 
-  private getTaskCardMetaProperties(file: TFile, task: OpenTaskSubitem, groupPropName: string | null): Array<{ text: string; title?: string; kind?: string }> {
-    const props: Array<{ text: string; title?: string; kind?: string }> = [
-      { text: file.basename, kind: 'source' },
-      { text: task.itemKind === 'bullet' ? 'bullet' : this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo', kind: 'status' },
-    ];
-    const groupProp = this.normalizeInlinePropertyKey(this.getTaskInlinePropertyName(groupPropName));
+  private getTaskCardMetaProperties(file: TFile, task: OpenTaskSubitem, groupPropName: string | null): TaskPropertyDisplay[] {
+    const selectedPropIds = this.getCardPropertyIds(groupPropName);
     const hidden = new Set(['tpsinlineprops', 'externalid', 'externaleventid', 'tpscalendaruid', 'tpscalendarsourceurl']);
-    const seen = new Set(props.map((prop) => `${prop.kind}:${prop.text.toLowerCase()}`));
+    const props: TaskPropertyDisplay[] = [];
+    const seen = new Set<string>();
+
+    for (const propId of selectedPropIds) {
+      const property = this.getTaskPropertyValue(file, task, propId, hidden);
+      if (!property) continue;
+      const id = `${property.kind || ''}:${property.text.toLowerCase()}`;
+      if (seen.has(id)) continue;
+      props.push(property);
+      seen.add(id);
+      if (props.length >= 4) break;
+    }
+
+    return props;
+  }
+
+  private getTaskPropertyValue(file: TFile, task: OpenTaskSubitem, propId: string, hidden: Set<string>): TaskPropertyDisplay | null {
+    const normalized = this.normalizeTaskPropertyId(propId);
+    if (!normalized || hidden.has(normalized)) return null;
+
+    if (normalized === 'status') {
+      const status = task.itemKind === 'bullet' ? 'bullet' : this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
+      return status ? {
+        text: status,
+        kind: 'status',
+        editable: task.itemKind !== 'bullet',
+        propName: this.getTaskInlinePropertyName(propId) || 'status',
+        rawValue: status,
+      } : null;
+    }
+
+    if (normalized === 'kind' || normalized === 'itemkind' || normalized === 'itemtype') {
+      const kind = task.itemKind === 'bullet' ? 'bullet' : 'task';
+      return { text: kind, kind: 'kind', editable: false };
+    }
+
+    if (normalized === 'path' || normalized === 'file' || normalized === 'source') {
+      return { text: file.basename, title: file.path, kind: 'source', editable: false };
+    }
+
+    if (normalized === 'line') {
+      return { text: String(task.line + 1), title: `${file.path}:${task.line + 1}`, kind: 'line', editable: false };
+    }
+
     for (const field of task.inlineFields ?? []) {
       const key = this.normalizeInlinePropertyKey(field.key);
-      if (!key || hidden.has(key)) continue;
-      if (key === groupProp && key !== 'scheduled') continue;
+      if (!key || key !== normalized || hidden.has(key)) continue;
       const value = String(field.value || '').trim();
-      if (!value) continue;
+      if (!value) return null;
       const text = this.formatTaskCardField(field.key, value);
-      const id = `${key}:${text.toLowerCase()}`;
-      if (!text || seen.has(id)) continue;
-      props.push({ text, title: field.key === 'tag' ? value : `${field.key}: ${value}`, kind: key === 'tag' || key === 'tags' ? 'tag' : key });
-      seen.add(id);
-      if (props.length >= 5) break;
+      if (!text) return null;
+      return {
+        text,
+        title: key === 'tag' || key === 'tags' ? value : `${field.key}: ${value}`,
+        kind: key === 'tag' || key === 'tags' ? 'tag' : key,
+        editable: true,
+        propName: field.key,
+        rawValue: value,
+      };
     }
-    return props;
+
+    return null;
+  }
+
+  private normalizeTaskPropertyId(propId: string): string {
+    const raw = String(propId || '').trim();
+    if (!raw) return '';
+    const lower = raw.toLowerCase();
+    if (lower === 'file.name' || lower === 'file.basename' || lower === 'file.fullname' || lower === 'file.link') return 'path';
+    if (lower === 'title' || lower === 'task.title') return 'title';
+    const frontmatterProp = this.getFrontmatterPropNameFromId(raw);
+    const withoutPrefix = lower.startsWith('task.') ? raw.slice(5) : frontmatterProp ?? raw;
+    const normalized = this.normalizeInlinePropertyKey(withoutPrefix);
+    if (normalized === 'filename' || normalized === 'basename' || normalized === 'fullname') return 'path';
+    return normalized;
   }
 
   private formatTaskCardField(key: string, value: string): string {
     const normalized = this.normalizeInlinePropertyKey(key);
-    if (normalized === 'tag' || normalized === 'tags') return value;
-    if (normalized === 'scheduled') {
+    if (normalized === 'tag' || normalized === 'tags') return value.replace(/^#/, '');
+    if (this.isDateLikeProperty(normalized)) {
+      const dateTime = this.formatCardPropertyValue(value);
+      if (dateTime && dateTime !== value) return dateTime;
       const timeMatch = value.match(/\b(\d{1,2}):(\d{2})(?::\d{2})?\b/u);
       if (timeMatch) {
         const hour = Number(timeMatch[1]);
@@ -6713,13 +7023,40 @@ export class KanbanView extends BasesView {
           return `${displayHour}:${minute} ${suffix}`;
         }
       }
-      const day = this.extractDateDay(value);
-      return day || value;
+      return dateTime || value;
     }
-    if (normalized === 'timeestimate') return `${value}m`;
-    const compactKey = key.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase();
-    const text = `${compactKey}: ${value}`;
+    if (this.isDurationLikeProperty(normalized)) return this.formatDurationLikeValue(value);
+    const text = this.formatCardPropertyValue(value);
     return text.length > 34 ? `${text.slice(0, 31)}...` : text;
+  }
+
+  private isDateLikeProperty(normalizedKey: string): boolean {
+    return normalizedKey === 'scheduled'
+      || normalizedKey === 'due'
+      || normalizedKey === 'start'
+      || normalizedKey === 'end'
+      || normalizedKey === 'date'
+      || normalizedKey === 'created'
+      || normalizedKey === 'modified'
+      || normalizedKey === 'ctime'
+      || normalizedKey === 'mtime'
+      || normalizedKey.endsWith('date')
+      || normalizedKey.endsWith('time')
+      || normalizedKey.endsWith('at');
+  }
+
+  private isDurationLikeProperty(normalizedKey: string): boolean {
+    return normalizedKey === 'timeestimate'
+      || normalizedKey === 'estimate'
+      || normalizedKey === 'duration'
+      || normalizedKey.endsWith('duration');
+  }
+
+  private formatDurationLikeValue(value: string): string {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    if (/[a-z]/i.test(raw)) return raw;
+    return `${raw}m`;
   }
 
   private getCheckboxMarker(rawState: string): string {
@@ -6735,12 +7072,22 @@ export class KanbanView extends BasesView {
     const targetSelection = propName
       ? await this.resolveDropValueForDisplayLane(displayLane)
       : { selected: true, value: null as string | null };
-    if (!targetSelection.selected) return;
+    if (!targetSelection.selected) {
+      flow('CreateSubitem', 'cancelled-target', { parentPath: parentEntry.file.path, lane: displayLane.label });
+      return;
+    }
 
     const parentKey = this.getParentLinkKeys()[0] ?? 'parent';
     const parentLinkValue = this.getFullPathWikilink(parentEntry.file);
     const targetValue = targetSelection.value;
 
+    flow('CreateSubitem', 'submit', {
+      parentPath: parentEntry.file.path,
+      parentKey,
+      propName: propName || '',
+      lane: displayLane.label,
+      targetValue,
+    });
     await this.createFileForView(undefined, (fm: Record<string, unknown>) => {
       if (propName) {
         if (targetValue == null) {
@@ -6757,13 +7104,39 @@ export class KanbanView extends BasesView {
     this.queuePostCreateRefresh();
   }
 
-  private async createTaskForEntry(file: TFile): Promise<void> {
+  private async createTaskForEntry(
+    file: TFile,
+    propName: string | null = null,
+    displayLane: DisplayLaneGroup | null = null,
+    taskFilter = this.getTaskRootFilterFromBaseFilters(),
+  ): Promise<void> {
+    const targetSelection = propName && displayLane
+      ? await this.resolveDropValueForDisplayLane(displayLane)
+      : { selected: true, value: null as string | null };
+    if (!targetSelection.selected) {
+      flow('CreateTask', 'cancelled-target', { path: file.path, lane: displayLane?.label || '' });
+      return;
+    }
+
     const title = await new Promise<string | null>((resolve) => {
       new TaskTitleModal(this.app, file.basename, resolve).open();
     });
-    if (!title) return;
+    if (!title) {
+      flow('CreateTask', 'cancelled-title', { path: file.path });
+      return;
+    }
 
-    const taskLine = `- [ ] ${title}`;
+    const defaults = this.getRootTaskCreationDefaults(taskFilter);
+    const taskLine = this.buildRootTaskLine(title, propName, targetSelection.value, taskFilter, defaults);
+    flow('CreateTask', 'write', {
+      path: file.path,
+      propName: propName || '',
+      lane: displayLane?.label || '',
+      targetValue: targetSelection.value,
+      status: defaults.status || '',
+      tags: Array.from(defaults.tags || []),
+      inlineKeys: Array.from(defaults.inlineFields?.keys?.() || []),
+    });
     await this.app.vault.process(file, (content) => {
       const trimmedEnd = content.replace(/\s+$/g, '');
       return trimmedEnd ? `${trimmedEnd}\n${taskLine}\n` : `${taskLine}\n`;
@@ -6782,21 +7155,42 @@ export class KanbanView extends BasesView {
     const targetSelection = propName
       ? await this.resolveDropValueForDisplayLane(displayLane)
       : { selected: true, value: null as string | null };
-    if (!targetSelection.selected) return;
+    if (!targetSelection.selected) {
+      flow('CreateRootTask', 'cancelled-target', { lane: displayLane.label });
+      return;
+    }
 
     const title = await new Promise<string | null>((resolve) => {
       new TaskTitleModal(this.app, 'task board', resolve).open();
     });
-    if (!title) return;
+    if (!title) {
+      flow('CreateRootTask', 'cancelled-title', { lane: displayLane.label });
+      return;
+    }
 
     const defaults = this.getRootTaskCreationDefaults(taskFilter);
     const targetFile = await this.resolveRootTaskTargetFile(defaults);
     if (!targetFile) {
+      flowWarn('CreateRootTask', 'missing-target', {
+        lane: displayLane.label,
+        defaultTargetPath: defaults.targetPath || '',
+        configuredDefaultRootTaskPath: this.plugin.settings?.defaultRootTaskPath || '',
+      });
       new Notice('Could not resolve a note to write the task into.');
       return;
     }
 
     const taskLine = this.buildRootTaskLine(title, propName, targetSelection.value, taskFilter, defaults);
+    flow('CreateRootTask', 'write', {
+      path: targetFile.path,
+      lane: displayLane.label,
+      propName: propName || '',
+      targetValue: targetSelection.value,
+      status: defaults.status || '',
+      tags: Array.from(defaults.tags || []),
+      inlineKeys: Array.from(defaults.inlineFields?.keys?.() || []),
+      openAfterCreate: this.plugin.settings.openTaskDestinationAfterCreate !== false,
+    });
     await this.app.vault.process(targetFile, (content) => this.insertLineAfterFrontmatter(content, taskLine));
 
     this.clearTaskCachesForPath(targetFile.path);
@@ -6814,51 +7208,14 @@ export class KanbanView extends BasesView {
     taskFilter: KanbanTaskRootFilter,
     defaults = this.getRootTaskCreationDefaults(taskFilter),
   ): string {
-    const writablePropName = propName ? this.getTaskInlinePropertyName(propName) : '';
-    const normalizedProp = writablePropName ? this.normalizeInlinePropertyKey(writablePropName) : '';
-    const parts = [`- [${this.getRootTaskCheckboxMarker(propName, laneValue, taskFilter, defaults)}] ${String(title || '').trim() || 'Untitled task'}`];
-    const tags = new Set<string>();
-
-    for (const tag of defaults.tags) {
-      if (defaults.excludedTags.has(tag)) continue;
-      const writableTag = this.normalizeWritableTaskTag(tag);
-      if (writableTag) tags.add(writableTag);
-    }
-    if (normalizedProp === 'tags' && laneValue) {
-      const laneTag = this.normalizeTaskTag(laneValue);
-      const writableLaneTag = this.normalizeWritableTaskTag(laneTag);
-      if (writableLaneTag && !defaults.excludedTags.has(laneTag)) tags.add(writableLaneTag);
-    }
-    for (const tag of tags) parts.push(`#${tag}`);
-
-    if (writablePropName && laneValue != null && laneValue !== '' && normalizedProp !== 'tags' && !this.isStatusPropertyName(writablePropName)) {
-      parts.push(`[${writablePropName}:: ${laneValue}]`);
-    }
-    for (const [defaultProp, field] of defaults.inlineFields) {
-      if (
-        !field.value
-        || defaultProp === normalizedProp
-        || defaultProp === 'tags'
-        || this.isStatusPropertyName(field.key)
-      ) continue;
-      parts.push(`[${field.key}:: ${field.value}]`);
-    }
-
-    return parts.join(' ').replace(/\s+/g, ' ').trim();
-  }
-
-  private getRootTaskCheckboxMarker(
-    propName: string | null,
-    laneValue: string | null,
-    taskFilter: KanbanTaskRootFilter,
-    defaults = this.getRootTaskCreationDefaults(taskFilter),
-  ): string {
-    const laneCheckbox = propName && this.isStatusPropertyName(propName)
-      ? this.getCheckboxStateForStatus(laneValue)
-      : null;
-    const filterStatus = !laneCheckbox ? defaults.status ?? null : null;
-    const checkbox = laneCheckbox || this.getCheckboxStateForStatus(filterStatus) || '[ ]';
-    return this.getCheckboxMarker(checkbox);
+    return buildKanbanRootTaskLine({
+      title,
+      propName,
+      laneValue,
+      defaults,
+      getCheckboxStateForStatus: (status) => this.getCheckboxStateForStatus(status),
+      isStatusPropertyName: (name) => this.isStatusPropertyName(name),
+    });
   }
 
   private getRootTaskCreationDefaults(taskFilter: KanbanTaskRootFilter): TaskCreationDefaults {
@@ -6977,6 +7334,9 @@ export class KanbanView extends BasesView {
 
   private inferTaskCreationDefaultsFromString(rawExpr: string): TaskCreationDefaults | null {
     const raw = String(rawExpr || '').trim();
+    if (parseBareSemanticKindExpression(raw)) {
+      return { mode: 'notes', inlineFields: new Map(), tags: new Set(), excludedStatuses: new Set(), excludedTags: new Set() };
+    }
     const isNegated = raw.startsWith('!');
     const expr = (isNegated ? raw.slice(1) : raw).trim();
     const defaults = this.inferPositiveTaskCreationDefaultsFromString(expr);
@@ -7059,6 +7419,10 @@ export class KanbanView extends BasesView {
     if (!values.length) return null;
     const excluded = operator.startsWith('!') || operator.includes('not') || operator === '!=' || operator === '!==';
 
+    if (isBareSemanticKindFilter(propRaw, values)) {
+      return { mode: 'notes', inlineFields: new Map(), tags: new Set(), excludedStatuses: new Set(), excludedTags: new Set() };
+    }
+
     if (['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) {
       const value = values[0].toLowerCase();
       return { mode: value.startsWith('task') ? 'tasks' : value.startsWith('note') ? 'notes' : 'mixed', inlineFields: new Map(), tags: new Set(), excludedStatuses: new Set(), excludedTags: new Set() };
@@ -7105,43 +7469,33 @@ export class KanbanView extends BasesView {
     const normalizedLine = String(line || '').trim();
     if (!normalizedLine) return content;
     const normalizedContent = String(content || '').replace(/\s+$/g, '');
-    const frontmatterMatch = normalizedContent.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n)?/);
-    if (!frontmatterMatch) {
-      return normalizedContent ? `${normalizedContent}\n${normalizedLine}\n` : `${normalizedLine}\n`;
-    }
-    const frontmatter = frontmatterMatch[0].replace(/\s+$/g, '');
-    const body = normalizedContent.slice(frontmatterMatch[0].length).trimStart();
-    return body
-      ? `${frontmatter}\n${normalizedLine}\n${body}\n`
-      : `${frontmatter}\n${normalizedLine}\n`;
+    return normalizedContent ? `${normalizedContent}\n${normalizedLine}\n` : `${normalizedLine}\n`;
   }
 
   private async resolveRootTaskTargetFile(defaults = this.getRootTaskCreationDefaults(this.getTaskRootFilterFromBaseFilters())): Promise<TFile | null> {
-    const configuredTargetPath = defaults.targetPath || this.plugin.settings?.defaultRootTaskPath || '';
-    if (configuredTargetPath) {
-      const targetPath = this.normalizeTaskTargetPath(configuredTargetPath);
-      if (targetPath) {
-        const existing = this.app.vault.getFileByPath(targetPath);
-        if (existing instanceof TFile) return existing;
-        const folderPath = targetPath.includes('/') ? targetPath.slice(0, targetPath.lastIndexOf('/')) : '';
-        if (folderPath) await this.ensureFolderPath(folderPath);
-        const basename = targetPath.split('/').pop()?.replace(/\.md$/i, '') || 'Tasks';
-        return await this.app.vault.create(targetPath, `---\ntitle: ${basename}\n---\n`);
+    const targetPath = resolveKanbanRootTaskTargetPath(defaults.targetPath, this.plugin.settings?.defaultRootTaskPath || '');
+    if (targetPath) {
+      const existing = this.app.vault.getFileByPath(targetPath);
+      if (existing instanceof TFile) {
+        flow('CreateRootTaskTarget', 'resolved-existing', { path: targetPath });
+        return existing;
       }
+      const folderPath = targetPath.includes('/') ? targetPath.slice(0, targetPath.lastIndexOf('/')) : '';
+      if (folderPath) await this.ensureFolderPath(folderPath);
+      const basename = targetPath.split('/').pop()?.replace(/\.md$/i, '') || 'Tasks';
+      flow('CreateRootTaskTarget', 'create-file', { path: targetPath, folderPath });
+      return await this.app.vault.create(targetPath, `---\ntitle: ${basename}\n---\n`);
     }
 
+    flowWarn('CreateRootTaskTarget', 'unresolved', {
+      defaultTargetPath: defaults.targetPath || '',
+      configuredDefaultRootTaskPath: this.plugin.settings?.defaultRootTaskPath || '',
+    });
     return null;
   }
 
   private normalizeTaskTargetPath(value: unknown): string | null {
-    const raw = String(value || '').trim()
-      .replace(/^\[\[|\]\]$/g, '')
-      .replace(/^\"+|\"+$/g, '')
-      .replace(/^'+|'+$/g, '');
-    if (!raw) return null;
-    const normalized = normalizePath(raw).replace(/^\/+/, '');
-    if (!normalized.toLowerCase().endsWith('.md')) return `${normalized}.md`;
-    return normalized;
+    return normalizeKanbanTaskTargetPath(value);
   }
 
   private normalizeNoteTargetPath(value: unknown): string | null {
@@ -7312,14 +7666,16 @@ export class KanbanView extends BasesView {
       button.addEventListener('click', onClick);
       return button;
     };
-    createControlButton(
-      layoutMode === 'list' ? 'columns' : 'list',
-      layoutMode === 'list' ? 'Switch to board' : 'Switch to list',
-      null,
-      () => {
-        void this.toggleLayoutMode();
-      },
-    );
+    {
+      createControlButton(
+        layoutMode === 'list' ? 'columns' : 'list',
+        layoutMode === 'list' ? 'Switch to board' : 'Switch to list',
+        null,
+        () => {
+          void this.toggleLayoutMode();
+        },
+      );
+    }
     createControlButton(
       this.plugin.settings.dynamicEmptyLaneWidth ? 'panel-left-close' : 'panel-left-open',
       this.plugin.settings.dynamicEmptyLaneWidth ? 'Dynamic width: on' : 'Dynamic width: off',
@@ -7360,10 +7716,20 @@ export class KanbanView extends BasesView {
       laneEl.classList.toggle('tps-kanban-lane--empty', itemCount === 0);
       laneEl.classList.toggle('tps-kanban-lane--collapsed', laneCollapsed);
 
+      const createCommandOverride = this.getCreateCommandOverride();
       const laneAddMode = this.resolveCardAddMode(taskFilter);
-      const shouldCreateTask = laneAddMode === 'task';
+      const laneAdd = resolveKanbanLaneAddPresentation(laneAddMode, displayLane.label);
       const handleLaneAdd = async () => {
-        if (shouldCreateTask) {
+        if (this.runCreateCommandOverride()) return;
+        flow('LaneAdd', 'click', {
+          lane: displayLane.label,
+          mode: createCommandOverride ? 'command' : laneAddMode,
+          commandId: createCommandOverride?.id || '',
+          createsTask: laneAdd.shouldCreateTask,
+          taskFilterMode: taskFilter.mode,
+          propName: propName || '',
+        });
+        if (laneAdd.shouldCreateTask) {
           await this.createRootTaskForLane(propName, displayLane, taskFilter);
           return;
         }
@@ -7446,10 +7812,35 @@ export class KanbanView extends BasesView {
         board.removeClass('tps-kanban-board--lane-drag');
 
         const draggedLaneId = e.dataTransfer.getData('application/x-kanban-lane');
-        if (!draggedLaneId || draggedLaneId === laneId) return;
+        if (!draggedLaneId || draggedLaneId === laneId) {
+          flowWarn('LaneOrder', 'drop:ignored', {
+            reason: draggedLaneId ? 'same-lane' : 'missing-lane',
+            draggedLaneId,
+            targetLaneId: laneId,
+          });
+          return;
+        }
         const nextGroups = this.reorderGroups(groups, draggedLaneId, laneId, position);
-        if (nextGroups === groups) return;
+        if (nextGroups === groups) {
+          flowWarn('LaneOrder', 'drop:ignored', {
+            reason: 'unchanged-order',
+            draggedLaneId,
+            targetLaneId: laneId,
+            position,
+          });
+          return;
+        }
+        flow('LaneOrder', 'drop:save', {
+          draggedLaneId,
+          targetLaneId: laneId,
+          position,
+        });
         await this.saveManualLaneOrder(nextGroups);
+        flow('LaneOrder', 'drop:done', {
+          draggedLaneId,
+          targetLaneId: laneId,
+          position,
+        });
         this.render();
       });
 
@@ -7480,8 +7871,8 @@ export class KanbanView extends BasesView {
           cls: 'tps-kanban-lane-header-add',
           attr: {
             type: 'button',
-            'aria-label': shouldCreateTask ? `Add task to ${displayLane.label}` : `Add card to ${displayLane.label}`,
-            title: shouldCreateTask ? 'Add task' : 'Add card',
+            'aria-label': createCommandOverride ? `Run ${createCommandOverride.name}` : laneAdd.ariaLabel,
+            title: createCommandOverride ? `Run ${createCommandOverride.name}` : laneAdd.title,
           },
         });
         setIconWithFallback(headerAdd, 'plus');
@@ -7578,11 +7969,34 @@ export class KanbanView extends BasesView {
           const filePath = e.dataTransfer.getData('application/x-kanban-entry');
           if (!filePath && !taskPayload) return;
           const targetSelection = await this.resolveDropValueForDisplayLane(displayLane);
-          if (!targetSelection.selected) return;
+          if (!targetSelection.selected) {
+            flow('LaneDrop', 'cancelled-target', {
+              lane: displayLane.label,
+              propName,
+              hasTaskPayload: !!taskPayload,
+              filePath,
+            });
+            return;
+          }
           const targetValue = targetSelection.value;
           if (taskPayload) {
             const taskFile = taskPayload.path ? this.app.vault.getFileByPath(taskPayload.path) : null;
-            if (!taskFile || !taskPayload.line) return;
+            if (!taskFile || !taskPayload.line) {
+              flowWarn('LaneDrop', 'blocked', {
+                reason: 'missing-task-source',
+                path: taskPayload.path,
+                line: taskPayload.line,
+                lane: displayLane.label,
+              });
+              return;
+            }
+            flow('LaneDrop', 'task:start', {
+              path: taskFile.path,
+              line: taskPayload.line,
+              lane: displayLane.label,
+              propName,
+              targetValue,
+            });
             await this.confirmAndApplyInlineTaskDrop(
               taskFile,
               taskPayload.line,
@@ -7592,7 +8006,14 @@ export class KanbanView extends BasesView {
             );
           } else {
             const file = this.app.vault.getFileByPath(filePath);
-            if (!file) return;
+            if (!file) {
+              flowWarn('LaneDrop', 'blocked', {
+                reason: 'missing-file',
+                filePath,
+                lane: displayLane.label,
+              });
+              return;
+            }
             let sourceLaneValues: string[] = [];
             try {
               const rawSourceValues = e.dataTransfer.getData('application/x-kanban-entry-source-values');
@@ -7604,6 +8025,13 @@ export class KanbanView extends BasesView {
             await this.applyFrontmatterProperty(file, propName, targetValue, sourceLaneValues);
             await this.applyCompanionRulesToFile(file);
           }
+          flow('LaneDrop', 'done', {
+            lane: displayLane.label,
+            propName,
+            targetValue,
+            kind: taskPayload ? 'task' : 'note',
+            path: taskPayload?.path || filePath,
+          });
           this.render();
         };
 
@@ -7624,7 +8052,7 @@ export class KanbanView extends BasesView {
         cardsWrap.appendChild(card);
       }
 
-      laneEl.createEl('button', { text: shouldCreateTask ? '+ Add task' : '+ Add card', cls: 'tps-kanban-add-card' })
+      laneEl.createEl('button', { text: createCommandOverride ? `+ ${createCommandOverride.name}` : laneAdd.buttonText, cls: 'tps-kanban-add-card' })
         .addEventListener('click', async () => {
           await handleLaneAdd();
         });
@@ -7633,4 +8061,5 @@ export class KanbanView extends BasesView {
     this.syncNativeResultsCountSoon();
     this.restoreRenderScrollState(scrollState);
   }
+
 }

@@ -15,6 +15,7 @@ export class EditCardModal extends Modal {
   }
 
   onOpen() {
+    this.modalEl.addClass("tps-keyboard-aware-modal");
     const { contentEl } = this;
     contentEl.createEl('h3', { text: 'Edit card' });
     const titleInput = new TextComponent(contentEl);

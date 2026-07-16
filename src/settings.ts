@@ -72,6 +72,8 @@ export const DEFAULT_PRIORITY_CARD_STYLE_RULES: KanbanStyleRule[] = [
 ];
 
 export interface KanbanSettings {
+  /** Enable concise development logs in the developer console */
+  enableLogging: boolean;
   /** Frontmatter key that holds a Lucide icon name (e.g. "icon") */
   iconKey: string;
   /** Frontmatter key that holds a CSS color value (e.g. "color") */
@@ -109,6 +111,7 @@ export interface KanbanSettings {
 }
 
 export const DEFAULT_SETTINGS: KanbanSettings = {
+  enableLogging: false,
   iconKey: 'icon',
   colorKey: 'color',
   frontmatterColorTarget: 'card',
@@ -120,7 +123,7 @@ export const DEFAULT_SETTINGS: KanbanSettings = {
   showCompletedTasksByView: {},
   dynamicEmptyLaneWidth: false,
   laneLabelAliasesByView: {},
-  cardActivationMode: 'preview',
+  cardActivationMode: 'open',
   cardAddButtonDefault: 'note',
   defaultRootTaskPath: '',
   openTaskDestinationAfterCreate: true,

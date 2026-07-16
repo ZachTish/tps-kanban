@@ -45,6 +45,50 @@ export class KanbanSettingTab extends PluginSettingTab {
       cls: 'setting-item-description',
     });
 
+    const coreSettings = containerEl.createDiv({ cls: 'tps-settings-core' });
+    new Setting(coreSettings).setName('Core settings').setHeading();
+
+    new Setting(coreSettings)
+      .setName('Card click behavior')
+      .setDesc('Choose whether a normal card click shows a Hover Editor preview first or opens the note immediately.')
+      .addDropdown((drop) => drop
+        .addOption('preview', 'Preview first')
+        .addOption('open', 'Open note')
+        .setValue(this.plugin.settings.cardActivationMode || 'open')
+        .onChange(async (value) => {
+          this.plugin.settings.cardActivationMode = value as 'preview' | 'open';
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(coreSettings)
+      .setName('Card add button default')
+      .setDesc('Choose whether the + button on a card creates a linked note subitem or an inline task in that card note.')
+      .addDropdown((drop) => drop
+        .addOption('note', 'Linked note subitem')
+        .addOption('task', 'Inline task')
+        .setValue(this.plugin.settings.cardAddButtonDefault || 'note')
+        .onChange(async (value) => {
+          this.plugin.settings.cardAddButtonDefault = value as 'note' | 'task';
+          await this.plugin.saveSettings();
+        }));
+
+    const diagnostics = createCollapsibleSection(
+      containerEl,
+      'Diagnostics',
+      'Concise development logs for tracing Kanban creation, filter, and settings flows.',
+      false,
+    );
+
+    new Setting(diagnostics)
+      .setName('Enable debug logging')
+      .setDesc('Logs Kanban lifecycle, settings saves, Base filter reads, lane add decisions, task creation, note creation, and edit failures. Errors are always logged.')
+      .addToggle((toggle) => toggle
+        .setValue(!!this.plugin.settings.enableLogging)
+        .onChange(async (value) => {
+          this.plugin.settings.enableLogging = value;
+          await this.plugin.saveSettings();
+        }));
+
     this.renderBaseQueryGuide(containerEl);
 
     const cardFields = createCollapsibleSection(
@@ -162,30 +206,6 @@ export class KanbanSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
-
-    new Setting(laneOrder)
-      .setName('Card click behavior')
-      .setDesc('Choose whether a normal card click shows a Hover Editor preview first or opens the note immediately.')
-      .addDropdown((drop) => drop
-        .addOption('preview', 'Preview first')
-        .addOption('open', 'Open note')
-        .setValue(this.plugin.settings.cardActivationMode || 'preview')
-        .onChange(async (value) => {
-          this.plugin.settings.cardActivationMode = value as 'preview' | 'open';
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(laneOrder)
-      .setName('Card add button default')
-      .setDesc('Choose whether the + button on a card creates a linked note subitem or an inline task in that card note.')
-      .addDropdown((drop) => drop
-        .addOption('note', 'Linked note subitem')
-        .addOption('task', 'Inline task')
-        .setValue(this.plugin.settings.cardAddButtonDefault || 'note')
-        .onChange(async (value) => {
-          this.plugin.settings.cardAddButtonDefault = value as 'note' | 'task';
-          await this.plugin.saveSettings();
-        }));
 
     new Setting(laneOrder)
       .setName('Default root task note path')

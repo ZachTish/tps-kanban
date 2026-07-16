@@ -1,13 +1,125 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
+import { Buffer } from 'node:buffer';
+import { fileURLToPath } from 'node:url';
+import * as esbuild from 'esbuild';
 
 const viewSource = readFileSync(new URL('../src/views/KanbanView.ts', import.meta.url), 'utf8');
+const taskCreationUtilsSource = readFileSync(new URL('../src/task-creation-utils.ts', import.meta.url), 'utf8');
+const taskCheckboxUtilsSource = readFileSync(new URL('../src/task-checkbox-utils.ts', import.meta.url), 'utf8');
+const taskDropUtilsSource = readFileSync(new URL('../src/task-drop-utils.ts', import.meta.url), 'utf8');
+const filterKindUtilsSource = readFileSync(new URL('../src/filter-kind-utils.ts', import.meta.url), 'utf8');
 const mainSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
 const settingsSource = readFileSync(new URL('../src/settings.ts', import.meta.url), 'utf8');
 const settingsTabSource = readFileSync(new URL('../src/settings/SettingsTab.ts', import.meta.url), 'utf8');
 const stylesSource = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 const loadedStylesSource = readFileSync(new URL('../styles.css', import.meta.url), 'utf8');
+
+async function importTaskCreationUtils() {
+  const build = await esbuild.build({
+    entryPoints: [fileURLToPath(new URL('../src/task-creation-utils.ts', import.meta.url))],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    write: false,
+    plugins: [
+      {
+        name: 'obsidian-stub',
+        setup(build) {
+          build.onResolve({ filter: /^obsidian$/ }, () => ({ path: 'obsidian-stub', namespace: 'stub' }));
+          build.onLoad({ filter: /.*/, namespace: 'stub' }, () => ({
+            loader: 'js',
+            contents: `
+              export function normalizePath(value) {
+                return String(value || '')
+                  .replace(/\\\\/g, '/')
+                  .replace(/\\/{2,}/g, '/')
+                  .replace(/^\\.\\//, '')
+                  .replace(/\\/\\.\\//g, '/')
+                  .replace(/\\/$/, '');
+              }
+            `,
+          }));
+        },
+      },
+    ],
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
+}
+
+async function importTaskCheckboxUtils() {
+  const build = await esbuild.build({
+    entryPoints: [fileURLToPath(new URL('../src/task-checkbox-utils.ts', import.meta.url))],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    write: false,
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
+}
+
+async function importTaskDropUtils() {
+  const build = await esbuild.build({
+    entryPoints: [fileURLToPath(new URL('../src/task-drop-utils.ts', import.meta.url))],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    write: false,
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
+}
+
+async function importFilterKindUtils() {
+  const build = await esbuild.build({
+    entryPoints: [fileURLToPath(new URL('../src/filter-kind-utils.ts', import.meta.url))],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    write: false,
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
+}
+
+async function importKanbanView() {
+  const build = await esbuild.build({
+    entryPoints: [fileURLToPath(new URL('../src/views/KanbanView.ts', import.meta.url))],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    write: false,
+    plugins: [
+      {
+        name: 'obsidian-stub',
+        setup(build) {
+          build.onResolve({ filter: /^obsidian$/ }, () => ({ path: 'obsidian-stub', namespace: 'stub' }));
+          build.onLoad({ filter: /.*/, namespace: 'stub' }, () => ({
+            loader: 'js',
+            contents: `
+              export class BasesView {}
+              export class QueryController {}
+              export class Menu {}
+              export class BasesEntry {}
+              export class BasesEntryGroup {}
+              export function setIcon() {}
+              export class TFile {}
+              export function debounce(callback) { return callback; }
+              export function normalizePath(value) { return String(value || '').replace(/\\\\/g, '/'); }
+              export class Modal {}
+              export class Setting {}
+              export function getAllTags() { return []; }
+              export class WorkspaceLeaf {}
+              export function parseYaml() { return {}; }
+              export class Notice {}
+              export const Platform = { isMobile: false };
+            `,
+          }));
+        },
+      },
+    ],
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
+}
 
 function getFrontmatterPropNameFromId(propId) {
   const raw = String(propId ?? '').trim();
@@ -47,6 +159,44 @@ test('loaded Obsidian stylesheet matches source stylesheet', () => {
   assert.equal(loadedStylesSource, stylesSource);
 });
 
+test('normal card clicks open/focus unless GCM forces Base previews', () => {
+  const methodMatch = viewSource.match(/private shouldPreviewCardClicks\(\): boolean \{([\s\S]*?)\n  \}/);
+  assert.ok(methodMatch, 'shouldPreviewCardClicks method should exist');
+  assert.match(methodMatch[1], /return shouldForceBaseLinkPreview\(this\.app\);/);
+  assert.doesNotMatch(methodMatch[1], /cardActivationMode/);
+  assert.match(settingsSource, /cardActivationMode: 'open'/);
+  assert.match(settingsTabSource, /\.setValue\(this\.plugin\.settings\.cardActivationMode \|\| 'open'\)/);
+});
+
+test('repeated card clicks are not swallowed by the preview-bubble guard', () => {
+  assert.match(viewSource, /let lastPreviewClickTimeStamp = 0;/);
+  assert.match(viewSource, /lastPreviewClickTimeStamp = e\.timeStamp \|\| 0;/);
+  assert.doesNotMatch(viewSource, /if \(!\(e instanceof PointerEvent\)\) return false;/);
+  assert.match(viewSource, /const repeated = lastTapPath === entry\.file\.path && now - lastTapAt < 650;/);
+  assert.match(viewSource, /const isSamePreviewClick = lastPreviewOpenAt > 0[\s\S]*!!lastPreviewClickTimeStamp[\s\S]*e\.timeStamp === lastPreviewClickTimeStamp;/);
+  assert.match(viewSource, /if \(isSamePreviewClick\) \{/);
+  assert.ok(
+    viewSource.indexOf('if (isSamePreviewClick) {') < viewSource.indexOf('if (!this.shouldPreviewCardClicks() || shouldOpenFromRepeatedTap(e)) {'),
+    'same-preview-click guard should still run before preview/open decision',
+  );
+});
+
+test('card and task opens create a foreground tab when the target file is not already open', () => {
+  const methodMatch = viewSource.match(/private getTargetLeafForOpen\(\): WorkspaceLeaf \| null \{([\s\S]*?)\n  \}/);
+  assert.ok(methodMatch, 'getTargetLeafForOpen method should exist');
+  assert.match(methodMatch[1], /return this\.app\.workspace\.getLeaf\('tab'\)/);
+  assert.doesNotMatch(methodMatch[1], /activeLeaf/);
+  assert.doesNotMatch(methodMatch[1], /getLeavesOfType\('markdown'\)/);
+});
+
+test('root task cards follow selected Base properties', () => {
+  assert.match(viewSource, /const selectedPropIds = this\.getCardPropertyIds\(groupPropName\)/);
+  assert.match(viewSource, /private getTaskPropertyValue\(file: TFile, task: OpenTaskSubitem, propId: string/);
+  assert.match(viewSource, /private normalizeTaskPropertyId\(propId: string\): string/);
+  assert.match(viewSource, /this\.getTaskPropertyValue\(file, task, propId, hidden\)/);
+  assert.doesNotMatch(viewSource, /const props: Array<\{ text: string; title\?: string; kind\?: string \}> = \[\s*\{ text: file\.basename, kind: 'source' \}/);
+});
+
 test('settings include a Base-native query guide', () => {
   assert.match(settingsTabSource, /Base query guide/);
   assert.match(settingsTabSource, /applies it separately to note cards and checkbox task cards/);
@@ -78,11 +228,10 @@ test('kanban search stays scoped to the current leaf or embed', () => {
 
 test('embedded kanban resolves markdown context before neighboring base tabs', () => {
   assert.match(viewSource, /private getWorkspaceLeafMarkdownContextPath\(\): string \| null/);
-  assert.match(viewSource, /private getVirtualBaseEmbedHost\(\): HTMLElement \| null/);
   assert.match(viewSource, /private getEmbeddedBasePathFromDom\(\): string \| null/);
   assert.ok(viewSource.includes('.internal-embed[src$=".base"]'));
   assert.match(viewSource, /this\.getEmbeddedBasePathFromDom\(\)/);
-  assert.match(viewSource, /if \(directFile && this\.getVirtualBaseEmbedHost\(\)\) return directFile\.path/);
+  assert.match(viewSource, /if \(directFile\) return directFile\.path/);
   assert.match(viewSource, /const activeFile = this\.app\.workspace\.getActiveFile\?\.\(\)/);
   assert.match(viewSource, /this\.isEmbeddedKanbanContext\(\) && activeFile instanceof TFile && activeFile\.extension === 'md'/);
   assert.match(viewSource, /return activeFile\.path/);
@@ -110,6 +259,146 @@ test('extracts serialized frontmatter lane labels', () => {
   assert.deepEqual(extractGroupValues('Single'), ['Single']);
 });
 
+test('root task creation utilities normalize targets and build lane-matching task lines', async () => {
+  const {
+    buildKanbanRootTaskLine,
+    getKanbanRootTaskCheckboxMarker,
+    normalizeKanbanTaskTargetPath,
+    resolveKanbanLaneAddPresentation,
+    resolveKanbanRootTaskTargetPath,
+  } = await importTaskCreationUtils();
+
+  assert.match(taskCreationUtilsSource, /export function resolveKanbanLaneAddPresentation/);
+  assert.match(viewSource, /resolveKanbanLaneAddPresentation\(laneAddMode, displayLane\.label\)/);
+  assert.match(viewSource, /if \(laneAdd\.shouldCreateTask\)/);
+  assert.match(viewSource, /'aria-label': createCommandOverride \? `Run \$\{createCommandOverride\.name\}` : laneAdd\.ariaLabel/);
+  assert.match(viewSource, /title: createCommandOverride \? `Run \$\{createCommandOverride\.name\}` : laneAdd\.title/);
+  assert.match(viewSource, /text: createCommandOverride \? `\+ \$\{createCommandOverride\.name\}` : laneAdd\.buttonText/);
+
+  assert.equal(normalizeKanbanTaskTargetPath('Inbox/Tasks'), 'Inbox/Tasks.md');
+  assert.equal(normalizeKanbanTaskTargetPath('[[Inbox/Tasks|Task Inbox]]'), 'Inbox/Tasks.md');
+  assert.equal(normalizeKanbanTaskTargetPath('[Task Inbox](Inbox/Tasks.md#Today)'), 'Inbox/Tasks.md');
+  assert.equal(resolveKanbanRootTaskTargetPath('[[Inbox/Filtered Tasks|Filtered]]', 'Inbox/Default.md'), 'Inbox/Filtered Tasks.md');
+  assert.equal(resolveKanbanRootTaskTargetPath('', '[Default](Inbox/Default.md#Tasks)'), 'Inbox/Default.md');
+  assert.equal(resolveKanbanRootTaskTargetPath('', ''), null);
+
+  const checkboxForStatus = (status) => {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (normalized === 'next') return '[/]';
+    if (normalized === 'complete') return '[x]';
+    if (normalized === 'todo') return '[ ]';
+    return null;
+  };
+  const defaults = {
+    status: 'next',
+    targetPath: 'Inbox/Tasks.md',
+    tags: new Set(['#work', '#skip']),
+    excludedTags: new Set(['#skip']),
+    inlineFields: new Map([
+      ['area', { key: 'area', value: 'GCP' }],
+      ['status', { key: 'status', value: 'next' }],
+    ]),
+  };
+
+  assert.deepEqual(resolveKanbanLaneAddPresentation('task', 'Doing'), {
+    shouldCreateTask: true,
+    buttonText: '+ Add task',
+    title: 'Add task',
+    ariaLabel: 'Add task to Doing',
+  });
+  assert.deepEqual(resolveKanbanLaneAddPresentation('note', ''), {
+    shouldCreateTask: false,
+    buttonText: '+ Add card',
+    title: 'Add card',
+    ariaLabel: 'Add card to lane',
+  });
+  assert.equal(
+    getKanbanRootTaskCheckboxMarker({
+      propName: 'task.status',
+      laneValue: 'complete',
+      defaults,
+      getCheckboxStateForStatus: checkboxForStatus,
+    }),
+    'x',
+  );
+  assert.equal(
+    getKanbanRootTaskCheckboxMarker({
+      propName: 'task.area',
+      laneValue: 'Ops',
+      defaults,
+      getCheckboxStateForStatus: checkboxForStatus,
+    }),
+    '/',
+  );
+
+  assert.equal(
+    buildKanbanRootTaskLine({
+      title: 'Plan rollout',
+      propName: 'task.status',
+      laneValue: 'complete',
+      defaults,
+      getCheckboxStateForStatus: checkboxForStatus,
+    }),
+    '- [x] Plan rollout #work [area:: GCP]',
+    'lane status should win over default status and status should not be duplicated inline',
+  );
+  assert.equal(
+    buildKanbanRootTaskLine({
+      title: 'Refine scope',
+      propName: 'task.tags',
+      laneValue: '#deep work',
+      defaults,
+      getCheckboxStateForStatus: checkboxForStatus,
+    }),
+    '- [/] Refine scope #work #deep-work [area:: GCP]',
+    'tag lanes should add a writable lane tag while retaining non-excluded filter tags',
+  );
+  assert.equal(
+    buildKanbanRootTaskLine({
+      title: 'Write summary',
+      propName: 'task.area',
+      laneValue: 'Ops',
+      defaults,
+      getCheckboxStateForStatus: checkboxForStatus,
+    }),
+    '- [/] Write summary #work [area:: Ops]',
+    'lane inline property should win over matching Base default field',
+  );
+});
+
+test('task checkbox utilities toggle mapped statuses and update only task checkbox markers', async () => {
+  assert.match(taskCheckboxUtilsSource, /export function replaceKanbanTaskLineCheckboxState/);
+  assert.match(viewSource, /replaceKanbanTaskLineCheckboxState\(current, nextState\)/);
+  const {
+    getKanbanCheckboxStateForStatus,
+    getKanbanStatusForCheckboxState,
+    getKanbanToggleCheckboxState,
+    replaceKanbanTaskLineCheckboxState,
+  } = await importTaskCheckboxUtils();
+  const mappings = [
+    { checkboxState: '[ ]', statuses: ['todo'], toggleTargetStatus: 'complete' },
+    { checkboxState: '[x]', statuses: ['complete'], toggleTargetStatus: 'todo' },
+    { checkboxState: '[/]', statuses: ['next'], toggleTargetStatus: 'complete' },
+    { checkboxState: '[?]', statuses: ['holding'], toggleTargetStatus: 'todo' },
+  ];
+
+  assert.equal(getKanbanStatusForCheckboxState('[/]', mappings), 'next');
+  assert.equal(getKanbanStatusForCheckboxState('[~]', mappings), 'wont-do');
+  assert.equal(getKanbanCheckboxStateForStatus('next', mappings), '[/]');
+  assert.equal(getKanbanCheckboxStateForStatus('working', mappings), '[\\]');
+  assert.equal(getKanbanToggleCheckboxState('[/]', mappings, new Set(['complete'])), '[x]');
+  assert.equal(getKanbanToggleCheckboxState('[x]', mappings, new Set(['complete'])), '[ ]');
+  assert.equal(getKanbanToggleCheckboxState('[?]', mappings, new Set(['complete'])), '[ ]');
+  assert.equal(getKanbanToggleCheckboxState('[!]', mappings, new Set(['complete', 'done'])), '[x]');
+  assert.equal(getKanbanToggleCheckboxState('[x]', [{ checkboxState: '[x]', statuses: ['done'] }], new Set(['done'])), '[ ]');
+
+  assert.equal(replaceKanbanTaskLineCheckboxState('- [ ] Write tests', '[x]'), '- [x] Write tests');
+  assert.equal(replaceKanbanTaskLineCheckboxState('  1. [/] Ordered task [area:: GCP]', '[x]'), '  1. [x] Ordered task [area:: GCP]');
+  assert.equal(replaceKanbanTaskLineCheckboxState('* [ ] Bullet marker task', 'x'), '* [x] Bullet marker task');
+  assert.equal(replaceKanbanTaskLineCheckboxState('- plain bullet', '[x]'), '- plain bullet');
+  assert.equal(replaceKanbanTaskLineCheckboxState('Not a task [ ] line', '[x]'), 'Not a task [ ] line');
+});
+
 test('card task previews are bounded and use source markdown labels', () => {
   assert.match(settingsSource, /openTaskPreviewLimit: 5/);
   assert.match(settingsSource, /showTaskOverflowCount: true/);
@@ -117,11 +406,23 @@ test('card task previews are bounded and use source markdown labels', () => {
   assert.match(viewSource, /private getPreviewTasksForFile\(file: TFile\): \{ tasks: OpenTaskSubitem\[\]; overflowCount: number \}/);
   assert.match(viewSource, /const fallback = this\.parseOpenTasks\(content, file\.path, limit\)/);
   assert.match(viewSource, /const openTasks = fallback\.openTasks\.map/);
-  assert.match(viewSource, /displayText: task\.displayText \|\| task\.text/);
+  assert.match(viewSource, /displayText: this\.getTaskVisibleTitle\(merged\)/);
   assert.doesNotMatch(viewSource, /displayText: enriched\?\.displayText \|\| task\.displayText/);
   assert.match(viewSource, /openTaskOverflowByPath/);
   assert.match(viewSource, /\+\$\{openTaskOverflow\} more/);
   assert.match(viewSource, /openTaskLine\(entry\.file, task\.line\)/);
+});
+
+test('task titles hide inline metadata in kanban views', () => {
+  assert.match(viewSource, /private stripTaskHiddenMetadata\(text: string\): string/);
+  assert.ok(viewSource.includes('%%\\s*tps-inline-props'));
+  assert.match(viewSource, /private getTaskVisibleTitle\(task: Pick<OpenTaskSubitem, 'displayText' \| 'text'>\): string/);
+  assert.ok(viewSource.includes(".replace(/(^|\\s)#[\\p{L}\\p{N}/_-]+/gu, ' ')"));
+  assert.match(viewSource, /const taskTitle = this\.getTaskVisibleTitle\(task\)/);
+  assert.match(viewSource, /text: taskTitle/);
+  assert.match(viewSource, /'aria-label': `Toggle task: \$\{taskTitle\}`/);
+  assert.doesNotMatch(viewSource, /text: task\.displayText \|\| task\.text/);
+  assert.doesNotMatch(viewSource, /'aria-label': `Toggle task: \$\{task\.displayText \|\| task\.text\}`/);
 });
 
 test('card summaries do not fall back to task text', () => {
@@ -217,7 +518,7 @@ test('root task cards expose native checkbox completion controls', () => {
   assert.match(viewSource, /private createTaskLaneCard\(item: TaskRenderItem, propName: string \| null, displayLane: DisplayLaneGroup\): HTMLElement/);
   assert.match(viewSource, /cls: 'tps-kanban-card-task-checkbox tps-kanban-task-card-checkbox'/);
   assert.match(viewSource, /type: 'checkbox'/);
-  assert.match(viewSource, /'aria-label': `Toggle task: \$\{task\.displayText \|\| task\.text\}`/);
+  assert.match(viewSource, /'aria-label': `Toggle task: \$\{taskTitle\}`/);
   assert.match(viewSource, /checkboxEl\.checked = this\.getDoneStatuses\(\)\.has\(this\.getStatusForCheckboxState\(task\.checkboxState \|\| '\[ \]'\)\)/);
   assert.match(viewSource, /checkboxEl\.addEventListener\('pointerdown', \(e: PointerEvent\) => \{\s*e\.stopPropagation\(\);/);
   assert.match(viewSource, /checkboxEl\.addEventListener\('click', \(e: MouseEvent\) => \{\s*e\.stopPropagation\(\);/);
@@ -323,9 +624,16 @@ test('saved base file filters are scoped to the configured Bases view name', () 
   assert.match(viewSource, /if \(visibleKnownNames\.length === 1\) return visibleKnownNames\[0\]/);
   assert.match(viewSource, /const extracted = this\.extractBaseFileFilterRoots\(parsed, viewName\)/);
   assert.match(viewSource, /viewName: extracted\.viewName/);
-  assert.match(viewSource, /const currentViewName = fallbackViewName \|\| viewNames\[0\] \|\| ''/);
+  assert.match(viewSource, /extractPersistedFilterRoots\(parsed, fallbackViewName/);
   assert.match(viewSource, /const baseFile = this\.getBaseFile\(\)/);
-  assert.match(viewSource, /return fileRoots\?\.length \? this\.dedupeFilterRoots\(fileRoots\) : \[\]/);
+  assert.match(viewSource, /const directFile = this\.getRuntimeBaseFile\(\);\s*if \(directFile\) return directFile\.path/);
+  assert.match(viewSource, /composeEffectiveFilterRoots\(runtimeRoots, fileRoots \|\| \[\]\)/);
+  assert.match(viewSource, /private getTaskFileComparableValues\(file: TFile \| null, propRaw: string\): string\[\]/);
+  assert.match(viewSource, /if \(prop === 'links' \|\| prop === 'link'\)[\s\S]*?return \[\]/);
+  assert.match(viewSource, /const folderComparison = expr\.match\(\/\^file\\\.folder/);
+  assert.match(viewSource, /file\\\.links\?\\\.\(\?:isEmpty\|empty\)/);
+  assert.doesNotMatch(viewSource, /for \(const delay of \[250, 750, 1500\]\)/);
+  assert.match(viewSource, /this\.openTasksLoading\.delete\(file\.path\);[\s\S]*?if \(this\.openTasksLoading\.size === 0\) this\.refreshDebounced\(\);/);
   assert.doesNotMatch(viewSource, /const knownViewNames = this\.baseFileFilterCache\?\.path === file\.path/);
 });
 
@@ -343,22 +651,20 @@ test('status kanban renders tasks as lane items and keeps done tasks addressable
   assert.match(viewSource, /getLaneIdForStatus\(this\.getStatusForCheckboxState\(task\.checkboxState/);
   assert.match(viewSource, /isStatusPropertyName\(propName\)/);
   assert.match(viewSource, /if \(this\.isStatusPropertyName\(propName\)\)/);
-  assert.match(viewSource, /nextLine = this\.updateInlineTaskCheckboxState\(nextLine, value\)/);
+  assert.match(viewSource, /nextLine = buildKanbanTaskDropLine\(\{\s*line: currentLine,\s*propName,\s*value,\s*sourceLaneValues,\s*filterTags,\s*filterStatus,/);
   assert.match(viewSource, /createTaskLaneCard\(taskItem, propName, displayLane\)/);
   assert.match(viewSource, /role: 'button', tabindex: '0'/);
   assert.doesNotMatch(viewSource, /cls: 'tps-kanban-card-title tps-kanban-task-card-title',[\\s\\S]{0,120}type: 'button'/);
-  assert.match(viewSource, /status == null \? '\[ \]' : this\.getCheckboxStateForStatus\(status\)/);
   assert.match(viewSource, /type ActiveTaskPointerDrag/);
   assert.match(viewSource, /itemKind\?: 'task' \| 'bullet'/);
-  assert.match(viewSource, /private parseLineItem\(line: string, includeBullets = true\): \{ itemKind: 'task' \| 'bullet'; checkboxState\?: string; text: string \} \| null/);
+  assert.match(viewSource, /private parseLineItem\(line: string, includeBullets = true\): \{ itemKind: 'task' \| 'bullet'; checkboxState\?: string; text: string \} \| null \{\s*return parseKanbanLineItem\(line, includeBullets\);/);
   assert.match(viewSource, /tps-kanban-task-card-drag-handle/);
   assert.match(viewSource, /sourceLaneValues: this\.getDisplayLaneWritableValues\(displayLane\)/);
   assert.match(viewSource, /application\/x-kanban-entry-source-values/);
   assert.match(viewSource, /private async applyFrontmatterTags/);
   assert.match(viewSource, /normalizeFrontmatterTags/);
   assert.match(viewSource, /this\.getDisplayLaneWritableValues\(active\.displayLane\)/);
-  assert.match(viewSource, /private updateInlineTaskTag\(line: string, value: string, sourceLaneValues: string\[\] = \[\]\)/);
-  assert.match(viewSource, /sourceTag\.toLowerCase\(\) !== cleanTag\.toLowerCase\(\)/);
+  assert.match(taskDropUtilsSource, /sourceTag\.toLowerCase\(\) !== cleanTag\.toLowerCase\(\)/);
   assert.match(viewSource, /createSpan\(\{\s*cls: 'tps-kanban-task-card-drag-handle'/);
   assert.doesNotMatch(viewSource, /createEl\('button', \{\s*cls: 'tps-kanban-task-card-drag-handle'/);
   assert.match(viewSource, /cardEl\.addEventListener\('pointerdown'/);
@@ -424,13 +730,91 @@ test('status kanban renders tasks as lane items and keeps done tasks addressable
   assert.doesNotMatch(viewSource, /\(\?:\\\[\\\|\\\(\)\(\[A-Za-z\]\[\\w -\]\{0,40\}\)::\\s\*\(\[\^\\\]\\\)\]\+\)/);
 });
 
-test('dragging a linked task writes only to the checklist source line', () => {
+test('dragging a linked task writes only to the checklist source line', async () => {
+  const {
+    buildKanbanTaskDropLine,
+    parseKanbanLineItem,
+    updateKanbanInlineTaskTag,
+  } = await importTaskDropUtils();
+  const checkboxForStatus = (status) => {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (normalized === 'complete') return '[x]';
+    if (normalized === 'working') return '[/]';
+    if (normalized === 'blocked') return '[-]';
+    if (normalized === 'todo') return '[ ]';
+    return null;
+  };
+  const isStatusPropertyName = (propName) => String(propName || '').trim().toLowerCase() === 'status';
+
+  assert.deepEqual(parseKanbanLineItem('- [ ] Call vendor [area:: office]', true), {
+    itemKind: 'task',
+    checkboxState: '[ ]',
+    text: 'Call vendor [area:: office]',
+  });
+  assert.deepEqual(parseKanbanLineItem('- Draft notes [area:: office]', true), {
+    itemKind: 'bullet',
+    text: 'Draft notes [area:: office]',
+  });
+  assert.equal(parseKanbanLineItem('- Draft notes [area:: office]', false), null);
+
+  assert.equal(
+    buildKanbanTaskDropLine({
+      line: '- [ ] Call vendor [area:: office] #home',
+      propName: 'status',
+      value: 'complete',
+      getCheckboxStateForStatus: checkboxForStatus,
+      isStatusPropertyName,
+    }),
+    '- [x] Call vendor [area:: office] #home',
+  );
+  assert.equal(
+    buildKanbanTaskDropLine({
+      line: '- [ ] Call vendor #todo #home',
+      propName: 'tags',
+      value: '#waiting on vendor',
+      sourceLaneValues: ['#todo'],
+      getCheckboxStateForStatus: checkboxForStatus,
+      isStatusPropertyName,
+    }),
+    '- [ ] Call vendor #home #waiting-on-vendor',
+  );
+  assert.equal(
+    buildKanbanTaskDropLine({
+      line: '- [ ] Call vendor [area:: office] #home',
+      propName: 'area',
+      value: 'errands',
+      filterTags: ['#project/home'],
+      filterStatus: 'working',
+      getCheckboxStateForStatus: checkboxForStatus,
+      isStatusPropertyName,
+    }),
+    '- [/] Call vendor #home [area:: errands] #project/home',
+  );
+  assert.equal(
+    buildKanbanTaskDropLine({
+      line: '- Draft notes [area:: office] #todo',
+      propName: 'status',
+      value: 'complete',
+      filterStatus: 'working',
+      getCheckboxStateForStatus: checkboxForStatus,
+      isStatusPropertyName,
+    }),
+    '- Draft notes [area:: office] #todo',
+  );
+  assert.equal(
+    updateKanbanInlineTaskTag('- [ ] Call vendor #todo #home', 'todo', ['todo']),
+    '- [ ] Call vendor #todo #home',
+  );
+
   assert.match(viewSource, /type: 'task-line',\s*source: 'tps-kanban',\s*itemKind: task\.itemKind \|\| 'task',\s*path: entry\.file\.path,\s*line: task\.line,/);
   assert.match(viewSource, /e\.dataTransfer\.setData\(KANBAN_TASK_MIME, payload\)/);
   assert.match(viewSource, /e\.dataTransfer\.setData\(TPS_TASK_LINE_MIME, payload\)/);
   assert.match(viewSource, /const taskFile = parsed\?\.path \? this\.app\.vault\.getFileByPath\(parsed\.path\) : null;/);
   assert.match(viewSource, /await this\.confirmAndApplyInlineTaskDrop\(\s*taskFile,\s*parsed\.line,/);
+  assert.match(viewSource, /nextLine = buildKanbanTaskDropLine\(\{/);
+  assert.match(viewSource, /parseKanbanLineItem\(line, includeBullets\)/);
   assert.match(viewSource, /private async buildTaskDropPlan/);
+  assert.match(taskDropUtilsSource, /export function buildKanbanTaskDropLine/);
   assert.match(viewSource, /cls: 'tps-kanban-task-drop-preview'/);
   assert.match(viewSource, /cls: 'tps-kanban-task-drop-preview-line'/);
   assert.match(viewSource, /changes\.push\(`Current line: \$\{currentLine\}`\)/);
@@ -461,8 +845,7 @@ test('root task cards are filtered independently from visible parent note cards'
   assert.match(viewSource, /private async loadBaseFileFilters\(file: TFile/);
   assert.match(viewSource, /const parsed = parseYaml\(content\)/);
   assert.match(viewSource, /private extractBaseFileFilterRoots/);
-  assert.match(viewSource, /Array\.isArray\(parsed\.views\)/);
-  assert.match(viewSource, /viewRecord\.filters/);
+  assert.match(viewSource, /extractPersistedFilterRoots\(parsed, fallbackViewName/);
   assert.match(viewSource, /queryController\?\.query\?\.file\?\.path/);
   assert.match(viewSource, /\(this as any\)\?\.queryController\?\.query\?\.filters/);
   assert.match(viewSource, /const runtimeRoots = this\.extractFilterRootCandidates/);
@@ -470,7 +853,9 @@ test('root task cards are filtered independently from visible parent note cards'
   assert.match(viewSource, /this\.getConfiguredBaseViewName\(\)/);
   assert.match(viewSource, /const baseFile = this\.getBaseFile\(\)/);
   assert.match(viewSource, /const fileRoots = this\.getBaseFileFilterRoot\(\)/);
-  assert.match(viewSource, /return fileRoots\?\.length \? this\.dedupeFilterRoots\(fileRoots\) : \[\]/);
+  assert.match(viewSource, /composeEffectiveFilterRoots\(runtimeRoots, fileRoots \|\| \[\]\)/);
+  assert.match(viewSource, /private getTaskFileComparableValues\(file: TFile \| null, propRaw: string\): string\[\]/);
+  assert.match(viewSource, /if \(prop === 'links' \|\| prop === 'link'\)[\s\S]*?return \[\]/);
   assert.match(viewSource, /private collectFilterRootCandidates\(root: unknown, roots: unknown\[\]\): void/);
   assert.match(viewSource, /this\.baseFilterSignature = this\.getBaseFilterSignature\(\)/);
   assert.match(viewSource, /window\.setInterval/);
@@ -505,7 +890,7 @@ test('root task cards are filtered independently from visible parent note cards'
 test('task-only kanban creation and matching preserve complex boolean filters', () => {
   assert.match(viewSource, /private taskMatchesStructuredBaseFilters\(task: OpenTaskSubitem, file: TFile \| null = null\): boolean \| null/);
   assert.match(viewSource, /private evaluateTaskFilterNode\(node: unknown, task: OpenTaskSubitem, file: TFile \| null = null\): boolean \| null/);
-  assert.match(viewSource, /if \(structuredMatch === true\) \{/);
+  assert.doesNotMatch(viewSource, /if \(structuredMatch === true\) \{\s*return true;/);
   assert.match(viewSource, /Object\.prototype\.hasOwnProperty\.call\(record, 'and'\)/);
   assert.match(viewSource, /Object\.prototype\.hasOwnProperty\.call\(record, 'or'\)/);
   assert.match(viewSource, /Object\.prototype\.hasOwnProperty\.call\(record, 'any'\)/);
@@ -530,9 +915,14 @@ test('task-only kanban creation and matching preserve complex boolean filters', 
   assert.match(viewSource, /task\|tasks\|bullet\|bullets\|note\|notes\|all\|mixed/);
   assert.match(viewSource, /if \(value\.startsWith\('bullet'\)\) return task\.itemKind === 'bullet'/);
   assert.match(viewSource, /const laneAddMode = this\.resolveCardAddMode\(taskFilter\)/);
-  assert.match(viewSource, /const shouldCreateTask = laneAddMode === 'task'/);
-  assert.match(viewSource, /shouldCreateTask \? '\+ Add task' : '\+ Add card'/);
+  assert.match(viewSource, /const createCommandOverride = this\.getCreateCommandOverride\(\)/);
+  assert.match(viewSource, /if \(this\.runCreateCommandOverride\(\)\) return/);
+  assert.match(viewSource, /const laneAdd = resolveKanbanLaneAddPresentation\(laneAddMode, displayLane\.label\)/);
+  assert.match(viewSource, /if \(laneAdd\.shouldCreateTask\)/);
+  assert.match(viewSource, /text: createCommandOverride \? `\+ \$\{createCommandOverride\.name\}` : laneAdd\.buttonText/);
   assert.match(viewSource, /await this\.createRootTaskForLane\(propName, displayLane, taskFilter\)/);
+  assert.match(viewSource, /void this\.createTaskForEntry\(entry\.file, propName, displayLane, taskFilter\)/);
+  assert.match(viewSource, /private async createTaskForEntry\([\s\S]*?propName: string \| null = null,[\s\S]*?displayLane: DisplayLaneGroup \| null = null,[\s\S]*?taskFilter = this\.getTaskRootFilterFromBaseFilters\(\)/);
   assert.match(viewSource, /private getRootTaskCreationDefaults\(taskFilter: KanbanTaskRootFilter\): TaskCreationDefaults/);
   assert.match(viewSource, /inlineFields: Map<string, \{ key: string; value: string \}>/);
   assert.match(viewSource, /private inferTaskCreationDefaultsFromFilterNode\(node: unknown\): TaskCreationDefaults \| null/);
@@ -544,12 +934,127 @@ test('task-only kanban creation and matching preserve complex boolean filters', 
   assert.match(viewSource, /const inlineFields = new Map\(left\.inlineFields\)/);
   assert.match(viewSource, /for \(const tag of tags\) if \(excludedTags\.has\(tag\)\) return null/);
   assert.match(viewSource, /return structured \?\? fallback/);
-  assert.match(viewSource, /for \(const tag of defaults\.tags\)/);
-  assert.match(viewSource, /const writableTag = this\.normalizeWritableTaskTag\(tag\)/);
-  assert.match(viewSource, /const writableLaneTag = this\.normalizeWritableTaskTag\(laneTag\)/);
-  assert.match(viewSource, /for \(const \[defaultProp, field\] of defaults\.inlineFields\)/);
-  assert.match(viewSource, /defaultProp === normalizedProp/);
+  assert.match(taskCreationUtilsSource, /for \(const tag of options\.defaults\.tags\)/);
+  assert.match(taskCreationUtilsSource, /const writableTag = normalizeWritableTaskTag\(tag\)/);
+  assert.match(taskCreationUtilsSource, /const writableLaneTag = normalizeWritableTaskTag\(laneTag\)/);
+  assert.match(taskCreationUtilsSource, /for \(const \[defaultProp, field\] of options\.defaults\.inlineFields\)/);
+  assert.match(taskCreationUtilsSource, /defaultProp === normalizedProp/);
+  assert.match(viewSource, /const taskLine = this\.buildRootTaskLine\(title, propName, targetSelection\.value, taskFilter, defaults\)/);
+  assert.doesNotMatch(viewSource, /const taskLine = `- \[ \] \$\{title\}`/);
   assert.doesNotMatch(viewSource, /for \(const tag of tags\) parts\.push\(`#\$\{tag\}`\)[\s\S]{0,120}normalizeTaskTag\(laneValue\)/);
+});
+
+test('synthesized Kanban tasks honor Home archive guards and done defaults', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  view.getStatusForCheckboxState = (state) => String(state).toLowerCase() === '[x]' ? 'complete' : 'todo';
+  view.getDoneStatuses = () => new Set(['complete', 'wont-do']);
+  view.getTaskInlineValues = (task, key) => (task.inlineFields || [])
+    .filter((field) => field.key.toLowerCase() === String(key).toLowerCase())
+    .map((field) => field.value);
+  view.normalizeInlinePropertyKey = (value) => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  view.normalizeTaskTag = (value) => String(value || '').trim().toLowerCase();
+  view.resolveBaseContextToken = (value) => String(value || '');
+  view.isEmbeddedScheduledDailyTaskBoard = () => false;
+  view.shouldShowCompletedTasks = () => false;
+
+  const task = (checkboxState) => ({ itemKind: 'task', checkboxState, inlineFields: [], text: 'Task' });
+  const file = (path) => ({
+    path,
+    basename: path.split('/').at(-1).replace(/\.md$/i, ''),
+    name: path.split('/').at(-1),
+    extension: 'md',
+    parent: { path: path.split('/').slice(0, -1).join('/') },
+  });
+  const matches = (roots, checkboxState, path) => {
+    view.getBaseFilterRoots = () => roots;
+    return view.taskMatchesRootFilter(task(checkboxState), view.getTaskRootFilterFromBaseFilters(), file(path));
+  };
+
+  const archiveRoot = { and: ['kind == "task"', '!file.path.startsWith("Archive/")', '!file.path.startsWith("_archive/")'] };
+  assert.equal(matches([archiveRoot], '[ ]', 'Archive/2026-07-05/Home Renovations.md'), false);
+  assert.equal(matches([archiveRoot], '[ ]', '_archive/2026-07-05/Home Renovations.md'), false);
+  assert.equal(matches([archiveRoot], '[ ]', 'Inbox/Home Renovations.md'), true);
+
+  // Home currently renders the custom Tasks.base component. Its persisted
+  // filter is wrapped in `or` and uses negative folder equality. For
+  // synthesized task rows, an archive root exclusion must also reject files in
+  // dated descendants such as Archive/2026-07-05/.
+  const homeTasksRoot = {
+    or: [{
+      and: [
+        'kind == "task"',
+        'file.folder != "_archive"',
+        'file.folder != "Archive"',
+      ],
+    }],
+  };
+  assert.equal(matches([homeTasksRoot], '[ ]', 'Archive/2026-07-05/Home Renovations.md'), false);
+  assert.equal(matches([homeTasksRoot], '[ ]', '_archive/2026-07-05/Home Renovations.md'), false);
+  assert.equal(matches([homeTasksRoot], '[ ]', 'Archive Notes/Home Renovations.md'), true);
+  assert.equal(matches([homeTasksRoot], '[ ]', 'Projects/Home Renovations.md'), true);
+
+  const liveHomeTasksRoot = {
+    or: [{
+      and: [
+        { property: 'kind', operator: 'is', value: 'task' },
+        { property: 'file.folder', operator: '!=', value: '_archive' },
+        { property: 'file.folder', operator: '!=', value: 'Archive' },
+      ],
+    }],
+  };
+  assert.equal(matches([liveHomeTasksRoot], '[ ]', 'Archive/2026-07-05/Home Renovations.md'), false);
+  assert.equal(matches([liveHomeTasksRoot], '[ ]', '_archive/2026-07-05/Home Renovations.md'), false);
+  assert.equal(matches([liveHomeTasksRoot], '[ ]', 'Projects/Home Renovations.md'), true);
+
+  assert.equal(matches(['kind == "task"'], '[x]', 'Inbox/Completed.md'), false);
+  assert.equal(matches(['kind == "task"'], '[ ]', 'Inbox/Open.md'), true);
+  assert.equal(matches([{ and: ['kind == "task"', 'status == "complete"'] }], '[x]', 'Inbox/Completed.md'), true);
+
+  let scheduled = false;
+  view.isBaseFileFilterReady = () => false;
+  view.scheduleBaseFileFilterLoad = () => { scheduled = true; };
+  const deferred = view.buildTaskRenderItemsByLane([], null, new Set(), {
+    mode: 'tasks',
+    hasTaskDirective: true,
+    includeDone: false,
+    statuses: new Set(),
+    excludeStatuses: new Set(),
+    tags: new Set(),
+    excludeTags: new Set(),
+  });
+  assert.equal(deferred.size, 0);
+  assert.equal(scheduled, true);
+});
+
+test('semantic note kinds stay note-only while structural task kinds keep task behavior', async () => {
+  const {
+    isBareSemanticKindFilter,
+    isKanbanStructuralKindValue,
+    parseBareSemanticKindExpression,
+  } = await importFilterKindUtils();
+
+  for (const value of ['task', 'tasks', 'bullet', 'bullets', 'note', 'notes', 'all', 'mixed']) {
+    assert.equal(isKanbanStructuralKindValue(value), true, `${value} should remain structural`);
+  }
+  assert.equal(parseBareSemanticKindExpression('kind == "workout"'), 'workout');
+  assert.equal(parseBareSemanticKindExpression("kind is 'food'"), 'food');
+  assert.equal(parseBareSemanticKindExpression('kind == "task"'), null);
+  assert.equal(parseBareSemanticKindExpression('task.kind == "workout"'), null);
+  assert.equal(isBareSemanticKindFilter('kind', ['workout']), true);
+  assert.equal(isBareSemanticKindFilter('kind', ['food']), true);
+  assert.equal(isBareSemanticKindFilter('kind', ['task']), false);
+  assert.equal(isBareSemanticKindFilter('itemKind', ['workout']), false);
+
+  assert.match(viewSource, /if \(parseBareSemanticKindExpression\(expr\)\) \{\s*filter\.mode = 'notes';\s*return;/);
+  assert.match(viewSource, /if \(isBareSemanticKindFilter\(propRaw, values\)\) \{\s*filter\.mode = 'notes';\s*return;/);
+  assert.match(viewSource, /if \(parseBareSemanticKindExpression\(raw\)\) return false;/);
+  assert.match(viewSource, /if \(isBareSemanticKindFilter\(propRaw, values\)\) return false;/);
+  assert.match(viewSource, /if \(parseBareSemanticKindExpression\(raw\)\) \{\s*return \{ mode: 'notes'/);
+  assert.match(viewSource, /if \(isBareSemanticKindFilter\(propRaw, values\)\) \{\s*return \{ mode: 'notes'/);
+  assert.match(viewSource, /const currentValues = this\.getNoteComparableValues\(file, propRaw\);\s*result = values\.some/);
+  assert.match(viewSource, /private extractNoteFrontmatterDefaults[\s\S]*defaults\[key\.trim\(\)\] = value;/);
+  assert.match(filterKindUtilsSource, /'task',[\s\S]*'tasks',[\s\S]*'bullet',[\s\S]*'bullets',[\s\S]*'note',[\s\S]*'notes',[\s\S]*'all',[\s\S]*'mixed'/);
 });
 
 test('kanban creation defaults can be controlled by Base task filters', () => {
@@ -557,12 +1062,13 @@ test('kanban creation defaults can be controlled by Base task filters', () => {
   assert.match(viewSource, /private inferTaskPathCreationDefaultsFromString\(expr: string\): TaskCreationDefaults \| null/);
   assert.match(viewSource, /\(\?:task\\\.\)\?\(\?:path\|file\|file\\\.path\)/);
   assert.match(viewSource, /private getBaseContextFile\(\): TFile \| null/);
+  assert.match(viewSource, /private getDomBaseContextValue\(key: string\): string \| null/);
+  assert.match(viewSource, /data-tps-context-scheduled/);
   assert.match(viewSource, /private resolveBaseContextToken\(rawValue: unknown\): string \| null/);
   assert.match(viewSource, /\^this\\\.file\\\.path\$/);
   assert.match(viewSource, /this\.getBaseContextFrontmatterValue\(frontmatterMatch\[1\]\)/);
   assert.match(viewSource, /private getEmbeddedBaseFilterRoot\(\): unknown\[\] \| null/);
   assert.match(viewSource, /private async loadEmbeddedBaseFilters\(file: TFile/);
-  assert.match(viewSource, /private embeddedBaseBlockMatchesCurrentKanbanView\(parsed: Record<string, unknown> \| null \| undefined, viewName: string\): boolean/);
   assert.match(viewSource, /const blockMatch = this\.getEmbeddedKanbanBlockMatch\(parsed, viewName\)/);
   assert.match(viewSource, /const type = String\(record\.type \|\| ''\)\.trim\(\)/);
   assert.match(viewSource, /const blockPattern = \/```base\\s\*\\n\(\[\\s\\S\]\*\?\)```\/gi/);
@@ -571,12 +1077,16 @@ test('kanban creation defaults can be controlled by Base task filters', () => {
   assert.match(viewSource, /this\.resolveBaseContextToken\(pathMatch\[1\] \|\| pathMatch\[2\] \|\| pathMatch\[3\]\)/);
   assert.match(viewSource, /this\.resolveBaseContextToken\(comparisonMatch\[2\] \|\| comparisonMatch\[3\] \|\| comparisonMatch\[4\]\)/);
   assert.match(viewSource, /private async resolveRootTaskTargetFile\(defaults = this\.getRootTaskCreationDefaults/);
-  assert.match(viewSource, /const configuredTargetPath = defaults\.targetPath \|\| this\.plugin\.settings\?\.defaultRootTaskPath \|\| ''/);
+  assert.match(viewSource, /resolveKanbanRootTaskTargetPath\(defaults\.targetPath, this\.plugin\.settings\?\.defaultRootTaskPath \|\| ''\)/);
   assert.match(viewSource, /await this\.ensureFolderPath\(folderPath\)/);
-  assert.match(viewSource, /if \(taskFilter\.mode === 'tasks'\) \{/);
+  assert.match(viewSource, /if \(this\.getPriorityResolvedCreationMode\(taskFilter\) === 'tasks'\) \{/);
   assert.match(viewSource, /await this\.createRootTaskForLane\(null, \{ id: 'ungrouped'/);
-  assert.match(viewSource, /const forcedMode = taskFilter\.mode === 'tasks'/);
-  assert.match(viewSource, /taskFilter\.mode === 'notes'/);
+  assert.match(viewSource, /private getPriorityResolvedCreationMode\(taskFilter: KanbanTaskRootFilter\)/);
+  assert.match(viewSource, /for \(const root of this\.getBaseFilterRoots\(\)\)/);
+  assert.match(viewSource, /inferPriorityCreationModeFromFilterNode\(root\)/);
+  assert.match(viewSource, /for \(const branchKey of \['or', 'any'\]\)/);
+  assert.match(viewSource, /const forcedMode = priorityMode === 'tasks'/);
+  assert.match(viewSource, /priorityMode === 'notes'/);
   assert.match(viewSource, /return forcedMode \?\? \(this\.plugin\.settings\?\.cardAddButtonDefault \?\? 'note'\)/);
   assert.doesNotMatch(viewSource, /Calendar\.md/);
   assert.doesNotMatch(viewSource, /console\.debug\('\[TPS Kanban\] (?:lane add action|createRootTaskForLane|getRootTaskCreationDefaults|resolveRootTaskTargetFile)/);
@@ -603,10 +1113,40 @@ test('note-mode creation can target folders and paths from Base note filters', (
 
 test('lane add mode resolution keeps tasks and notes explicit while mixed/all defer to settings', () => {
   assert.match(viewSource, /private resolveCardAddMode\(taskFilter: KanbanTaskRootFilter = this\.getTaskRootFilterFromBaseFilters\(\)\): 'note' \| 'task'/);
-  assert.match(viewSource, /const forcedMode = taskFilter\.mode === 'tasks'/);
-  assert.match(viewSource, /: taskFilter\.mode === 'notes'/);
+  assert.match(viewSource, /const priorityMode = this\.getPriorityResolvedCreationMode\(taskFilter\)/);
+  assert.match(viewSource, /const forcedMode = priorityMode === 'tasks'/);
+  assert.match(viewSource, /: priorityMode === 'notes'/);
   assert.match(viewSource, /return forcedMode \?\? \(this\.plugin\.settings\?\.cardAddButtonDefault \?\? 'note'\)/);
   assert.doesNotMatch(viewSource, /taskOnlyBoard/);
+});
+
+test('kanban diagnostics trace drag/drop mutation decisions', () => {
+  for (const event of [
+    "flow('CardMove', 'frontmatter:start'",
+    "flow('CardMove', 'frontmatter:done'",
+    "flowWarn('TaskDrop', 'no-change'",
+    "flow('TaskDrop', 'confirm:start'",
+    "flow('TaskDrop', 'confirm:cancelled'",
+    "flow('TaskDrop', 'apply:start'",
+    "flow('TaskDrop', changed ? 'apply:done' : 'apply:no-change'",
+    "flowWarn('CardNest', 'blocked'",
+    "flow('CardNest', 'drop:start'",
+    "flow('CardNest', 'drop:done'",
+    "flowWarn('LaneOrder', 'drop:ignored'",
+    "flow('LaneOrder', 'drop:save'",
+    "flow('LaneOrder', 'drop:done'",
+    "flow('LaneDrop', 'task:start'",
+    "flowWarn('LaneDrop', 'blocked'",
+    "flow('LaneDrop', 'done'",
+    "flow('OpenTarget', 'focus-existing'",
+    "flow('OpenTarget', 'open-new'",
+    "flow('OpenTaskLine', 'scroll:start'",
+    "flowWarn('OpenTaskLine', 'blocked'",
+    "flow('TaskCheckbox', 'update:start'",
+    "flow('TaskCheckbox', changed ? 'update:done' : 'update:no-change'",
+  ]) {
+    assert.match(viewSource, new RegExp(event.replace(/[()'.?]/g, '\\$&')));
+  }
 });
 
 test('scheduled daily task filters compare by day and render in the daily lane', () => {
@@ -619,8 +1159,8 @@ test('scheduled daily task filters compare by day and render in the daily lane',
   assert.match(viewSource, /private isEmbeddedScheduledDailyTaskBoard\(\): boolean/);
   assert.doesNotMatch(viewSource, /shouldDefaultScheduledDailyLaneTaskToAllDay/);
   assert.doesNotMatch(viewSource, /parts\.push\(`\[allDay:: true\]`\)/);
-  assert.match(viewSource, /for \(const \[defaultProp, field\] of defaults\.inlineFields\)/);
-  assert.match(viewSource, /parts\.push\(`\[\$\{field\.key\}:: \$\{field\.value\}\]`\)/);
+  assert.match(taskCreationUtilsSource, /for \(const \[defaultProp, field\] of options\.defaults\.inlineFields\)/);
+  assert.match(taskCreationUtilsSource, /parts\.push\(`\[\$\{field\.key\}:: \$\{field\.value\}\]`\)/);
   assert.match(viewSource, /private isEmbeddedScheduledDailyTaskFallbackFilter\(\): boolean/);
   assert.match(viewSource, /private collectFilterTextConditions\(root: unknown, seen = new WeakSet<object>\(\)\): string\[\]/);
   assert.match(viewSource, /private isScheduledTodayCondition\(condition: string\): boolean/);
@@ -634,8 +1174,17 @@ test('scheduled daily task filters compare by day and render in the daily lane',
   assert.match(viewSource, /private getTaskCardMetaProperties\(file: TFile, task: OpenTaskSubitem, groupPropName: string \| null\)/);
   assert.match(viewSource, /hidden = new Set\(\['tpsinlineprops', 'externalid', 'externaleventid', 'tpscalendaruid', 'tpscalendarsourceurl'\]\)/);
   assert.match(viewSource, /private formatTaskCardField\(key: string, value: string\): string/);
+  assert.match(viewSource, /const dateTime = this\.formatCardPropertyValue\(value\)/);
+  assert.match(viewSource, /private isDateLikeProperty\(normalizedKey: string\): boolean/);
+  assert.match(viewSource, /private formatDurationLikeValue\(value: string\): string/);
   assert.match(stylesSource, /\.tps-kanban-container--reading-embed \.tps-kanban-task-card > \.tps-kanban-card-inner > \.tps-kanban-card-title-row\s*\{[\s\S]*grid-template-columns:\s*18px minmax\(0, 1fr\);/);
   assert.match(stylesSource, /\.tps-kanban-container--reading-embed \.tps-kanban-task-card-title\s*\{[\s\S]*-webkit-line-clamp:\s*2;/);
+});
+
+test('Kanban task titles hand off to the exact-line virtual editor', () => {
+  assert.match(viewSource, /private openTaskQuickEditor\(event: Event, taskEl: HTMLElement, sourceEl: HTMLElement \| null = taskEl\): boolean/);
+  assert.match(viewSource, /service\.openQuickEditorForElement\(taskEl, sourceEl\)/);
+  assert.match(viewSource, /if \(this\.openTaskQuickEditor\(e, cardEl, titleEl\)\) return/);
 });
 
 test('kanban does not register vault-wide or Notebook Navigator open interception', () => {

@@ -1,17 +1,53 @@
-import { Plugin, QueryController, BasesView } from 'obsidian';
+import { Plugin, QueryController, BasesView, type BasesAllOptions, type BasesViewConfig } from 'obsidian';
 import { KanbanView, KANBAN_VIEW_TYPE } from './views/KanbanView';
 import { DEFAULT_SETTINGS, KanbanSettings } from './settings';
 import { KanbanSettingTab } from './settings/SettingsTab';
 import { NATIVE_PREVIEW_SOURCE } from './preview';
+import { flow, flowError, setLoggingEnabled } from './logger';
+
+function createBaseCreateButtonOptions(config: BasesViewConfig): BasesAllOptions[] {
+  return [
+    {
+      type: 'group',
+      displayName: 'Create button',
+      items: [
+        {
+          key: 'createAction',
+          type: 'dropdown',
+          displayName: 'Action',
+          default: 'default',
+          options: {
+            default: 'Default',
+            command: 'Run command',
+          },
+        },
+        {
+          key: 'createCommandId',
+          type: 'text',
+          displayName: 'Command ID',
+          placeholder: 'plugin-id:command-id',
+          shouldHide: () => String(config.get('createAction') || '').trim() !== 'command',
+        },
+      ],
+    },
+  ];
+}
 
 export default class TPSKanbanPlugin extends Plugin {
   settings: KanbanSettings = DEFAULT_SETTINGS;
   private static readonly MIN_SCALE = 0.5;
   private static readonly MAX_SCALE = 1.4;
+  private settingsSavePromise: Promise<void> | null = null;
+  private settingsSavePending = false;
 
   async onload() {
-    console.log('Loading TPS Kanban (Dev)');
     this.settings = this.normalizeSettings(await this.loadData() as Partial<KanbanSettings> || {});
+    setLoggingEnabled(this.settings.enableLogging);
+    flow('Plugin', 'load', {
+      scale: this.settings.scale,
+      cardAddButtonDefault: this.settings.cardAddButtonDefault,
+      cardActivationMode: this.settings.cardActivationMode,
+    });
     this.settings.scale = this.normalizeScale(this.settings.scale);
     if (!this.settings.layoutModeByView || typeof this.settings.layoutModeByView !== 'object') {
       this.settings.layoutModeByView = {};
@@ -46,6 +82,7 @@ export default class TPSKanbanPlugin extends Plugin {
       icon: 'columns',
       factory: (controller: QueryController, containerEl: HTMLElement): BasesView =>
         new KanbanView(controller, containerEl, this),
+      options: createBaseCreateButtonOptions,
     });
 
     this.addSettingTab(new KanbanSettingTab(this.app, this));
@@ -56,16 +93,47 @@ export default class TPSKanbanPlugin extends Plugin {
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    if (this.settingsSavePromise) {
+      this.settingsSavePending = true;
+      flow('Settings', 'save:queued');
+      await this.settingsSavePromise;
+      return;
+    }
+
+    do {
+      this.settingsSavePending = false;
+      const snapshot = JSON.parse(JSON.stringify(this.settings));
+      setLoggingEnabled(snapshot.enableLogging);
+      flow('Settings', 'save:start', {
+        enableLogging: snapshot.enableLogging,
+        cardAddButtonDefault: snapshot.cardAddButtonDefault,
+        cardActivationMode: snapshot.cardActivationMode,
+        scale: snapshot.scale,
+      });
+      this.settingsSavePromise = this.saveData(snapshot);
+      try {
+        await this.settingsSavePromise;
+        flow('Settings', 'save:done');
+      } catch (error) {
+        flowError('Settings', 'save:failed', error);
+        throw error;
+      } finally {
+        this.settingsSavePromise = null;
+      }
+    } while (this.settingsSavePending);
+
     this.refreshKanbanViewsFromSettings();
   }
 
   onunload() {
-    console.log('Unloading TPS Kanban (Dev)');
+    flow('Plugin', 'unload');
   }
 
   private normalizeSettings(stored: Partial<KanbanSettings>): KanbanSettings {
     return {
+      enableLogging: typeof stored.enableLogging === 'boolean'
+        ? stored.enableLogging
+        : DEFAULT_SETTINGS.enableLogging,
       iconKey: typeof stored.iconKey === 'string' && stored.iconKey.trim()
         ? stored.iconKey.trim()
         : DEFAULT_SETTINGS.iconKey,
