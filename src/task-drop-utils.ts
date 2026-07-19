@@ -19,6 +19,55 @@ export type BuildKanbanTaskDropLineOptions = {
   isStatusPropertyName: (propName: string | null | undefined) => boolean;
 };
 
+export type ApplyKanbanTaskDropPlanOptions = {
+  content: string;
+  expectedContent: string;
+  targetLine: number;
+  expectedLine: string;
+  nextLine: string;
+};
+
+export type ApplyKanbanTaskDropPlanResult = {
+  content: string;
+  outcome: 'changed' | 'unchanged' | 'stale';
+};
+
+export function applyKanbanTaskDropPlan(
+  options: ApplyKanbanTaskDropPlanOptions,
+): ApplyKanbanTaskDropPlanResult {
+  const content = String(options.content ?? '');
+  if (content !== options.expectedContent) {
+    return { content, outcome: 'stale' };
+  }
+
+  const targetLine = Math.floor(Number(options.targetLine));
+  if (!Number.isFinite(targetLine) || targetLine < 1) {
+    return { content, outcome: 'stale' };
+  }
+
+  let lineStart = 0;
+  const lineBreak = /\r\n|\n|\r/gu;
+  for (let lineNumber = 1; lineNumber < targetLine; lineNumber += 1) {
+    const match = lineBreak.exec(content);
+    if (!match) return { content, outcome: 'stale' };
+    lineStart = lineBreak.lastIndex;
+  }
+  const ending = lineBreak.exec(content);
+  const lineEnd = ending?.index ?? content.length;
+  const currentLine = content.slice(lineStart, lineEnd);
+  if (currentLine !== options.expectedLine) {
+    return { content, outcome: 'stale' };
+  }
+  if (options.nextLine === currentLine) {
+    return { content, outcome: 'unchanged' };
+  }
+
+  return {
+    content: `${content.slice(0, lineStart)}${options.nextLine}${content.slice(lineEnd)}`,
+    outcome: 'changed',
+  };
+}
+
 export function parseKanbanLineItem(line: string, includeBullets = true): KanbanTaskLineParseResult | null {
   const taskMatch = String(line ?? '').match(/^\s*(?:[-*+]|\d+[.)])\s+\[([^\]\r\n]?)\]\s+(.+)$/);
   if (taskMatch) {

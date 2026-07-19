@@ -821,10 +821,80 @@ test('dragging a linked task writes only to the checklist source line', async ()
   assert.match(viewSource, /changes\.push\(`Result line: \$\{nextLine\}`\)/);
   assert.match(viewSource, /const displayTag = tag\.startsWith\('#'\) \? tag : `#\$\{tag\}`/);
   assert.match(viewSource, /changes\.push\(`Add Base filter tag \$\{displayTag\}\.`\)/);
-  assert.match(viewSource, /await this\.app\.vault\.process\(file, \(content\) =>/);
-  assert.match(viewSource, /const current = lines\[index\];/);
-  assert.match(viewSource, /lines\[index\] = next;/);
   assert.doesNotMatch(viewSource, /metadataCache\.getFirstLinkpathDest[\s\S]{0,400}application\/x-kanban-task/);
+});
+
+test('task drop plans fail closed when the source changes during confirmation', async () => {
+  const { applyKanbanTaskDropPlan } = await importTaskDropUtils();
+
+  const expectedContent = [
+    '# Project',
+    '- [ ] Call vendor [area:: office]',
+    '- [ ] Preserve this task',
+  ].join('\n');
+  const applied = applyKanbanTaskDropPlan({
+    content: expectedContent,
+    expectedContent,
+    targetLine: 2,
+    expectedLine: '- [ ] Call vendor [area:: office]',
+    nextLine: '- [ ] Call vendor [area:: errands]',
+  });
+  assert.deepEqual(applied, {
+    content: [
+      '# Project',
+      '- [ ] Call vendor [area:: errands]',
+      '- [ ] Preserve this task',
+    ].join('\n'),
+    outcome: 'changed',
+  });
+
+  const editedDuringConfirmation = expectedContent.replace('Call vendor', 'Call supplier');
+  assert.deepEqual(
+    applyKanbanTaskDropPlan({
+      content: editedDuringConfirmation,
+      expectedContent,
+      targetLine: 2,
+      expectedLine: '- [ ] Call vendor [area:: office]',
+      nextLine: '- [ ] Call vendor [area:: errands]',
+    }),
+    { content: editedDuringConfirmation, outcome: 'stale' },
+  );
+
+  const duplicateExpected = ['# Project', '- [ ] Duplicate', '- [ ] Duplicate'].join('\n');
+  const insertedBeforeConfirmation = ['# New heading', '- [ ] Duplicate', '- [ ] Duplicate'].join('\n');
+  assert.deepEqual(
+    applyKanbanTaskDropPlan({
+      content: insertedBeforeConfirmation,
+      expectedContent: duplicateExpected,
+      targetLine: 2,
+      expectedLine: '- [ ] Duplicate',
+      nextLine: '- [x] Duplicate',
+    }),
+    { content: insertedBeforeConfirmation, outcome: 'stale' },
+  );
+
+  const crlfContent = '# Project\r\n- [ ] Call vendor\r\nKeep me\r\n';
+  assert.deepEqual(
+    applyKanbanTaskDropPlan({
+      content: crlfContent,
+      expectedContent: crlfContent,
+      targetLine: 2,
+      expectedLine: '- [ ] Call vendor',
+      nextLine: '- [x] Call vendor',
+    }),
+    {
+      content: '# Project\r\n- [x] Call vendor\r\nKeep me\r\n',
+      outcome: 'changed',
+    },
+  );
+
+  assert.match(viewSource, /await this\.app\.vault\.process\(file, \(content\) =>/);
+  assert.match(viewSource, /applyKanbanTaskDropPlan\(\{/);
+  assert.match(viewSource, /expectedContent: plan\.currentContent/);
+  assert.match(viewSource, /expectedLine: plan\.currentLine/);
+  assert.match(viewSource, /reason: 'stale-plan'/);
+  assert.match(taskDropUtilsSource, /if \(content !== options\.expectedContent\)/);
+  assert.match(viewSource, /const applied = await this\.confirmAndApplyInlineTaskDrop\([\s\S]{0,400}if \(!applied\) \{[\s\S]{0,400}flow\('LaneDrop', 'task:not-applied'/);
 });
 
 test('root task cards are filtered independently from visible parent note cards', () => {
@@ -1136,6 +1206,7 @@ test('kanban diagnostics trace drag/drop mutation decisions', () => {
     "flow('LaneOrder', 'drop:save'",
     "flow('LaneOrder', 'drop:done'",
     "flow('LaneDrop', 'task:start'",
+    "flow('LaneDrop', 'task:not-applied'",
     "flowWarn('LaneDrop', 'blocked'",
     "flow('LaneDrop', 'done'",
     "flow('OpenTarget', 'focus-existing'",

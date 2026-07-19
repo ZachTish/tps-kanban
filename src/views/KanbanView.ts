@@ -20,6 +20,7 @@ import {
   replaceKanbanTaskLineCheckboxState,
 } from '../task-checkbox-utils';
 import {
+  applyKanbanTaskDropPlan,
   buildKanbanTaskDropLine,
   normalizeKanbanWritableTaskTag,
   parseKanbanLineItem,
@@ -126,6 +127,7 @@ type TaskDropPlan = {
   changes: string[];
   filterTags: string[];
   filterStatus: string | null;
+  currentContent: string;
   currentLine: string;
   nextLine: string;
   itemKind: 'task' | 'bullet';
@@ -3999,8 +4001,7 @@ export class KanbanView extends BasesView {
       });
       return false;
     }
-    await this.applyInlineTaskDropPlan(file, line, propName, value, sourceLaneValues, plan);
-    return true;
+    return this.applyInlineTaskDropPlan(file, line, propName, value, sourceLaneValues, plan);
   }
 
   private async buildTaskDropPlan(
@@ -4019,8 +4020,8 @@ export class KanbanView extends BasesView {
     const changes: string[] = [];
     const displayValue = value == null || value === '' ? '(empty)' : String(value);
     const targetLine = Math.max(1, Math.floor(Number(line || 1)));
-    const content = await this.app.vault.cachedRead(file);
-    const currentLine = content.split(/\r?\n/)[targetLine - 1] ?? '';
+    const content = await this.app.vault.read(file);
+    const currentLine = content.split(/\r\n|\n|\r/u)[targetLine - 1] ?? '';
     const parsedLine = this.parseLineItem(currentLine, true);
     const itemKind = parsedLine?.itemKind ?? 'task';
     let nextLine = currentLine;
@@ -4073,6 +4074,7 @@ export class KanbanView extends BasesView {
       changes,
       filterTags,
       filterStatus: itemKind === 'bullet' ? null : filterStatus,
+      currentContent: content,
       currentLine,
       nextLine,
       itemKind,
@@ -4091,10 +4093,11 @@ export class KanbanView extends BasesView {
     propName: string,
     value: string | null,
     sourceLaneValues: string[] = [],
-    plan: Pick<TaskDropPlan, 'filterTags' | 'filterStatus' | 'nextLine'>,
-  ): Promise<void> {
+    plan: Pick<TaskDropPlan, 'filterTags' | 'filterStatus' | 'currentContent' | 'currentLine' | 'nextLine'>,
+  ): Promise<boolean> {
     const targetLine = Math.max(1, Math.floor(Number(line || 1)));
     let changed = false;
+    let stale = false;
     flow('TaskDrop', 'apply:start', {
       path: file.path,
       line: targetLine,
@@ -4106,17 +4109,29 @@ export class KanbanView extends BasesView {
     });
 
     await this.app.vault.process(file, (content) => {
-      const lines = content.split(/\r?\n/);
-      const index = targetLine - 1;
-      if (index < 0 || index >= lines.length) return content;
-      const current = lines[index];
-      if (!this.parseLineItem(current, true)) return content;
-      const next = plan.nextLine;
-      if (next === current) return content;
-      lines[index] = next;
-      changed = true;
-      return lines.join('\n');
+      const result = applyKanbanTaskDropPlan({
+        content,
+        expectedContent: plan.currentContent,
+        targetLine,
+        expectedLine: plan.currentLine,
+        nextLine: plan.nextLine,
+      });
+      changed = result.outcome === 'changed';
+      stale = result.outcome === 'stale';
+      return result.content;
     });
+
+    if (stale) {
+      flowWarn('TaskDrop', 'apply:blocked', {
+        reason: 'stale-plan',
+        path: file.path,
+        line: targetLine,
+        propName,
+        value,
+      });
+      new Notice('The source note changed while this drop was awaiting confirmation. No changes were applied; retry the drop.');
+      return false;
+    }
 
     if (changed) {
       this.clearTaskCachesForPath(file.path);
@@ -4128,6 +4143,7 @@ export class KanbanView extends BasesView {
       propName,
       value,
     });
+    return changed;
   }
 
   private getDisplayLaneWritableValues(displayLane: DisplayLaneGroup | null | undefined): string[] {
@@ -7997,13 +8013,24 @@ export class KanbanView extends BasesView {
               propName,
               targetValue,
             });
-            await this.confirmAndApplyInlineTaskDrop(
+            const applied = await this.confirmAndApplyInlineTaskDrop(
               taskFile,
               taskPayload.line,
               propName,
               targetValue,
               Array.isArray(taskPayload.sourceLaneValues) ? taskPayload.sourceLaneValues : [],
             );
+            if (!applied) {
+              flow('LaneDrop', 'task:not-applied', {
+                path: taskFile.path,
+                line: taskPayload.line,
+                lane: displayLane.label,
+                propName,
+                targetValue,
+              });
+              this.render();
+              return;
+            }
           } else {
             const file = this.app.vault.getFileByPath(filePath);
             if (!file) {
