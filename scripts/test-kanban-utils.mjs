@@ -81,6 +81,38 @@ async function importFilterKindUtils() {
   return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
 }
 
+async function importKanbanSettings() {
+  const build = await esbuild.build({
+    entryPoints: [fileURLToPath(new URL('../src/settings.ts', import.meta.url))],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    write: false,
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
+}
+
+async function importKanbanSettingsPersistence() {
+  const build = await esbuild.build({
+    entryPoints: [fileURLToPath(new URL('../src/settings-persistence.ts', import.meta.url))],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    write: false,
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 async function importKanbanView() {
   const build = await esbuild.build({
     entryPoints: [fileURLToPath(new URL('../src/views/KanbanView.ts', import.meta.url))],
@@ -440,6 +472,198 @@ test('frontmatter color is card-only until explicit icon color behavior exists',
   assert.doesNotMatch(viewSource, /--tps-card-icon-color/);
   assert.match(viewSource, /private resolveTaskCardStyleRule\(file: TFile, task: OpenTaskSubitem/);
   assert.match(settingsSource, /DEFAULT_PRIORITY_CARD_STYLE_RULES/);
+});
+
+test('settings normalization preserves an explicit empty style-rule list and every supported color target', async () => {
+  assert.match(mainSource, /frontmatterColorTarget: normalizeFrontmatterColorTarget\(stored\.frontmatterColorTarget\)/);
+  assert.match(mainSource, /cardStyleRules: normalizeCardStyleRules\(stored\.cardStyleRules\)/);
+  const settings = await importKanbanSettings();
+  assert.deepEqual(settings.normalizeCardStyleRules([]), []);
+  assert.equal(settings.normalizeCardStyleRules(undefined).length, settings.DEFAULT_PRIORITY_CARD_STYLE_RULES.length);
+  assert.deepEqual(settings.normalizeCardStyleRules([{
+    label: 'Custom',
+    active: false,
+    match: 'any',
+    conditions: [{ field: ' priority ', operator: 'contains', value: 2 }],
+  }]), [{
+    id: undefined,
+    label: 'Custom',
+    active: false,
+    match: 'any',
+    conditions: [{ field: 'priority', operator: 'contains', value: '2' }],
+    color: '',
+    icon: '',
+    textStyle: '',
+  }]);
+
+  for (const target of ['off', 'card', 'icon', 'both']) {
+    assert.equal(settings.normalizeFrontmatterColorTarget(target), target);
+  }
+  assert.equal(settings.normalizeFrontmatterColorTarget('unsupported'), 'card');
+});
+
+test('settings persistence merges local keys into the latest raw data without adopting remote keys as intent', async () => {
+  const { SettingsPersistenceCoordinator } = await importKanbanSettingsPersistence();
+  let disk = {
+    localChoice: 'old',
+    remoteChoice: 'remote-before-save',
+    settingsVersion: 99,
+    futurePayload: { keep: true },
+  };
+  const live = { localChoice: 'old', remoteChoice: 'old' };
+  const normalize = (stored) => ({
+    localChoice: String(stored.localChoice || ''),
+    remoteChoice: String(stored.remoteChoice || ''),
+  });
+  const reconcile = (requested, persisted) => {
+    for (const key of Object.keys(persisted)) {
+      if (JSON.stringify(live[key]) === JSON.stringify(requested[key])) live[key] = persisted[key];
+    }
+  };
+  const coordinator = new SettingsPersistenceCoordinator({
+    loadLatest: async () => structuredClone(disk),
+    saveMerged: async (merged) => { disk = structuredClone(merged); },
+    normalize,
+    onPersisted: reconcile,
+  }, structuredClone(live));
+
+  live.localChoice = 'local-one';
+  await coordinator.request(live);
+  assert.deepEqual(disk, {
+    localChoice: 'local-one',
+    remoteChoice: 'remote-before-save',
+    settingsVersion: 99,
+    futurePayload: { keep: true },
+  });
+  assert.equal(live.remoteChoice, 'remote-before-save');
+
+  disk.remoteChoice = 'remote-after-save';
+  disk.futurePayload = { keep: true, addedRemotely: true };
+  live.localChoice = 'local-two';
+  await coordinator.request(live);
+  assert.equal(disk.localChoice, 'local-two');
+  assert.equal(disk.remoteChoice, 'remote-after-save');
+  assert.deepEqual(disk.futurePayload, { keep: true, addedRemotely: true });
+});
+
+test('settings persistence durably applies an old-new-old revert queued during an active write', async () => {
+  const { SettingsPersistenceCoordinator } = await importKanbanSettingsPersistence();
+  let disk = { mode: 'old' };
+  const firstSaveStarted = deferred();
+  const releaseFirstSave = deferred();
+  const secondSaveStarted = deferred();
+  const releaseSecondSave = deferred();
+  const writes = [];
+  const coordinator = new SettingsPersistenceCoordinator({
+    loadLatest: async () => structuredClone(disk),
+    saveMerged: async (merged) => {
+      writes.push(structuredClone(merged));
+      if (writes.length === 1) {
+        firstSaveStarted.resolve();
+        await releaseFirstSave.promise;
+      } else {
+        secondSaveStarted.resolve();
+        await releaseSecondSave.promise;
+      }
+      disk = structuredClone(merged);
+    },
+    normalize: (stored) => ({ mode: String(stored.mode || '') }),
+  }, { mode: 'old' });
+
+  const first = coordinator.request({ mode: 'new' });
+  await firstSaveStarted.promise;
+  let revertResolved = false;
+  const revert = coordinator.request({ mode: 'old' }).then(() => { revertResolved = true; });
+  releaseFirstSave.resolve();
+  await secondSaveStarted.promise;
+  assert.equal(revertResolved, false, 'the revert caller must wait for the second durable write');
+  releaseSecondSave.resolve();
+  await Promise.all([first, revert]);
+
+  assert.deepEqual(writes.map((write) => write.mode), ['new', 'old']);
+  assert.equal(disk.mode, 'old');
+});
+
+test('a pending newest settings snapshot supersedes a failed active write for every waiter', async () => {
+  const { SettingsPersistenceCoordinator } = await importKanbanSettingsPersistence();
+  let disk = { first: 'old', second: 'old' };
+  const firstSaveStarted = deferred();
+  const releaseFailedSave = deferred();
+  let attempts = 0;
+  const coordinator = new SettingsPersistenceCoordinator({
+    loadLatest: async () => structuredClone(disk),
+    saveMerged: async (merged) => {
+      attempts += 1;
+      if (attempts === 1) {
+        firstSaveStarted.resolve();
+        await releaseFailedSave.promise;
+        throw new Error('synthetic first-write failure');
+      }
+      disk = structuredClone(merged);
+    },
+    normalize: (stored) => ({
+      first: String(stored.first || ''),
+      second: String(stored.second || ''),
+    }),
+  }, { first: 'old', second: 'old' });
+
+  const first = coordinator.request({ first: 'new', second: 'old' });
+  await firstSaveStarted.promise;
+  const newest = coordinator.request({ first: 'new', second: 'newest' });
+  releaseFailedSave.resolve();
+  await Promise.all([first, newest]);
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(disk, { first: 'new', second: 'newest' });
+});
+
+test('failed settings intent is retained for an explicit same-snapshot retry', async () => {
+  const { SettingsPersistenceCoordinator } = await importKanbanSettingsPersistence();
+  let disk = { mode: 'old' };
+  let attempts = 0;
+  const coordinator = new SettingsPersistenceCoordinator({
+    loadLatest: async () => structuredClone(disk),
+    saveMerged: async (merged) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('synthetic write failure');
+      disk = structuredClone(merged);
+    },
+    normalize: (stored) => ({ mode: String(stored.mode || '') }),
+  }, { mode: 'old' });
+
+  await assert.rejects(coordinator.request({ mode: 'new' }), /synthetic write failure/);
+  await coordinator.request({ mode: 'new' });
+  assert.equal(attempts, 2);
+  assert.equal(disk.mode, 'new');
+});
+
+test('a settings request made in the persistence completion callback is not stranded', async () => {
+  const { SettingsPersistenceCoordinator } = await importKanbanSettingsPersistence();
+  let disk = { mode: 'old' };
+  let live = { mode: 'old' };
+  let completionRequest;
+  const writes = [];
+  let coordinator;
+  coordinator = new SettingsPersistenceCoordinator({
+    loadLatest: async () => structuredClone(disk),
+    saveMerged: async (merged) => {
+      writes.push(structuredClone(merged));
+      disk = structuredClone(merged);
+    },
+    normalize: (stored) => ({ mode: String(stored.mode || '') }),
+    onPersisted: (_requested, persisted) => {
+      if (persisted.mode === 'first' && !completionRequest) {
+        live = { mode: 'second' };
+        completionRequest = coordinator.request(live);
+      }
+    },
+  }, live);
+
+  live = { mode: 'first' };
+  await coordinator.request(live);
+  await completionRequest;
+  assert.deepEqual(writes.map((write) => write.mode), ['first', 'second']);
+  assert.equal(disk.mode, 'second');
 });
 
 test('kanban cards own their layout so task previews expand below metadata', () => {

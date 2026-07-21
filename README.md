@@ -1,12 +1,17 @@
-TPS Kanban (Dev)
+# TPS Kanban
+
+## 0.0.2
+
+- Saved empty card-style rules remain empty, and all supported frontmatter color targets (`off`, `card`, `icon`, and `both`) survive reload.
+- Settings persistence reloads the newest plugin data and merges only locally changed fields, preserving synchronized choices and unknown newer-release fields. Overlapping edits retain quick reverts and wait for durable state.
+- This backward-compatible patch keeps the minimum supported Obsidian version at 1.10.0 and requires no manual migration.
 
 ## Install with BRAT
 
-This plugin is distributed from the private GitHub repository `ZachTish/tps-kanban`. To let BRAT read its releases:
+This GitHub repository is public. BRAT 2.2.0 or newer can install `ZachTish/tps-kanban` without a private-repository token:
 
-1. Create a fine-grained GitHub personal access token scoped only to `ZachTish/tps-kanban`, with **Repository permissions → Contents: Read-only**.
-2. In BRAT, add `ZachTish/tps-kanban` as a beta plugin, provide that token for private-repository access, and select **Latest** so BRAT tracks the newest published release.
-3. Store the token only in BRAT's device-local configuration. Never put it in this repository, a vault note, plugin settings, or any committed file.
+1. Add `ZachTish/tps-kanban` as a beta plugin.
+2. Select **Latest** to follow numbered releases, or freeze a numeric version for controlled rollout.
 
 ## Development and deployment
 
@@ -58,6 +63,7 @@ A Kanban board view that integrates with Obsidian's **Bases** plugin. It appears
 | Enable debug logging | `false` | Enables concise developer-console traces for lifecycle, settings saves, Base filter reads, lane add decisions, note/task creation, and edit failures. Errors are always logged |
 | Icon property | `icon` | Frontmatter key holding a Lucide icon name to show on the card |
 | Color property | `color` | Frontmatter key holding a CSS color value (hex, rgb, named) for the card's left-border accent |
+| Frontmatter color target | `card` | Stored `card`, `icon`, `both`, and `off` values survive reload; the current UI exposes Card and Off, and icon coloring remains unsupported |
 | Card add button default | `note` | Controls what `+ Add card` / `+ Add subitem` creates when board mode is mixed. `task` creates inline checkbox tasks in notes; `note` creates linked notes |
 | Ungrouped lane position | `Last` | Whether cards with no group-by value appear before or after the keyed lanes |
 | Default root task note path | `''` | Optional explicit sink for root task lines when no `task.path` base/default exists. If empty, task creation is blocked and no implicit fallback note is created |
@@ -67,6 +73,8 @@ A Kanban board view that integrates with Obsidian's **Bases** plugin. It appears
 The `icon` and `color` defaults match the keys written by Notebook Navigator Companion, so cards automatically pick up whatever styling NNC has applied to each note.
 
 Card click previews are gated by TPS Global Context Menu's `Force previews for Base links` setting. When that GCM toggle is off, cards open/focus notes normally even if Kanban's stored activation mode was previously `preview`.
+
+An explicitly empty frontmatter style-rule list remains empty after reload. Bundled priority rules are used only when the stored setting is missing or is not an array.
 
 ## Behaviour Matrix
 

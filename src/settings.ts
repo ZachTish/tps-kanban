@@ -130,3 +130,33 @@ export const DEFAULT_SETTINGS: KanbanSettings = {
   openTaskPreviewLimit: 5,
   showTaskOverflowCount: true,
 };
+
+export function normalizeFrontmatterColorTarget(value: unknown): KanbanSettings['frontmatterColorTarget'] {
+  return value === 'card' || value === 'icon' || value === 'both' || value === 'off'
+    ? value
+    : DEFAULT_SETTINGS.frontmatterColorTarget;
+}
+
+export function normalizeCardStyleRules(value: unknown): KanbanStyleRule[] {
+  const stored = Array.isArray(value) ? value : DEFAULT_SETTINGS.cardStyleRules;
+  return stored
+    .filter((rule: any) => rule && typeof rule === 'object')
+    .map((rule: any) => ({
+      id: typeof rule.id === 'string' ? rule.id : undefined,
+      label: typeof rule.label === 'string' ? rule.label : '',
+      active: rule.active !== false,
+      match: rule.match === 'any' ? 'any' : 'all',
+      conditions: Array.isArray(rule.conditions) && rule.conditions.length
+        ? rule.conditions.map((condition: any) => ({
+          field: typeof condition?.field === 'string' && condition.field.trim() ? condition.field.trim() : 'status',
+          operator: ['is', '!is', 'contains', '!contains', 'starts', '!starts', 'ends', '!ends', 'exists', '!exists'].includes(condition?.operator)
+            ? condition.operator
+            : 'is',
+          value: condition?.value == null ? '' : String(condition.value),
+        }))
+        : [{ field: 'status', operator: 'is', value: '' }],
+      color: typeof rule.color === 'string' ? rule.color : '',
+      icon: typeof rule.icon === 'string' ? rule.icon : '',
+      textStyle: typeof rule.textStyle === 'string' ? rule.textStyle : '',
+    }));
+}

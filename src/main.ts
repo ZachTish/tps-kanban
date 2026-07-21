@@ -1,7 +1,13 @@
 import { Plugin, QueryController, BasesView, type BasesAllOptions, type BasesViewConfig } from 'obsidian';
 import { KanbanView, KANBAN_VIEW_TYPE } from './views/KanbanView';
-import { DEFAULT_SETTINGS, KanbanSettings } from './settings';
+import {
+  DEFAULT_SETTINGS,
+  KanbanSettings,
+  normalizeCardStyleRules,
+  normalizeFrontmatterColorTarget,
+} from './settings';
 import { KanbanSettingTab } from './settings/SettingsTab';
+import { SettingsPersistenceCoordinator } from './settings-persistence';
 import { NATIVE_PREVIEW_SOURCE } from './preview';
 import { flow, flowError, setLoggingEnabled } from './logger';
 
@@ -37,8 +43,7 @@ export default class TPSKanbanPlugin extends Plugin {
   settings: KanbanSettings = DEFAULT_SETTINGS;
   private static readonly MIN_SCALE = 0.5;
   private static readonly MAX_SCALE = 1.4;
-  private settingsSavePromise: Promise<void> | null = null;
-  private settingsSavePending = false;
+  private settingsPersistence: SettingsPersistenceCoordinator<KanbanSettings> | null = null;
 
   async onload() {
     this.settings = this.normalizeSettings(await this.loadData() as Partial<KanbanSettings> || {});
@@ -77,6 +82,12 @@ export default class TPSKanbanPlugin extends Plugin {
     if (typeof this.settings.showTaskOverflowCount !== 'boolean') {
       this.settings.showTaskOverflowCount = DEFAULT_SETTINGS.showTaskOverflowCount;
     }
+    this.settingsPersistence = new SettingsPersistenceCoordinator<KanbanSettings>({
+      loadLatest: () => this.loadData(),
+      saveMerged: (settings) => this.saveData(settings),
+      normalize: (stored) => this.normalizeSettings(stored as Partial<KanbanSettings>),
+      onPersisted: (requested, persisted) => this.reconcilePersistedSettings(requested, persisted),
+    }, this.settings);
     this.registerBasesView(KANBAN_VIEW_TYPE, {
       name: 'Kanban',
       icon: 'columns',
@@ -93,36 +104,25 @@ export default class TPSKanbanPlugin extends Plugin {
   }
 
   async saveSettings() {
-    if (this.settingsSavePromise) {
-      this.settingsSavePending = true;
-      flow('Settings', 'save:queued');
-      await this.settingsSavePromise;
-      return;
+    const persistence = this.settingsPersistence;
+    if (!persistence) throw new Error('TPS Kanban settings persistence is not initialized');
+
+    setLoggingEnabled(this.settings.enableLogging);
+    flow('Settings', 'save:start', {
+      enableLogging: this.settings.enableLogging,
+      cardAddButtonDefault: this.settings.cardAddButtonDefault,
+      cardActivationMode: this.settings.cardActivationMode,
+      scale: this.settings.scale,
+    });
+    try {
+      await persistence.request(this.settings);
+      setLoggingEnabled(this.settings.enableLogging);
+      this.refreshKanbanViewsFromSettings();
+      flow('Settings', 'save:done');
+    } catch (error) {
+      flowError('Settings', 'save:failed', error);
+      throw error;
     }
-
-    do {
-      this.settingsSavePending = false;
-      const snapshot = JSON.parse(JSON.stringify(this.settings));
-      setLoggingEnabled(snapshot.enableLogging);
-      flow('Settings', 'save:start', {
-        enableLogging: snapshot.enableLogging,
-        cardAddButtonDefault: snapshot.cardAddButtonDefault,
-        cardActivationMode: snapshot.cardActivationMode,
-        scale: snapshot.scale,
-      });
-      this.settingsSavePromise = this.saveData(snapshot);
-      try {
-        await this.settingsSavePromise;
-        flow('Settings', 'save:done');
-      } catch (error) {
-        flowError('Settings', 'save:failed', error);
-        throw error;
-      } finally {
-        this.settingsSavePromise = null;
-      }
-    } while (this.settingsSavePending);
-
-    this.refreshKanbanViewsFromSettings();
   }
 
   onunload() {
@@ -140,33 +140,8 @@ export default class TPSKanbanPlugin extends Plugin {
       colorKey: typeof stored.colorKey === 'string' && stored.colorKey.trim()
         ? stored.colorKey.trim()
         : DEFAULT_SETTINGS.colorKey,
-      frontmatterColorTarget: stored.frontmatterColorTarget === 'off'
-        ? 'off'
-        : stored.frontmatterColorTarget === 'card' || stored.frontmatterColorTarget === 'icon' || stored.frontmatterColorTarget === 'both'
-          ? 'card'
-        : DEFAULT_SETTINGS.frontmatterColorTarget,
-      cardStyleRules: Array.isArray(stored.cardStyleRules) && stored.cardStyleRules.length
-        ? stored.cardStyleRules
-          .filter((rule: any) => rule && typeof rule === 'object')
-          .map((rule: any) => ({
-            id: typeof rule.id === 'string' ? rule.id : undefined,
-            label: typeof rule.label === 'string' ? rule.label : '',
-            active: rule.active !== false,
-            match: rule.match === 'any' ? 'any' : 'all',
-            conditions: Array.isArray(rule.conditions) && rule.conditions.length
-              ? rule.conditions.map((condition: any) => ({
-                field: typeof condition?.field === 'string' && condition.field.trim() ? condition.field.trim() : 'status',
-                operator: ['is', '!is', 'contains', '!contains', 'starts', '!starts', 'ends', '!ends', 'exists', '!exists'].includes(condition?.operator)
-                  ? condition.operator
-                  : 'is',
-                value: condition?.value == null ? '' : String(condition.value),
-              }))
-              : [{ field: 'status', operator: 'is', value: '' }],
-            color: typeof rule.color === 'string' ? rule.color : '',
-            icon: typeof rule.icon === 'string' ? rule.icon : '',
-            textStyle: typeof rule.textStyle === 'string' ? rule.textStyle : '',
-          }))
-        : DEFAULT_SETTINGS.cardStyleRules,
+      frontmatterColorTarget: normalizeFrontmatterColorTarget(stored.frontmatterColorTarget),
+      cardStyleRules: normalizeCardStyleRules(stored.cardStyleRules),
       ungroupedPosition: stored.ungroupedPosition === 'first' || stored.ungroupedPosition === 'last'
         ? stored.ungroupedPosition
         : DEFAULT_SETTINGS.ungroupedPosition,
@@ -215,6 +190,18 @@ export default class TPSKanbanPlugin extends Plugin {
     const numeric = typeof value === 'number' ? value : Number(value);
     if (!Number.isFinite(numeric)) return DEFAULT_SETTINGS.openTaskPreviewLimit;
     return Math.max(0, Math.min(20, Math.floor(numeric)));
+  }
+
+  private reconcilePersistedSettings(requested: KanbanSettings, persisted: KanbanSettings): void {
+    const currentRecord = this.settings as unknown as Record<string, unknown>;
+    const requestedRecord = requested as unknown as Record<string, unknown>;
+    const persistedRecord = persisted as unknown as Record<string, unknown>;
+
+    for (const key of Object.keys(persistedRecord)) {
+      if (JSON.stringify(currentRecord[key]) === JSON.stringify(requestedRecord[key])) {
+        currentRecord[key] = JSON.parse(JSON.stringify(persistedRecord[key]));
+      }
+    }
   }
 
   private refreshKanbanViewsFromSettings(): void {
