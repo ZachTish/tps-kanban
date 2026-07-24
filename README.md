@@ -1,10 +1,10 @@
 # TPS Kanban
 
-## 0.0.2
+## 0.1.0
 
-- Saved empty card-style rules remain empty, and all supported frontmatter color targets (`off`, `card`, `icon`, and `both`) survive reload.
-- Settings persistence reloads the newest plugin data and merges only locally changed fields, preserving synchronized choices and unknown newer-release fields. Overlapping edits retain quick reverts and wait for durable state.
-- This backward-compatible patch keeps the minimum supported Obsidian version at 1.10.0 and requires no manual migration.
+- Settings now use five clean destinations for rules/creation, cards, appearance, lanes/layout, and advanced diagnostics.
+- A compact Base-rules guide and one optional full reference make creation rules discoverable; per-view lane/layout ownership remains in each board.
+- Existing Kanban settings, per-view state, and frontmatter color compatibility are unchanged. This backward-compatible minor release keeps the minimum supported Obsidian version at 1.10.0 and requires no migration.
 
 ## Install with BRAT
 
@@ -18,6 +18,7 @@ This GitHub repository is public. BRAT 2.2.0 or newer can install `ZachTish/tps-
 Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtisherman/TishOS Plugin Development/TPS-Kanban (Dev)`, outside both vaults. `npm run build` and watch builds deploy byte-changed runtime artifacts by default only to `/Users/zachtisherman/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Plugin Test Vault/.obsidian/plugins/tps-kanban`; `npm test` is therefore isolated even though it ends with a production-mode build. Promotion to `/Users/zachtisherman/TishOS v0.1/.obsidian/plugins/tps-kanban` is an explicit guarded post-validation action. Neither target overwrites `data.json` or other runtime-owned state.
 
 - 2026-07-16 isolation validation: all 51 declared tests and the required final `npm run build` passed with `[runtime-deploy] target=test ... unchanged`. Obsidian 1.12.7 loaded the plugin in the registered test vault, where the synthetic Kanban view rendered `todo` and `working` lanes with their expected task cards. No live promotion occurred, and production runtime checksums remained unchanged.
+- 2026-07-24 settings-release validation: all 61 declared contract, filter-composition, utility, and routed-settings tests passed, and source/shipped CSS remained byte-identical. The required final standalone build deployed only to `[runtime-deploy] target=test`. Obsidian 1.12.7 was reloaded with `Reload app without saving`; all five settings destinations, the compact Base guide, and its single full-reference disclosure were inspected in the registered test vault without changing a default or invoking a reset. Runtime-owned state remained absent and production was not accessed or promoted.
 
 ## Mobile modal contract
 
@@ -58,23 +59,44 @@ A Kanban board view that integrates with Obsidian's **Bases** plugin. It appears
 
 ## Settings
 
-| Setting | Default | Description |
-|---|---|---|
-| Enable debug logging | `false` | Enables concise developer-console traces for lifecycle, settings saves, Base filter reads, lane add decisions, note/task creation, and edit failures. Errors are always logged |
-| Icon property | `icon` | Frontmatter key holding a Lucide icon name to show on the card |
-| Color property | `color` | Frontmatter key holding a CSS color value (hex, rgb, named) for the card's left-border accent |
-| Frontmatter color target | `card` | Stored `card`, `icon`, `both`, and `off` values survive reload; the current UI exposes Card and Off, and icon coloring remains unsupported |
-| Card add button default | `note` | Controls what `+ Add card` / `+ Add subitem` creates when board mode is mixed. `task` creates inline checkbox tasks in notes; `note` creates linked notes |
-| Ungrouped lane position | `Last` | Whether cards with no group-by value appear before or after the keyed lanes |
-| Default root task note path | `''` | Optional explicit sink for root task lines when no `task.path` base/default exists. If empty, task creation is blocked and no implicit fallback note is created |
-| Open task destination after create | `true` | Auto-open the note that receives a newly created root task |
-| Card click behavior | `open` | Normal card/list clicks open and focus the note. Hover Editor preview behavior is controlled by GCM's `Force previews for Base links` toggle |
+Settings uses a shallow five-destination hub. The route choice is transient and never written to plugin data, only the active destination is rendered, and each destination restores its own scroll position after a settings-triggered redraw.
+
+| Destination | Contents |
+|---|---|
+| **Rules & creation** | Base filter guidance, card add behavior, the optional root-task destination, and whether that destination opens after creation |
+| **Cards** | Card click behavior, open-task preview limit, and overflow count |
+| **Appearance** | Icon/color property keys, frontmatter color handling, and JSON card style rules |
+| **Lanes & layout** | Ungrouped position, global scale, and dynamic empty-lane width |
+| **Advanced** | Debug logging |
+
+**Rules & creation** starts with a compact Base rules guide. One optional full reference disclosure contains the complete variable list and examples; no other settings are nested behind disclosures. Keyboard focus moves to the destination heading after navigation, the route strip has a visible focus state, and the strip scrolls horizontally on narrow/mobile screens.
+
+Per-view lane order, board/list mode, completed-task visibility, and lane labels remain saved per Base view and are changed from the Kanban view itself. The settings hub does not replace or reset those per-view controls.
+
+| Destination | Setting | Default | Description |
+|---|---|---|---|
+| Rules & creation | Card add button default | `note` | Controls what `+ Add card` / `+ Add subitem` creates when board mode is mixed. `task` creates inline checkbox tasks in notes; `note` creates linked notes |
+| Rules & creation | Default root task note path | `''` | Optional explicit sink for root task lines when no `task.path` Base/default exists. If empty, task creation is blocked and no implicit fallback note is created |
+| Rules & creation | Open task destination after create | `true` | Auto-open the note that receives a newly created root task |
+| Cards | Card click behavior | `open` | Normal card/list clicks open and focus the note. Hover Editor preview behavior is controlled by GCM's `Force previews for Base links` toggle |
+| Cards | Open task preview limit | `5` | Maximum unchecked body tasks shown on a card; the adjacent reset restores `5` |
+| Cards | Show task overflow count | `true` | Shows `+N more` when unchecked tasks exceed the preview limit |
+| Appearance | Icon property | `icon` | Frontmatter key holding a Lucide icon name to show on the card |
+| Appearance | Color property | `color` | Frontmatter key holding a CSS color value for the card accent |
+| Appearance | Frontmatter color target | `card` | The UI continues to expose Card and Off. Stored `icon` and `both` remain load-compatible and survive reload until the user explicitly chooses a displayed option |
+| Appearance | Frontmatter value style rules | bundled priority rules | JSON rules matching note frontmatter or task inline fields; an explicitly saved empty array remains empty |
+| Lanes & layout | Ungrouped lane position | `Last` | Places cards without a group-by value before or after keyed lanes |
+| Lanes & layout | Kanban scale | `100%` | Scales board sizing from 50% through 140%; the adjacent reset restores 100% |
+| Lanes & layout | Dynamic empty lane width | `false` | Shrinks empty columns in board mode |
+| Advanced | Enable debug logging | `false` | Enables concise developer-console traces for lifecycle, settings saves, Base filter reads, creation, and edit failures. Errors are always logged |
 
 The `icon` and `color` defaults match the keys written by Notebook Navigator Companion, so cards automatically pick up whatever styling NNC has applied to each note.
 
 Card click previews are gated by TPS Global Context Menu's `Force previews for Base links` setting. When that GCM toggle is off, cards open/focus notes normally even if Kanban's stored activation mode was previously `preview`.
 
 An explicitly empty frontmatter style-rule list remains empty after reload. Bundled priority rules are used only when the stored setting is missing or is not an array.
+
+Run `npm run test:settings` for the focused settings source contract. It checks route depth, control/key coverage, frontmatter color compatibility, reset actions, per-view ownership, accessibility, mobile CSS, and the README specification without invoking a build or runtime deployment.
 
 ## Behaviour Matrix
 
@@ -200,8 +222,13 @@ An explicitly empty frontmatter style-rule list remains empty after reload. Bund
 - If no Group By is configured, the board shows a single ungrouped lane.
 - Only `frontmatter` properties support drag-to-move. Computed or file properties are displayed but dragging between lanes is disabled when the Group By targets a non-frontmatter property.
 
+## Version notes
+
+- 0.1.0: Reorganized settings into five shallow accessible destinations, added a compact Base-rules guide, per-route scroll/focus restoration, and mobile navigation while preserving every global/per-view setting and compatibility path.
+- 0.0.2: Preserved explicit empty style rules and all supported frontmatter color targets while making settings writes merge local intent into the newest synchronized data.
+
 ## Settings layout
 
-Card click and add-button behavior are root-level core controls. Card metadata, lane behavior, card content, the Base query guide, and diagnostics are optional collapsed groups. There is no nested accordion beyond the top-level groups, and a fresh settings open starts with all groups collapsed.
+The five-route hub documented above replaces the former root controls plus collapsed-group layout. A fresh settings open starts on **Rules & creation**; switching routes renders that destination alone, and only the full Base filter reference uses a disclosure.
 
-- 2026-07-13: Promoted the two primary card interactions to the root and kept all optional settings collapsed. Validation: settings hierarchy audit, full test suite, production build/deploy, and Obsidian reload.
+- 2026-07-13: Promoted the two primary card interactions to the root and kept all optional settings collapsed. That historical layout was superseded by the shallow five-route settings hub.

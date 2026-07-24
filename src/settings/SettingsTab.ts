@@ -1,35 +1,54 @@
 import { App, PluginSettingTab, Setting } from 'obsidian';
 import TPSKanbanPlugin from '../main';
 
-const createCollapsibleSection = (
-  parent: HTMLElement,
-  title: string,
-  description?: string,
-  defaultOpen = false,
-): HTMLElement => {
-  const details = parent.createEl('details', { cls: 'tps-collapsible-section' });
-  if (defaultOpen) {
-    details.setAttr('open', 'true');
-  }
+type KanbanSettingsPage =
+  | 'rules-creation'
+  | 'cards'
+  | 'appearance'
+  | 'lanes-layout'
+  | 'advanced';
 
-  const summary = details.createEl('summary', { cls: 'tps-collapsible-section-summary' });
-  summary.createSpan({ cls: 'tps-collapsible-section-title', text: title });
+interface KanbanSettingsDestination {
+  id: KanbanSettingsPage;
+  title: string;
+  description: string;
+}
 
-  if (description) {
-    details.createEl('p', {
-      cls: 'tps-collapsible-section-description',
-      text: description,
-    });
-  }
-
-  return details.createDiv({ cls: 'tps-collapsible-section-content' });
-};
+const KANBAN_SETTINGS_DESTINATIONS: readonly KanbanSettingsDestination[] = [
+  {
+    id: 'rules-creation',
+    title: 'Rules & creation',
+    description: 'Base filters, add behavior, and task destinations.',
+  },
+  {
+    id: 'cards',
+    title: 'Cards',
+    description: 'Click behavior and open-task previews.',
+  },
+  {
+    id: 'appearance',
+    title: 'Appearance',
+    description: 'Card icons, colors, and style rules.',
+  },
+  {
+    id: 'lanes-layout',
+    title: 'Lanes & layout',
+    description: 'Lane placement, sizing, and board density.',
+  },
+  {
+    id: 'advanced',
+    title: 'Advanced',
+    description: 'Diagnostics for troubleshooting Kanban.',
+  },
+];
 
 export class KanbanSettingTab extends PluginSettingTab {
   plugin: TPSKanbanPlugin;
-  private settingsViewState = new Map<string, boolean>();
-  private settingsScrollTop = 0;
-  private hasRenderedSettings = false;
+  private activeSettingsPage: KanbanSettingsPage = 'rules-creation';
+  private renderedSettingsPage: KanbanSettingsPage | null = null;
+  private settingsScrollTopByPage = new Map<KanbanSettingsPage, number>();
+  private navigatingToPage = false;
+
   constructor(app: App, plugin: TPSKanbanPlugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -37,30 +56,110 @@ export class KanbanSettingTab extends PluginSettingTab {
 
   display(): void {
     const { containerEl } = this;
-    this.captureSettingsViewState(containerEl);
+    if (this.renderedSettingsPage) {
+      this.settingsScrollTopByPage.set(this.renderedSettingsPage, containerEl.scrollTop);
+    }
+
     containerEl.empty();
     containerEl.createEl('h2', { text: 'TPS Kanban settings' });
     containerEl.createEl('p', {
-      text: "Lanes are defined by the Group By setting in each base view. Use the base's toolbar to configure grouping and sorting.",
+      text: "Lanes are defined by the Group By setting in each Base view. Use the Base toolbar to configure grouping and sorting.",
       cls: 'setting-item-description',
     });
 
-    const coreSettings = containerEl.createDiv({ cls: 'tps-settings-core' });
-    new Setting(coreSettings).setName('Core settings').setHeading();
+    containerEl.createEl('h3', {
+      cls: 'tps-kanban-settings-nav-heading',
+      text: 'Choose what to configure',
+    });
+    containerEl.createEl('p', {
+      cls: 'setting-item-description tps-kanban-settings-nav-description',
+      text: 'Pick one destination. Base-view choices stay in the board, while these pages control shared Kanban behavior.',
+    });
+    const navigation = containerEl.createEl('nav', {
+      cls: 'tps-kanban-settings-nav',
+    });
+    navigation.setAttr('aria-label', 'Kanban settings sections');
 
-    new Setting(coreSettings)
-      .setName('Card click behavior')
-      .setDesc('Choose whether a normal card click shows a Hover Editor preview first or opens the note immediately.')
-      .addDropdown((drop) => drop
-        .addOption('preview', 'Preview first')
-        .addOption('open', 'Open note')
-        .setValue(this.plugin.settings.cardActivationMode || 'open')
-        .onChange(async (value) => {
-          this.plugin.settings.cardActivationMode = value as 'preview' | 'open';
-          await this.plugin.saveSettings();
-        }));
+    for (const destination of KANBAN_SETTINGS_DESTINATIONS) {
+      const isActive = destination.id === this.activeSettingsPage;
+      const button = navigation.createEl('button', {
+        cls: `tps-kanban-settings-route${isActive ? ' is-active' : ''}`,
+      });
+      button.type = 'button';
+      button.id = `tps-kanban-settings-route-${destination.id}`;
+      button.setAttr('aria-pressed', String(isActive));
+      button.createSpan({
+        cls: 'tps-kanban-settings-route-label',
+        text: destination.title,
+      });
+      button.createSpan({
+        cls: 'tps-kanban-settings-route-description',
+        text: destination.description,
+      });
+      button.addEventListener('click', () => this.navigateToPage(destination.id));
+    }
 
-    new Setting(coreSettings)
+    const destination = KANBAN_SETTINGS_DESTINATIONS.find(
+      (candidate) => candidate.id === this.activeSettingsPage,
+    ) ?? KANBAN_SETTINGS_DESTINATIONS[0];
+    const page = containerEl.createEl('section', {
+      cls: 'tps-kanban-settings-page',
+    });
+    page.id = `tps-kanban-settings-page-${destination.id}`;
+    page.dataset.settingsPage = destination.id;
+    page.setAttr('aria-labelledby', `tps-kanban-settings-route-${destination.id}`);
+
+    const pageHeading = page.createEl('h3', {
+      cls: 'tps-kanban-settings-page-heading',
+      text: destination.title,
+    });
+    pageHeading.tabIndex = -1;
+    page.createEl('p', {
+      cls: 'setting-item-description tps-kanban-settings-page-description',
+      text: destination.description,
+    });
+
+    switch (this.activeSettingsPage) {
+      case 'rules-creation':
+        this.renderRulesAndCreation(page);
+        break;
+      case 'cards':
+        this.renderCards(page);
+        break;
+      case 'appearance':
+        this.renderAppearance(page);
+        break;
+      case 'lanes-layout':
+        this.renderLanesAndLayout(page);
+        break;
+      case 'advanced':
+        this.renderAdvanced(page);
+        break;
+    }
+
+    this.renderedSettingsPage = this.activeSettingsPage;
+    if (this.navigatingToPage) {
+      this.navigatingToPage = false;
+      containerEl.scrollTop = 0;
+      containerEl
+        .querySelector<HTMLElement>('.tps-kanban-settings-route[aria-pressed="true"]')
+        ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      pageHeading.focus({ preventScroll: true });
+      pageHeading.scrollIntoView({ block: 'start' });
+      return;
+    }
+    containerEl.scrollTop = this.settingsScrollTopByPage.get(this.activeSettingsPage) ?? 0;
+  }
+
+  private navigateToPage(page: KanbanSettingsPage): void {
+    if (page === this.activeSettingsPage) return;
+    this.activeSettingsPage = page;
+    this.navigatingToPage = true;
+    this.display();
+  }
+
+  private renderRulesAndCreation(page: HTMLElement): void {
+    new Setting(page)
       .setName('Card add button default')
       .setDesc('Choose whether the + button on a card creates a linked note subitem or an inline task in that card note.')
       .addDropdown((drop) => drop
@@ -72,153 +171,18 @@ export class KanbanSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    const diagnostics = createCollapsibleSection(
-      containerEl,
-      'Diagnostics',
-      'Concise development logs for tracing Kanban creation, filter, and settings flows.',
-      false,
-    );
-
-    new Setting(diagnostics)
-      .setName('Enable debug logging')
-      .setDesc('Logs Kanban lifecycle, settings saves, Base filter reads, lane add decisions, task creation, note creation, and edit failures. Errors are always logged.')
-      .addToggle((toggle) => toggle
-        .setValue(!!this.plugin.settings.enableLogging)
-        .onChange(async (value) => {
-          this.plugin.settings.enableLogging = value;
-          await this.plugin.saveSettings();
-        }));
-
-    this.renderBaseQueryGuide(containerEl);
-
-    const cardFields = createCollapsibleSection(
-      containerEl,
-      'Card Frontmatter Keys',
-      'Keys used to pull visual metadata from each card note.',
-      false,
-    );
-
-    new Setting(cardFields)
-      .setName('Icon property')
-      .setDesc('Frontmatter key whose value is a Lucide icon name to display on each card (e.g. icon).')
-      .addText(text => text
-        .setPlaceholder('icon')
-        .setValue(this.plugin.settings.iconKey)
-        .onChange(async value => {
-          this.plugin.settings.iconKey = value.trim() || 'icon';
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(cardFields)
-      .setName('Color property')
-      .setDesc('Frontmatter key whose value is a CSS color (hex, rgb, named) to use as the card accent (e.g. color).')
-      .addText(text => text
-        .setPlaceholder('color')
-        .setValue(this.plugin.settings.colorKey)
-        .onChange(async value => {
-          this.plugin.settings.colorKey = value.trim() || 'color';
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(cardFields)
-      .setName('Frontmatter color applies to')
-      .setDesc('Choose whether frontmatter and rule colors affect card accents. Icons keep their note/task identity color.')
-      .addDropdown(drop => drop
-        .addOption('card', 'Card only')
-        .addOption('off', 'Off')
-        .setValue(this.plugin.settings.frontmatterColorTarget === 'off' ? 'off' : 'card')
-        .onChange(async value => {
-          this.plugin.settings.frontmatterColorTarget = value as 'card' | 'off';
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(cardFields)
-      .setName('Frontmatter value style rules')
-      .setDesc('JSON array of rules. Match note frontmatter or task inline fields and apply card color/textStyle. Icons are not changed by these rules.')
-      .addTextArea(text => {
-        text.inputEl.rows = 8;
-        text.inputEl.style.width = '100%';
-        text
-          .setPlaceholder('[{"label":"Priority: high","conditions":[{"field":"priority","operator":"is","value":"high"}],"color":"#ef4444"}]')
-          .setValue(JSON.stringify(this.plugin.settings.cardStyleRules || [], null, 2))
-          .onChange(async value => {
-            try {
-              const parsed = value.trim() ? JSON.parse(value) : [];
-              this.plugin.settings.cardStyleRules = Array.isArray(parsed) ? parsed : [];
-              await this.plugin.saveSettings();
-            } catch {
-              // Wait for valid JSON before persisting.
-            }
-          });
-      });
-
-    const laneOrder = createCollapsibleSection(
-      containerEl,
-      'Lane Behavior',
-      'Optional sorting behavior for cards that do not have a group-by value.',
-      false,
-    );
-
-    new Setting(laneOrder)
-      .setName('Ungrouped lane position')
-      .setDesc('Where to place cards that have no group-by value.')
-      .addDropdown(drop => drop
-        .addOption('first', 'First')
-        .addOption('last', 'Last')
-        .setValue(this.plugin.settings.ungroupedPosition)
-        .onChange(async value => {
-          this.plugin.settings.ungroupedPosition = value as 'first' | 'last';
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(laneOrder)
-      .setName('Kanban scale')
-      .setDesc('Scale board sizing from 50% to 140%.')
-      .addSlider((slider) => {
-        slider
-          .setLimits(50, 140, 5)
-          .setDynamicTooltip()
-          .setValue(Math.round((this.plugin.settings.scale || 1) * 100))
-          .onChange(async (value) => {
-            this.plugin.settings.scale = value / 100;
-            await this.plugin.saveSettings();
-          });
-      })
-      .addExtraButton((btn) => {
-        btn
-          .setIcon('reset')
-          .setTooltip('Reset to 100%')
-          .onClick(async () => {
-            this.plugin.settings.scale = 1;
-            await this.plugin.saveSettings();
-            this.display();
-          });
-      });
-
-    new Setting(laneOrder)
-      .setName('Dynamic empty lane width')
-      .setDesc('In board mode, shrink columns that have no cards.')
-      .addToggle((toggle) => {
-        toggle
-          .setValue(!!this.plugin.settings.dynamicEmptyLaneWidth)
-          .onChange(async (value) => {
-            this.plugin.settings.dynamicEmptyLaneWidth = value;
-            await this.plugin.saveSettings();
-          });
-      });
-
-    new Setting(laneOrder)
+    new Setting(page)
       .setName('Default root task note path')
       .setDesc('Optional. When a task-only Kanban view has no task.path filter, new root tasks are written to this note.')
-      .addText(text => text
+      .addText((text) => text
         .setPlaceholder('Inbox.md')
         .setValue(this.plugin.settings.defaultRootTaskPath || '')
-        .onChange(async value => {
+        .onChange(async (value) => {
           this.plugin.settings.defaultRootTaskPath = value.trim();
           await this.plugin.saveSettings();
         }));
 
-    new Setting(laneOrder)
+    new Setting(page)
       .setName('Open task destination after create')
       .setDesc('After creating a root task, open the note that the task was written into.')
       .addToggle((toggle) => toggle
@@ -228,14 +192,23 @@ export class KanbanSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    const cardContent = createCollapsibleSection(
-      containerEl,
-      'Card Content',
-      'Controls for note-body task previews shown inside cards.',
-      false,
-    );
+    this.renderBaseQueryGuide(page);
+  }
 
-    new Setting(cardContent)
+  private renderCards(page: HTMLElement): void {
+    new Setting(page)
+      .setName('Card click behavior')
+      .setDesc('Choose whether a normal card click shows a Hover Editor preview first or opens the note immediately.')
+      .addDropdown((drop) => drop
+        .addOption('preview', 'Preview first')
+        .addOption('open', 'Open note')
+        .setValue(this.plugin.settings.cardActivationMode || 'open')
+        .onChange(async (value) => {
+          this.plugin.settings.cardActivationMode = value as 'preview' | 'open';
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(page)
       .setName('Open task preview limit')
       .setDesc('Maximum number of unchecked body tasks to show on each card.')
       .addSlider((slider) => {
@@ -248,8 +221,8 @@ export class KanbanSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       })
-      .addExtraButton((btn) => {
-        btn
+      .addExtraButton((button) => {
+        button
           .setIcon('reset')
           .setTooltip('Reset to 5')
           .onClick(async () => {
@@ -259,63 +232,167 @@ export class KanbanSettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(cardContent)
+    new Setting(page)
       .setName('Show task overflow count')
       .setDesc('Show a compact +N more row when a card has additional unchecked tasks.')
-      .addToggle((toggle) => {
-        toggle
-          .setValue(this.plugin.settings.showTaskOverflowCount !== false)
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.showTaskOverflowCount !== false)
+        .onChange(async (value) => {
+          this.plugin.settings.showTaskOverflowCount = value;
+          await this.plugin.saveSettings();
+        }));
+  }
+
+  private renderAppearance(page: HTMLElement): void {
+    new Setting(page)
+      .setName('Icon property')
+      .setDesc('Frontmatter key whose value is a Lucide icon name to display on each card (e.g. icon).')
+      .addText((text) => text
+        .setPlaceholder('icon')
+        .setValue(this.plugin.settings.iconKey)
+        .onChange(async (value) => {
+          this.plugin.settings.iconKey = value.trim() || 'icon';
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(page)
+      .setName('Color property')
+      .setDesc('Frontmatter key whose value is a CSS color (hex, rgb, named) to use as the card accent (e.g. color).')
+      .addText((text) => text
+        .setPlaceholder('color')
+        .setValue(this.plugin.settings.colorKey)
+        .onChange(async (value) => {
+          this.plugin.settings.colorKey = value.trim() || 'color';
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(page)
+      .setName('Frontmatter color applies to')
+      .setDesc('Choose whether frontmatter and rule colors affect card accents. Icons keep their note/task identity color.')
+      .addDropdown((drop) => drop
+        .addOption('card', 'Card only')
+        .addOption('off', 'Off')
+        .setValue(this.plugin.settings.frontmatterColorTarget === 'off' ? 'off' : 'card')
+        .onChange(async (value) => {
+          this.plugin.settings.frontmatterColorTarget = value as 'card' | 'off';
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(page)
+      .setName('Frontmatter value style rules')
+      .setDesc('JSON array of rules. Match note frontmatter or task inline fields and apply card color/textStyle. Icons are not changed by these rules.')
+      .addTextArea((text) => {
+        text.inputEl.rows = 8;
+        text.inputEl.style.width = '100%';
+        text
+          .setPlaceholder('[{"label":"Priority: high","conditions":[{"field":"priority","operator":"is","value":"high"}],"color":"#ef4444"}]')
+          .setValue(JSON.stringify(this.plugin.settings.cardStyleRules || [], null, 2))
           .onChange(async (value) => {
-            this.plugin.settings.showTaskOverflowCount = value;
+            try {
+              const parsed = value.trim() ? JSON.parse(value) : [];
+              this.plugin.settings.cardStyleRules = Array.isArray(parsed) ? parsed : [];
+              await this.plugin.saveSettings();
+            } catch {
+              // Wait for valid JSON before persisting.
+            }
+          });
+      });
+  }
+
+  private renderLanesAndLayout(page: HTMLElement): void {
+    page.createEl('p', {
+      cls: 'tps-kanban-settings-context-note',
+      text: 'Board/list mode, manual lane order, lane labels, and completed-task visibility are saved per Base view and are changed from that Kanban view.',
+    });
+
+    new Setting(page)
+      .setName('Ungrouped lane position')
+      .setDesc('Where to place cards that have no group-by value.')
+      .addDropdown((drop) => drop
+        .addOption('first', 'First')
+        .addOption('last', 'Last')
+        .setValue(this.plugin.settings.ungroupedPosition)
+        .onChange(async (value) => {
+          this.plugin.settings.ungroupedPosition = value as 'first' | 'last';
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(page)
+      .setName('Kanban scale')
+      .setDesc('Scale board sizing from 50% to 140%.')
+      .addSlider((slider) => {
+        slider
+          .setLimits(50, 140, 5)
+          .setDynamicTooltip()
+          .setValue(Math.round((this.plugin.settings.scale || 1) * 100))
+          .onChange(async (value) => {
+            this.plugin.settings.scale = value / 100;
             await this.plugin.saveSettings();
+          });
+      })
+      .addExtraButton((button) => {
+        button
+          .setIcon('reset')
+          .setTooltip('Reset to 100%')
+          .onClick(async () => {
+            this.plugin.settings.scale = 1;
+            await this.plugin.saveSettings();
+            this.display();
           });
       });
 
-    this.restoreSettingsViewState(containerEl);
+    new Setting(page)
+      .setName('Dynamic empty lane width')
+      .setDesc('In board mode, shrink columns that have no cards.')
+      .addToggle((toggle) => toggle
+        .setValue(!!this.plugin.settings.dynamicEmptyLaneWidth)
+        .onChange(async (value) => {
+          this.plugin.settings.dynamicEmptyLaneWidth = value;
+          await this.plugin.saveSettings();
+        }));
   }
 
-  private captureSettingsViewState(containerEl: HTMLElement): void {
-    this.settingsScrollTop = containerEl.scrollTop;
-    this.settingsViewState.clear();
-    const detailsEls = Array.from(containerEl.querySelectorAll('details'));
-    detailsEls.forEach((detailsEl, index) => {
-      const details = detailsEl as HTMLDetailsElement;
-      const summaryText = details.querySelector('summary')?.textContent?.trim() || '';
-      this.settingsViewState.set(`${index}:${summaryText}`, details.open);
+  private renderAdvanced(page: HTMLElement): void {
+    new Setting(page)
+      .setName('Enable debug logging')
+      .setDesc('Logs Kanban lifecycle, settings saves, Base filter reads, lane add decisions, task creation, note creation, and edit failures. Errors are always logged.')
+      .addToggle((toggle) => toggle
+        .setValue(!!this.plugin.settings.enableLogging)
+        .onChange(async (value) => {
+          this.plugin.settings.enableLogging = value;
+          await this.plugin.saveSettings();
+        }));
+  }
+
+  private renderBaseQueryGuide(parent: HTMLElement): void {
+    const guide = parent.createDiv({ cls: 'tps-kanban-settings-base-guide' });
+    guide.setAttr('aria-label', 'Base query guide');
+    guide.createEl('h4', { text: 'Base rules at a glance' });
+    guide.createEl('p', {
+      cls: 'setting-item-description',
+      text: 'Kanban reads the saved Base filter tree and applies it separately to note cards and checkbox task cards. Explicit note. and task. prefixes make both matching and creation defaults predictable.',
     });
-  }
 
-  private restoreSettingsViewState(containerEl: HTMLElement): void {
-    const detailsEls = Array.from(containerEl.querySelectorAll('details'));
-    if (!this.hasRenderedSettings) {
-      detailsEls.forEach((detailsEl) => {
-        (detailsEl as HTMLDetailsElement).removeAttribute('open');
-      });
-      this.hasRenderedSettings = true;
-      containerEl.scrollTop = 0;
-      return;
-    }
-    detailsEls.forEach((detailsEl, index) => {
-      const details = detailsEl as HTMLDetailsElement;
-      const summaryText = details.querySelector('summary')?.textContent?.trim() || '';
-      const isOpen = this.settingsViewState.get(`${index}:${summaryText}`);
-      if (isOpen) details.setAttr('open', 'true');
-      else details.removeAttribute('open');
+    const essentials = guide.createEl('ul');
+    essentials.createEl('li', { text: 'Use kind == "note" for notes, kind == "task" for checkbox tasks, or ordered OR branches for mixed views.' });
+    essentials.createEl('li', { text: 'Use note.tags/note.status for note frontmatter and task.tags/task.status for inline tasks; bare fields are shared.' });
+    essentials.createEl('li', { text: 'Use task.path to choose the note scanned for tasks and to provide the root-task creation destination.' });
+    essentials.createEl('li', { text: 'Positive task.path, task.status, task.tags, and simple equality filters can become defaults for newly created tasks.' });
+
+    const reference = guide.createEl('details', {
+      cls: 'tps-kanban-settings-base-reference',
     });
-    containerEl.scrollTop = this.settingsScrollTop;
-  }
-
-  private renderBaseQueryGuide(containerEl: HTMLElement): void {
-    const section = createCollapsibleSection(
-      containerEl,
-      'Base query guide',
-      'How TPS Kanban interprets ordinary Obsidian Base filters for visibility, task cards, and task creation defaults.',
-      false,
-    );
+    reference.createEl('summary', {
+      text: 'Open full Base filter reference',
+      cls: 'tps-kanban-settings-base-reference-summary',
+    });
+    const section = reference.createDiv({
+      cls: 'tps-kanban-settings-base-reference-content',
+    });
 
     section.createEl('p', {
       cls: 'setting-item-description',
-      text: 'Kanban reads the saved Base filter tree and applies it separately to note cards and checkbox task cards. Use explicit prefixes when a filter should target only one side.',
+      text: 'Use explicit prefixes when a filter should target only notes or only checkbox task lines.',
     });
 
     const defaults = section.createEl('ul');
