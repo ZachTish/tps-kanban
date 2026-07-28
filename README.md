@@ -1,5 +1,12 @@
 # TPS Kanban
 
+## 0.1.1
+
+- Each board render now builds synthesized task-lane rows once instead of repeating the same source-note or full-vault task traversal after empty lane groups are inserted.
+- Empty task-only lanes, manual lane order, task identity/order, note-card grouping, settings, and persisted board state remain unchanged.
+- This backward-compatible performance release keeps the minimum supported Obsidian version at 1.10.0 and requires no migration.
+- Validation passed all 62 declared checks, the separate final build, isolated runtime deployment, Obsidian 1.12.7 reload, and loaded-plugin verification; exact evidence and hashes are in `release-notes/0.1.1.md`.
+
 ## 0.1.0
 
 - Settings now use five clean destinations for rules/creation, cards, appearance, lanes/layout, and advanced diagnostics.
@@ -224,6 +231,7 @@ Run `npm run test:settings` for the focused settings source contract. It checks 
 
 ## Version notes
 
+- 0.1.1: Removed the duplicate task-map construction from each board render while preserving synthetic task lanes and every existing board/task behavior.
 - 0.1.0: Reorganized settings into five shallow accessible destinations, added a compact Base-rules guide, per-route scroll/focus restoration, and mobile navigation while preserving every global/per-view setting and compatibility path.
 - 0.0.2: Preserved explicit empty style rules and all supported frontmatter color targets while making settings writes merge local intent into the newest synchronized data.
 

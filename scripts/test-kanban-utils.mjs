@@ -867,6 +867,93 @@ test('mixed or task filters do not force the whole board task-only', () => {
   assert.match(viewSource, /taskFilter\.mode !== 'tasks'[\s\S]*!taskFilter\.hasTaskDirective[\s\S]*!explicitTaskSourcePaths\.has\(file\.path\)[\s\S]*!visibleNotePaths\.has\(file\.path\)/);
 });
 
+test('task lane synthesis reuses one full-vault task build without changing task results', async () => {
+  const renderAsyncStart = viewSource.indexOf('  private async renderAsync(');
+  const renderAsyncEnd = viewSource.lastIndexOf('\n}');
+  assert.ok(renderAsyncStart >= 0 && renderAsyncEnd > renderAsyncStart);
+  const renderAsyncSource = viewSource.slice(renderAsyncStart, renderAsyncEnd);
+  assert.equal(
+    (renderAsyncSource.match(/this\.buildTaskRenderItemsByLane\(/g) || []).length,
+    1,
+    'each render should perform one full-vault task build',
+  );
+  assert.match(
+    renderAsyncSource,
+    /const taskRenderItemsByLane = this\.buildTaskRenderItemsByLane\([\s\S]*groups = this\.ensureGroupsForTaskLanes\(groups, taskRenderItemsByLane\);[\s\S]*parentByChild = this\.buildParentByChild\(groups\);[\s\S]*laneRenderItemsByLane = [\s\S]*this\.buildLaneRenderItemsByLane\(groups, parentByChild\);/,
+  );
+
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const todoFile = { path: 'Inbox/Todo.md' };
+  const doingFile = { path: 'Projects/Doing.md' };
+  const todoTask = { text: 'First task', laneIds: ['key:todo'] };
+  const doingTask = { text: 'Second task', laneIds: ['key:doing', 'key:done'] };
+  let fullVaultVisits = 0;
+
+  view.app = {
+    vault: {
+      getMarkdownFiles: () => {
+        fullVaultVisits += 1;
+        return [todoFile, doingFile];
+      },
+    },
+  };
+  view.isBaseFileFilterReady = () => true;
+  view.getActiveBasesSearchQuery = () => '';
+  view.getExplicitTaskSourceFiles = () => [];
+  view.shouldScanVaultForTaskFilters = () => true;
+  view.getAllLineItemsForFile = (file) => file.path === todoFile.path ? [todoTask] : [doingTask];
+  view.taskMatchesRootFilter = () => true;
+  view.taskMatchesSearchQuery = () => true;
+  view.getTaskLaneIds = (task) => task.laneIds;
+  view.getLaneId = (group) => group.key == null ? 'ungrouped' : `key:${String(group.key).toLowerCase()}`;
+  view.applyManualLaneOrder = (groups) => groups;
+
+  const groups = [{
+    key: 'todo',
+    entries: [{ file: todoFile }],
+    hasKey: () => true,
+  }];
+  const taskFilter = {
+    mode: 'tasks',
+    hasTaskDirective: true,
+    includeDone: true,
+    statuses: new Set(),
+    excludeStatuses: new Set(),
+    tags: new Set(),
+    excludeTags: new Set(),
+  };
+  const beforeSynthesis = view.buildTaskRenderItemsByLane(
+    groups,
+    'status',
+    new Set([todoFile.path]),
+    taskFilter,
+  );
+  const groupsWithTaskLanes = view.ensureGroupsForTaskLanes(groups, beforeSynthesis);
+  assert.deepEqual(
+    groupsWithTaskLanes.map((group) => [view.getLaneId(group), group.entries.length]),
+    [['key:todo', 1], ['key:doing', 0], ['key:done', 0]],
+  );
+
+  const afterSynthesisOracle = view.buildTaskRenderItemsByLane(
+    groupsWithTaskLanes,
+    'status',
+    new Set([todoFile.path]),
+    taskFilter,
+  );
+  assert.equal(fullVaultVisits, 2);
+  assert.deepEqual(Array.from(afterSynthesisOracle.keys()), Array.from(beforeSynthesis.keys()));
+  for (const [laneId, items] of beforeSynthesis) {
+    const oracleItems = afterSynthesisOracle.get(laneId) || [];
+    assert.equal(oracleItems.length, items.length, `${laneId} task count should be unchanged`);
+    assert.deepEqual(
+      oracleItems.map((item) => item.task),
+      items.map((item) => item.task),
+      `${laneId} task identities and order should be unchanged`,
+    );
+  }
+});
+
 test('status kanban renders tasks as lane items and keeps done tasks addressable', () => {
   assert.match(viewSource, /type TaskRenderItem/);
   assert.match(viewSource, /private allTasksByPath = new Map<string, OpenTaskSubitem\[\]>\(\)/);

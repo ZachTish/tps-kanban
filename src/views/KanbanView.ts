@@ -7607,7 +7607,7 @@ export class KanbanView extends BasesView {
     let laneRenderItemsByLane = !this.shouldRenderNoteEntriesForGroups(groups, taskFilter)
       ? new Map<string, LaneRenderItem[]>()
       : this.buildLaneRenderItemsByLane(groups, parentByChild);
-    let taskRenderItemsByLane = this.buildTaskRenderItemsByLane(
+    const taskRenderItemsByLane = this.buildTaskRenderItemsByLane(
       groups,
       propName,
       this.getVisibleNotePaths(groups),
@@ -7618,12 +7618,6 @@ export class KanbanView extends BasesView {
     laneRenderItemsByLane = !this.shouldRenderNoteEntriesForGroups(groups, taskFilter)
       ? new Map<string, LaneRenderItem[]>()
       : this.buildLaneRenderItemsByLane(groups, parentByChild);
-    taskRenderItemsByLane = this.buildTaskRenderItemsByLane(
-      groups,
-      propName,
-      this.getVisibleNotePaths(groups),
-      taskFilter,
-    );
     const displayLanes = this.buildDisplayLaneGroups(groups);
     const renderItemsByDisplayLane = new Map<string, LaneRenderItem[]>();
     const taskItemsByDisplayLane = new Map<string, TaskRenderItem[]>();
