@@ -1,5 +1,11 @@
 # TPS Kanban
 
+## 0.1.2
+
+- Board rendering now waits until task-only synthetic lanes are known before building note parent relationships and lane trees, removing an earlier pair of indexes that was always discarded.
+- Task, parent, and note-lane indexes are each built once while lane order, nesting, task identity, card output, settings, and persisted board state remain unchanged.
+- This backward-compatible performance patch keeps the minimum supported Obsidian version at 1.10.0 and requires no migration.
+
 ## 0.1.1
 
 - Each board render now builds synthesized task-lane rows once instead of repeating the same source-note or full-vault task traversal after empty lane groups are inserted.
@@ -26,6 +32,7 @@ Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtish
 
 - 2026-07-16 isolation validation: all 51 declared tests and the required final `npm run build` passed with `[runtime-deploy] target=test ... unchanged`. Obsidian 1.12.7 loaded the plugin in the registered test vault, where the synthetic Kanban view rendered `todo` and `working` lanes with their expected task cards. No live promotion occurred, and production runtime checksums remained unchanged.
 - 2026-07-24 settings-release validation: all 61 declared contract, filter-composition, utility, and routed-settings tests passed, and source/shipped CSS remained byte-identical. The required final standalone build deployed only to `[runtime-deploy] target=test`. Obsidian 1.12.7 was reloaded with `Reload app without saving`; all five settings destinations, the compact Base guide, and its single full-reference disclosure were inspected in the registered test vault without changing a default or invoking a reset. Runtime-owned state remained absent and production was not accessed or promoted.
+- 2026-07-28 render-efficiency validation: all 62 declared tests passed, including call-count and former-result equivalence coverage for the final parent, task, and note-lane indexes. The required standalone build deployed only to `[runtime-deploy] target=test`. After **Reload app without saving**, Obsidian 1.12.7 rendered the synthetic `Plugin QA.base` Kanban board with the expected `todo` and `working` cards and an empty ungrouped lane. No task, note, setting, or runtime state was changed; production was not accessed or promoted.
 
 ## Mobile modal contract
 
@@ -231,6 +238,7 @@ Run `npm run test:settings` for the focused settings source contract. It checks 
 
 ## Version notes
 
+- 0.1.2: Removed a discarded pre-synthesis parent index and note-lane tree from each board render, leaving one final build of every render index.
 - 0.1.1: Removed the duplicate task-map construction from each board render while preserving synthetic task lanes and every existing board/task behavior.
 - 0.1.0: Reorganized settings into five shallow accessible destinations, added a compact Base-rules guide, per-route scroll/focus restoration, and mobile navigation while preserving every global/per-view setting and compatibility path.
 - 0.0.2: Preserved explicit empty style rules and all supported frontmatter color targets while making settings writes merge local intent into the newest synchronized data.

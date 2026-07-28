@@ -7603,10 +7603,6 @@ export class KanbanView extends BasesView {
     }
     let groups = this.applyManualLaneOrder(mergedGroups);
     const taskFilter = this.getTaskRootFilterFromBaseFilters();
-    let parentByChild = this.buildParentByChild(groups);
-    let laneRenderItemsByLane = !this.shouldRenderNoteEntriesForGroups(groups, taskFilter)
-      ? new Map<string, LaneRenderItem[]>()
-      : this.buildLaneRenderItemsByLane(groups, parentByChild);
     const taskRenderItemsByLane = this.buildTaskRenderItemsByLane(
       groups,
       propName,
@@ -7614,8 +7610,8 @@ export class KanbanView extends BasesView {
       taskFilter,
     );
     groups = this.ensureGroupsForTaskLanes(groups, taskRenderItemsByLane);
-    parentByChild = this.buildParentByChild(groups);
-    laneRenderItemsByLane = !this.shouldRenderNoteEntriesForGroups(groups, taskFilter)
+    const parentByChild = this.buildParentByChild(groups);
+    const laneRenderItemsByLane = !this.shouldRenderNoteEntriesForGroups(groups, taskFilter)
       ? new Map<string, LaneRenderItem[]>()
       : this.buildLaneRenderItemsByLane(groups, parentByChild);
     const displayLanes = this.buildDisplayLaneGroups(groups);

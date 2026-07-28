@@ -867,7 +867,7 @@ test('mixed or task filters do not force the whole board task-only', () => {
   assert.match(viewSource, /taskFilter\.mode !== 'tasks'[\s\S]*!taskFilter\.hasTaskDirective[\s\S]*!explicitTaskSourcePaths\.has\(file\.path\)[\s\S]*!visibleNotePaths\.has\(file\.path\)/);
 });
 
-test('task lane synthesis reuses one full-vault task build without changing task results', async () => {
+test('task lane synthesis builds each render index once without changing final results', async () => {
   const renderAsyncStart = viewSource.indexOf('  private async renderAsync(');
   const renderAsyncEnd = viewSource.lastIndexOf('\n}');
   assert.ok(renderAsyncStart >= 0 && renderAsyncEnd > renderAsyncStart);
@@ -877,9 +877,19 @@ test('task lane synthesis reuses one full-vault task build without changing task
     1,
     'each render should perform one full-vault task build',
   );
+  assert.equal(
+    (renderAsyncSource.match(/this\.buildParentByChild\(/g) || []).length,
+    1,
+    'each render should build the child-to-parent index once',
+  );
+  assert.equal(
+    (renderAsyncSource.match(/this\.buildLaneRenderItemsByLane\(/g) || []).length,
+    1,
+    'each render should build note lane items once',
+  );
   assert.match(
     renderAsyncSource,
-    /const taskRenderItemsByLane = this\.buildTaskRenderItemsByLane\([\s\S]*groups = this\.ensureGroupsForTaskLanes\(groups, taskRenderItemsByLane\);[\s\S]*parentByChild = this\.buildParentByChild\(groups\);[\s\S]*laneRenderItemsByLane = [\s\S]*this\.buildLaneRenderItemsByLane\(groups, parentByChild\);/,
+    /const taskRenderItemsByLane = this\.buildTaskRenderItemsByLane\([\s\S]*groups = this\.ensureGroupsForTaskLanes\(groups, taskRenderItemsByLane\);[\s\S]*const parentByChild = this\.buildParentByChild\(groups\);[\s\S]*const laneRenderItemsByLane = [\s\S]*this\.buildLaneRenderItemsByLane\(groups, parentByChild\);/,
   );
 
   const { KanbanView } = await importKanbanView();
@@ -952,6 +962,65 @@ test('task lane synthesis reuses one full-vault task build without changing task
       `${laneId} task identities and order should be unchanged`,
     );
   }
+
+  const parentFile = { path: 'Projects/Parent.md' };
+  const childFile = { path: 'Projects/Child.md' };
+  const parentEntry = { file: parentFile };
+  const childEntry = { file: childFile };
+  const noteGroups = [{
+    key: 'todo',
+    entries: [parentEntry, childEntry],
+    hasKey: () => true,
+  }];
+  const createIndexView = () => {
+    const indexView = Object.create(KanbanView.prototype);
+    indexView.app = {
+      metadataCache: {
+        getFileCache: () => ({ frontmatter: {} }),
+      },
+    };
+    indexView.expandedSubtreePaths = new Set([parentFile.path]);
+    indexView.getLaneId = (group) => group.key == null
+      ? 'ungrouped'
+      : `key:${String(group.key).toLowerCase()}`;
+    indexView.applyManualLaneOrder = (nextGroups) => nextGroups;
+    indexView.resolveParentPath = (file) => file.path === childFile.path ? parentFile.path : null;
+    indexView.getChildLinkKeys = () => [];
+    return indexView;
+  };
+
+  const legacyView = createIndexView();
+  let legacyGroups = noteGroups;
+  const discardedParentByChild = legacyView.buildParentByChild(legacyGroups);
+  legacyView.buildLaneRenderItemsByLane(
+    legacyGroups,
+    discardedParentByChild,
+  );
+  legacyGroups = legacyView.ensureGroupsForTaskLanes(legacyGroups, beforeSynthesis);
+  const legacyParentByChild = legacyView.buildParentByChild(legacyGroups);
+  const legacyLaneItems = legacyView.buildLaneRenderItemsByLane(legacyGroups, legacyParentByChild);
+
+  const optimizedView = createIndexView();
+  const optimizedGroups = optimizedView.ensureGroupsForTaskLanes(noteGroups, beforeSynthesis);
+  const optimizedParentByChild = optimizedView.buildParentByChild(optimizedGroups);
+  const optimizedLaneItems = optimizedView.buildLaneRenderItemsByLane(
+    optimizedGroups,
+    optimizedParentByChild,
+  );
+
+  assert.deepEqual(
+    optimizedGroups.map((group) => [optimizedView.getLaneId(group), group.entries.length]),
+    legacyGroups.map((group) => [legacyView.getLaneId(group), group.entries.length]),
+  );
+  assert.deepEqual(optimizedParentByChild, legacyParentByChild);
+  assert.deepEqual(optimizedLaneItems, legacyLaneItems);
+  const optimizedTodoItems = optimizedLaneItems.get('key:todo') || [];
+  assert.equal(optimizedTodoItems[0]?.entry, parentEntry);
+  assert.equal(optimizedTodoItems[0]?.children[0]?.entry, childEntry);
+  assert.deepEqual(
+    Array.from(optimizedLaneItems, ([laneId, items]) => [laneId, items.length]),
+    [['key:todo', 1], ['key:doing', 0], ['key:done', 0]],
+  );
 });
 
 test('status kanban renders tasks as lane items and keeps done tasks addressable', () => {
