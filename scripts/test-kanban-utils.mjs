@@ -257,6 +257,103 @@ test('loaded Obsidian stylesheet matches source stylesheet', () => {
   assert.equal(loadedStylesSource, stylesSource);
 });
 
+test('GCM-sensitive frontmatter writes use the supported service exactly once with native standalone fallback', async () => {
+  const { KanbanView } = await importKanbanView();
+  const file = { path: 'Inbox/Card.md' };
+  const mutator = (frontmatter) => {
+    frontmatter.status = 'working';
+  };
+
+  let gcmCalls = 0;
+  let nativeCalls = 0;
+  const gcmView = Object.create(KanbanView.prototype);
+  gcmView.getGcmServices = () => ({
+    frontmatter: {
+      async process(receivedFile, receivedMutator) {
+        gcmCalls += 1;
+        assert.equal(receivedFile, file);
+        const frontmatter = {};
+        await receivedMutator(frontmatter);
+        assert.deepEqual(frontmatter, { status: 'working' });
+        return true;
+      },
+    },
+  });
+  gcmView.app = {
+    fileManager: {
+      async processFrontMatter() {
+        nativeCalls += 1;
+      },
+    },
+  };
+
+  assert.equal(await gcmView.processFrontmatter(file, mutator), true);
+  assert.equal(gcmCalls, 1);
+  assert.equal(nativeCalls, 0);
+
+  const nativeView = Object.create(KanbanView.prototype);
+  nativeView.getGcmServices = () => null;
+  nativeView.app = {
+    fileManager: {
+      async processFrontMatter(receivedFile, receivedMutator) {
+        nativeCalls += 1;
+        assert.equal(receivedFile, file);
+        const frontmatter = {};
+        await receivedMutator(frontmatter);
+        assert.deepEqual(frontmatter, { status: 'working' });
+      },
+    },
+  };
+
+  assert.equal(await nativeView.processFrontmatter(file, mutator), undefined);
+  assert.equal(gcmCalls, 1);
+  assert.equal(nativeCalls, 1);
+});
+
+test('GCM frontmatter false and errors propagate without a native retry', async () => {
+  const { KanbanView } = await importKanbanView();
+  const file = { path: 'Inbox/Card.md' };
+  let nativeCalls = 0;
+  const view = Object.create(KanbanView.prototype);
+  view.app = {
+    fileManager: {
+      async processFrontMatter() {
+        nativeCalls += 1;
+      },
+    },
+  };
+
+  view.getGcmServices = () => ({
+    frontmatter: {
+      async process() {
+        return false;
+      },
+    },
+  });
+  assert.equal(await view.processFrontmatter(file, () => {}), false);
+  assert.equal(nativeCalls, 0);
+
+  const expectedError = new Error('GCM write failed');
+  view.getGcmServices = () => ({
+    frontmatter: {
+      async process() {
+        throw expectedError;
+      },
+    },
+  });
+  await assert.rejects(view.processFrontmatter(file, () => {}), (error) => error === expectedError);
+  assert.equal(nativeCalls, 0);
+});
+
+test('tag-lane and card-nesting writes share the GCM-first frontmatter route', () => {
+  const routedWriteCount = viewSource.match(/await this\.processFrontmatter\(/g)?.length ?? 0;
+  assert.equal(routedWriteCount, 3);
+  assert.match(viewSource, /private async applyFrontmatterTags[\s\S]*?await this\.processFrontmatter\(file,/);
+  assert.match(viewSource, /Already a child of this card[\s\S]*?await this\.processFrontmatter\(draggedFile,/);
+  assert.match(viewSource, /Set as subitem of this card[\s\S]*?await this\.processFrontmatter\(draggedFile,/);
+  assert.match(viewSource, /private async applyFrontmatterProperty[\s\S]*?await this\.app\.fileManager\.processFrontMatter\(file,/);
+});
+
 test('normal card clicks open/focus unless GCM forces Base previews', () => {
   const methodMatch = viewSource.match(/private shouldPreviewCardClicks\(\): boolean \{([\s\S]*?)\n  \}/);
   assert.ok(methodMatch, 'shouldPreviewCardClicks method should exist');

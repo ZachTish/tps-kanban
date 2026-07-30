@@ -1,5 +1,12 @@
 # TPS Kanban
 
+## 0.1.4
+
+- Tag-lane moves and card-nesting parent-link changes now call TPS Global Context Menu's supported `services.frontmatter.process` API explicitly when that service is available.
+- Native Obsidian frontmatter processing remains the standalone path when GCM is absent. A GCM refusal or error is propagated without retrying the mutation natively, so one user action can never write twice or bypass GCM validation.
+- Status moves, generic property moves, tag merging, case-insensitive parent removal, parent link formatting, refresh events, settings, commands, and persisted data remain unchanged.
+- This backward-compatible reliability patch keeps the minimum supported Obsidian version at 1.10.0 and requires no migration. Validation covers 73 declared checks plus a separate final production-mode build and test-vault reload; exact evidence and artifact hashes are in `release-notes/0.1.4.md`.
+
 ## 0.1.3
 
 - Task and bullet previews now use file-identity ownership for every asynchronous vault read. A result may update the board only while it still owns the captured path and that path still resolves to the same Obsidian file.
@@ -246,6 +253,7 @@ Run `npm run test:settings` for the focused settings source contract. It checks 
 
 ## Version notes
 
+- 0.1.4: Routed tag-lane and card-nesting frontmatter mutations through GCM's supported service when available, with an exactly-once native standalone fallback.
 - 0.1.3: Made task/bullet preview reads single-flight and identity-owned so stale async completions cannot overwrite modified, renamed, replaced, deleted, or unloaded board state.
 - 0.1.2: Removed a discarded pre-synthesis parent index and note-lane tree from each board render, leaving one final build of every render index.
 - 0.1.1: Removed the duplicate task-map construction from each board render while preserving synthetic task lanes and every existing board/task behavior.

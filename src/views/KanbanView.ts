@@ -670,6 +670,17 @@ export class KanbanView extends BasesView {
     return gcm?.services || gcm?.sharedServices || null;
   }
 
+  private processFrontmatter(
+    file: TFile,
+    mutator: (frontmatter: Record<string, unknown>) => void | Promise<void>,
+  ): Promise<boolean | void> {
+    const frontmatterService = this.getGcmServices()?.frontmatter;
+    if (typeof frontmatterService?.process === 'function') {
+      return frontmatterService.process(file, mutator);
+    }
+    return this.app.fileManager.processFrontMatter(file, mutator);
+  }
+
   private openTaskLineContextMenu(evt: MouseEvent, fallbackPath?: string | null, fallbackLine?: number | null): boolean {
     const plugin = this.getGcmPlugin();
     const contextTargetService = plugin?.contextTargetService || this.getGcmApi()?.contextTargetService;
@@ -4013,7 +4024,7 @@ export class KanbanView extends BasesView {
       .map((sourceValue) => this.normalizeWritableTaskTag(sourceValue))
       .filter((sourceTag) => sourceTag && sourceTag.toLowerCase() !== targetTag.toLowerCase());
 
-    await this.app.fileManager.processFrontMatter(file, (fm) => {
+    await this.processFrontmatter(file, (fm) => {
       const actualKey = this.findFrontmatterKeyCaseInsensitive(fm, propName) ?? propName;
       const currentTags = this.normalizeFrontmatterTags(fm[actualKey]);
       const nextTags = currentTags.filter((tag) => !sourceTags.some((sourceTag) => sourceTag.toLowerCase() === tag.toLowerCase()));
@@ -6775,7 +6786,7 @@ export class KanbanView extends BasesView {
 
       if (existingParentPath === entry.file.path) {
         // Already a child of this card — toggle off (remove parent link)
-        await this.app.fileManager.processFrontMatter(draggedFile, (fm) => {
+        await this.processFrontmatter(draggedFile, (fm) => {
           const actualKey = this.findFrontmatterKeyCaseInsensitive(fm, parentKey);
           if (actualKey) delete fm[actualKey];
         });
@@ -6784,7 +6795,7 @@ export class KanbanView extends BasesView {
         const linktext = this.app.metadataCache.fileToLinktext(entry.file, draggedFile.path, true);
         const linkValue = `[[${linktext}]]`;
         // Set as subitem of this card
-        await this.app.fileManager.processFrontMatter(draggedFile, (fm) => {
+        await this.processFrontmatter(draggedFile, (fm) => {
           fm[parentKey] = linkValue;
         });
         await this.ensureParentSelfLink(entry.file);
