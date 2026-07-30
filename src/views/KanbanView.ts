@@ -112,6 +112,15 @@ type OpenTaskSubitem = {
   inlineFields?: Array<{ key: string; value: string }>;
 };
 
+type TaskReadKind = 'tasks' | 'bullets';
+
+type TaskReadOwner = {
+  key: string;
+  kind: TaskReadKind;
+  path: string;
+  file: TFile;
+};
+
 type TaskDropPayload = {
   itemKind?: 'task' | 'bullet';
   path?: string;
@@ -467,13 +476,14 @@ export class KanbanView extends BasesView {
   private openTasksByPath = new Map<string, OpenTaskSubitem[]>();
   private allTasksByPath = new Map<string, OpenTaskSubitem[]>();
   private openTaskOverflowByPath = new Map<string, number>();
-  private openTasksLoading = new Set<string>();
+  private taskReadsInFlight = new Map<string, TaskReadOwner>();
   private baseFileFilterCache: { path: string; mtime: number; viewName: string; viewNames: string[]; filters: unknown[] | null } | null = null;
   private baseFileFiltersLoadingKey: string | null = null;
   private embeddedBaseFilterCache: { path: string; mtime: number; viewName: string; filters: unknown[] | null } | null = null;
   private embeddedBaseFiltersLoadingKey: string | null = null;
   private baseFilterSignature = '';
   private baseFilterPollInterval: ReturnType<typeof window.setInterval> | null = null;
+  private isViewLoaded = false;
   private renderGeneration = 0;
   private wheelHandlerTarget: HTMLElement | null = null;
   private onWheelBound: ((event: WheelEvent) => void) | null = null;
@@ -1154,6 +1164,7 @@ export class KanbanView extends BasesView {
   }
 
   onload(): void {
+    this.isViewLoaded = true;
     this.ensureContainer();
     this.activeNotePath = this.getActiveMarkdownPath();
 
@@ -1183,16 +1194,38 @@ export class KanbanView extends BasesView {
 
     this.registerEvent(this.app.vault.on('create', (file) => {
       if (!(file instanceof TFile)) return;
+      this.clearTaskCachesForPath(file.path);
       this.refreshDebounced();
       this.queuePostCreateRefresh();
     }));
 
     // Keep board stable through file lifecycle changes while this view is open.
-    this.registerEvent(this.app.vault.on('rename', () => this.refreshDebounced()));
-    this.registerEvent(this.app.vault.on('delete', (file) => {
-      if (!(file instanceof TFile)) return;
-      if (!this.isVisibleFile(file.path)) return;
+    this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+      if (file instanceof TFile) {
+        this.clearTaskCachesForPath(oldPath);
+        this.clearTaskCachesForPath(file.path);
+      } else {
+        this.clearAllTaskCaches();
+      }
       this.refreshDebounced();
+    }));
+    this.registerEvent(this.app.vault.on('delete', (file) => {
+      if (!(file instanceof TFile)) {
+        this.clearAllTaskCaches();
+        this.refreshDebounced();
+        return;
+      }
+      const path = file.path;
+      this.clearTaskCachesForPath(path);
+      const taskFilter = this.getTaskRootFilterFromBaseFilters();
+      if (
+        taskFilter.mode === 'tasks'
+        || taskFilter.mode === 'bullets'
+        || taskFilter.hasTaskDirective
+        || this.isVisibleFile(path)
+      ) {
+        this.refreshDebounced();
+      }
     }));
 
     this.registerEvent(this.app.workspace.on('file-open', (file) => {
@@ -1256,6 +1289,8 @@ export class KanbanView extends BasesView {
   }
 
   onunload(): void {
+    this.isViewLoaded = false;
+    this.clearAllTaskCaches();
     this.detachWheelHandler();
     this.detachTouchHandlers();
     this.setMobileKeyboardHidden(false);
@@ -1361,6 +1396,7 @@ export class KanbanView extends BasesView {
   }
 
   private ensureContainer(): void {
+    if (!this.isViewLoaded) return;
     if (this.containerEl && this.containerEl.parentElement === this.scrollEl) return;
     this.containerEl = this.scrollEl.createDiv({ cls: 'tps-kanban-container' });
     this.applyLayoutSettings();
@@ -1839,23 +1875,70 @@ export class KanbanView extends BasesView {
     this.allTasksByPath.delete(path);
     this.allTasksByPath.delete(`${path}:bullets`);
     this.openTaskOverflowByPath.delete(path);
+    for (const [key, owner] of this.taskReadsInFlight) {
+      if (owner.path === path) this.taskReadsInFlight.delete(key);
+    }
+  }
+
+  private clearAllTaskCaches(): void {
+    this.openTasksByPath.clear();
+    this.allTasksByPath.clear();
+    this.openTaskOverflowByPath.clear();
+    this.taskReadsInFlight.clear();
+  }
+
+  private getTaskReadKey(kind: TaskReadKind, path: string): string {
+    return `${kind}:${path}`;
+  }
+
+  private claimTaskRead(kind: TaskReadKind, file: TFile, path: string): TaskReadOwner | null {
+    if (!this.isViewLoaded) return null;
+    const key = this.getTaskReadKey(kind, path);
+    const existing = this.taskReadsInFlight.get(key);
+    if (existing?.file === file && existing.path === path) return null;
+    const owner = { key, kind, path, file };
+    this.taskReadsInFlight.set(key, owner);
+    return owner;
+  }
+
+  private ownsTaskRead(owner: TaskReadOwner): boolean {
+    return (
+      this.taskReadsInFlight.get(owner.key) === owner
+      && owner.file.path === owner.path
+      && this.app.vault.getFileByPath(owner.path) === owner.file
+    );
+  }
+
+  private releaseTaskRead(owner: TaskReadOwner): boolean {
+    if (this.taskReadsInFlight.get(owner.key) !== owner) return false;
+    this.taskReadsInFlight.delete(owner.key);
+    return true;
+  }
+
+  private hasTaskReadsInFlight(kind: TaskReadKind): boolean {
+    for (const owner of this.taskReadsInFlight.values()) {
+      if (owner.kind === kind) return true;
+    }
+    return false;
   }
 
   private loadOpenTasksForFile(file: TFile): void {
-    if (this.openTasksLoading.has(file.path)) return;
+    const path = file.path;
+    const owner = this.claimTaskRead('tasks', file, path);
+    if (!owner) return;
     const generation = this.renderGeneration;
-    this.openTasksLoading.add(file.path);
     void this.app.vault.cachedRead(file)
       .then((content) => {
+        if (!this.ownsTaskRead(owner)) return;
         const taskFilter = this.getTaskRootFilterFromBaseFilters();
-        if (generation !== this.renderGeneration && !this.isVisibleFile(file.path) && !this.isTaskSourceFile(file, taskFilter)) return;
+        if (generation !== this.renderGeneration && !this.isVisibleFile(path) && !this.isTaskSourceFile(file, taskFilter)) return;
         const contentApi = this.getGcmServices()?.cardContent || this.getGcmApi()?.cardContent;
         const limit = this.getOpenTaskPreviewLimit();
-        const fallback = this.parseOpenTasks(content, file.path, limit);
+        const fallback = this.parseOpenTasks(content, path, limit);
         const parsed = typeof contentApi?.extractOpenTasksFromMarkdown === 'function'
-          ? contentApi.extractOpenTasksFromMarkdown(file.path, content, { openTaskLimit: limit })
+          ? contentApi.extractOpenTasksFromMarkdown(path, content, { openTaskLimit: limit })
           : fallback;
-        const allTasks = this.parseOpenTasks(content, file.path, Number.MAX_SAFE_INTEGER, true).openTasks;
+        const allTasks = this.parseOpenTasks(content, path, Number.MAX_SAFE_INTEGER, true).openTasks;
         const gcmTasksByLine = new Map<number, OpenTaskSubitem>(
           (Array.isArray(parsed?.openTasks) ? parsed.openTasks : [])
             .filter((task: OpenTaskSubitem) => Number.isFinite(Number(task.line)))
@@ -1888,20 +1971,21 @@ export class KanbanView extends BasesView {
           };
         });
         const overflowCount = Number(parsed?.overflowCount ?? fallback.overflowCount);
-        this.openTasksByPath.set(file.path, openTasks);
-        this.allTasksByPath.set(file.path, enrichedAllTasks);
-        this.openTaskOverflowByPath.set(file.path, Number.isFinite(overflowCount) ? Math.max(0, overflowCount) : fallback.overflowCount);
+        if (!this.ownsTaskRead(owner)) return;
+        this.openTasksByPath.set(path, openTasks);
+        this.allTasksByPath.set(path, enrichedAllTasks);
+        this.openTaskOverflowByPath.set(path, Number.isFinite(overflowCount) ? Math.max(0, overflowCount) : fallback.overflowCount);
       })
       .catch(() => {
-        this.openTasksByPath.set(file.path, []);
-        this.allTasksByPath.set(file.path, []);
-        this.openTaskOverflowByPath.set(file.path, 0);
+        if (!this.ownsTaskRead(owner)) return;
+        this.openTasksByPath.set(path, []);
+        this.allTasksByPath.set(path, []);
+        this.openTaskOverflowByPath.set(path, 0);
       })
       .finally(() => {
-        this.openTasksLoading.delete(file.path);
         // Vault-wide task views can read hundreds of source files at once.
         // Repaint once when the batch settles instead of once per file.
-        if (this.openTasksLoading.size === 0) this.refreshDebounced();
+        if (this.releaseTaskRead(owner) && !this.hasTaskReadsInFlight('tasks')) this.refreshDebounced();
       });
   }
 
@@ -3109,15 +3193,29 @@ export class KanbanView extends BasesView {
 
   private getAllLineItemsForFile(file: TFile, filter: KanbanTaskRootFilter): OpenTaskSubitem[] {
     if (filter.mode !== 'bullets') return this.getAllTasksForFile(file);
-    const cached = this.allTasksByPath.get(`${file.path}:bullets`);
+    const path = file.path;
+    const cacheKey = `${path}:bullets`;
+    const cached = this.allTasksByPath.get(cacheKey);
     if (cached) return cached;
-    let items: OpenTaskSubitem[] = [];
-    void this.app.vault.cachedRead(file).then((content) => {
-      items = this.parseOpenTasks(content, file.path, Number.MAX_SAFE_INTEGER, true, true).openTasks;
-      this.allTasksByPath.set(`${file.path}:bullets`, items);
-      this.refreshDebounced();
-    });
-    return items;
+    const owner = this.claimTaskRead('bullets', file, path);
+    if (!owner) return [];
+    let committed = false;
+    void this.app.vault.cachedRead(file)
+      .then((content) => {
+        if (!this.ownsTaskRead(owner)) return;
+        const items = this.parseOpenTasks(content, path, Number.MAX_SAFE_INTEGER, true, true).openTasks;
+        if (!this.ownsTaskRead(owner)) return;
+        this.allTasksByPath.set(cacheKey, items);
+        committed = true;
+      })
+      .catch((error) => {
+        if (!this.ownsTaskRead(owner)) return;
+        flowError('TaskCache', 'bullet-read:failed', error, { path });
+      })
+      .finally(() => {
+        if (this.releaseTaskRead(owner) && committed) this.refreshDebounced();
+      });
+    return [];
   }
 
   private taskMatchesRootFilter(task: OpenTaskSubitem, filter: KanbanTaskRootFilter, file: TFile | null = null): boolean {
@@ -7552,6 +7650,7 @@ export class KanbanView extends BasesView {
   }
 
   private render(preserveScroll = true): void {
+    if (!this.isViewLoaded) return;
     this.renderGeneration += 1;
     if (!this.shouldRenderView()) return;
     const scrollState = preserveScroll ? this.captureRenderScrollState() : null;

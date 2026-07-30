@@ -153,6 +153,72 @@ async function importKanbanView() {
   return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
 }
 
+async function flushDeferredWork() {
+  for (let index = 0; index < 6; index += 1) {
+    await Promise.resolve();
+  }
+}
+
+function createTaskReadHarness(KanbanView) {
+  const pendingReads = [];
+  const filesByPath = new Map();
+  let refreshCount = 0;
+  const view = Object.create(KanbanView.prototype);
+  view.openTasksByPath = new Map();
+  view.allTasksByPath = new Map();
+  view.openTaskOverflowByPath = new Map();
+  view.taskReadsInFlight = new Map();
+  view.isViewLoaded = true;
+  view.renderGeneration = 0;
+  view.refreshDebounced = () => {
+    refreshCount += 1;
+  };
+  view.app = {
+    vault: {
+      cachedRead(file) {
+        const gate = deferred();
+        pendingReads.push({ file, gate });
+        return gate.promise;
+      },
+      getFileByPath(path) {
+        return filesByPath.get(path) ?? null;
+      },
+    },
+  };
+  view.getTaskRootFilterFromBaseFilters = () => ({
+    mode: 'mixed',
+    hasTaskDirective: false,
+    includeDone: false,
+    statuses: new Set(),
+    excludeStatuses: new Set(),
+    tags: new Set(),
+    excludeTags: new Set(),
+  });
+  view.isVisibleFile = () => true;
+  view.isTaskSourceFile = () => false;
+  view.getGcmServices = () => null;
+  view.getGcmApi = () => null;
+  view.getOpenTaskPreviewLimit = () => 5;
+  view.getTaskVisibleTitle = (task) => task.text;
+  view.parseOpenTasks = (content, path, _limit, _includeDone, includeBullets = false) => ({
+    openTasks: [{
+      itemKind: includeBullets ? 'bullet' : 'task',
+      line: 1,
+      checkboxState: includeBullets ? undefined : '[ ]',
+      text: String(content),
+      displayText: String(content),
+      inlineFields: [{ key: 'path', value: path }],
+    }],
+    overflowCount: 0,
+  });
+  return {
+    view,
+    pendingReads,
+    filesByPath,
+    refreshCount: () => refreshCount,
+  };
+}
+
 function getFrontmatterPropNameFromId(propId) {
   const raw = String(propId ?? '').trim();
   if (!raw) return null;
@@ -436,13 +502,201 @@ test('card task previews are bounded and use source markdown labels', () => {
   assert.match(settingsSource, /showTaskOverflowCount: true/);
   assert.match(viewSource, /cardContent/);
   assert.match(viewSource, /private getPreviewTasksForFile\(file: TFile\): \{ tasks: OpenTaskSubitem\[\]; overflowCount: number \}/);
-  assert.match(viewSource, /const fallback = this\.parseOpenTasks\(content, file\.path, limit\)/);
+  assert.match(viewSource, /const fallback = this\.parseOpenTasks\(content, path, limit\)/);
   assert.match(viewSource, /const openTasks = fallback\.openTasks\.map/);
   assert.match(viewSource, /displayText: this\.getTaskVisibleTitle\(merged\)/);
   assert.doesNotMatch(viewSource, /displayText: enriched\?\.displayText \|\| task\.displayText/);
   assert.match(viewSource, /openTaskOverflowByPath/);
   assert.match(viewSource, /\+\$\{openTaskOverflow\} more/);
   assert.match(viewSource, /openTaskLine\(entry\.file, task\.line\)/);
+});
+
+test('task preview reads reject stale owners and deduplicate bullet work', async (t) => {
+  const { KanbanView } = await importKanbanView();
+
+  await t.test('a modify can start a fresh read and the older success cannot overwrite it', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const file = { path: 'Inbox/Tasks.md' };
+    harness.filesByPath.set(file.path, file);
+
+    harness.view.loadOpenTasksForFile(file);
+    harness.view.clearTaskCachesForPath(file.path);
+    harness.view.loadOpenTasksForFile(file);
+    assert.equal(harness.pendingReads.length, 2);
+
+    harness.pendingReads[1].gate.resolve('new');
+    await flushDeferredWork();
+    assert.equal(harness.view.openTasksByPath.get(file.path)?.[0]?.text, 'new');
+
+    harness.pendingReads[0].gate.resolve('old');
+    await flushDeferredWork();
+    assert.equal(harness.view.openTasksByPath.get(file.path)?.[0]?.text, 'new');
+    assert.equal(harness.view.taskReadsInFlight.size, 0);
+    assert.equal(harness.refreshCount(), 1);
+  });
+
+  await t.test('rename and same-path replacement cannot leak owners or task caches', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const oldPath = 'Inbox/Tasks.md';
+    const newPath = 'Inbox/Renamed Tasks.md';
+    const original = { path: oldPath };
+    harness.filesByPath.set(oldPath, original);
+    harness.view.loadOpenTasksForFile(original);
+
+    original.path = newPath;
+    harness.filesByPath.delete(oldPath);
+    harness.filesByPath.set(newPath, original);
+    harness.view.clearTaskCachesForPath(oldPath);
+    harness.view.clearTaskCachesForPath(newPath);
+
+    const replacement = { path: oldPath };
+    harness.filesByPath.set(oldPath, replacement);
+    harness.view.loadOpenTasksForFile(replacement);
+    assert.equal(harness.pendingReads.length, 2);
+
+    harness.pendingReads[1].gate.resolve('replacement');
+    await flushDeferredWork();
+    harness.pendingReads[0].gate.resolve('renamed-stale');
+    await flushDeferredWork();
+
+    assert.equal(harness.view.openTasksByPath.get(oldPath)?.[0]?.text, 'replacement');
+    assert.equal(harness.view.openTasksByPath.has(newPath), false);
+    assert.equal(harness.view.taskReadsInFlight.size, 0);
+    assert.equal(harness.refreshCount(), 1);
+  });
+
+  await t.test('delete and recreate at one path never inherits a pending read', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const path = 'Inbox/Reused.md';
+    const deleted = { path };
+    harness.filesByPath.set(path, deleted);
+    harness.view.loadOpenTasksForFile(deleted);
+
+    harness.filesByPath.delete(path);
+    harness.view.clearTaskCachesForPath(path);
+    const replacement = { path };
+    harness.filesByPath.set(path, replacement);
+    harness.view.loadOpenTasksForFile(replacement);
+    assert.equal(harness.pendingReads.length, 2);
+
+    harness.pendingReads[1].gate.resolve('replacement');
+    await flushDeferredWork();
+    harness.pendingReads[0].gate.resolve('deleted-stale');
+    await flushDeferredWork();
+
+    assert.equal(harness.view.openTasksByPath.get(path)?.[0]?.text, 'replacement');
+    assert.equal(harness.view.taskReadsInFlight.size, 0);
+  });
+
+  await t.test('one hundred pending bullet requests perform one read', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const file = { path: 'Inbox/Bullets.md' };
+    harness.filesByPath.set(file.path, file);
+    const filter = { mode: 'bullets' };
+
+    for (let index = 0; index < 100; index += 1) {
+      assert.deepEqual(harness.view.getAllLineItemsForFile(file, filter), []);
+    }
+    assert.equal(harness.pendingReads.length, 1);
+
+    harness.pendingReads[0].gate.resolve('bullet');
+    await flushDeferredWork();
+    assert.equal(
+      harness.view.getAllLineItemsForFile(file, filter)[0]?.text,
+      'bullet',
+    );
+    assert.equal(harness.pendingReads.length, 1);
+    assert.equal(harness.refreshCount(), 1);
+  });
+
+  await t.test('a stale failure cannot replace a newer success with empty caches', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const file = { path: 'Inbox/Failure.md' };
+    harness.filesByPath.set(file.path, file);
+    harness.view.loadOpenTasksForFile(file);
+    harness.view.clearTaskCachesForPath(file.path);
+    harness.view.loadOpenTasksForFile(file);
+    assert.equal(harness.pendingReads.length, 2);
+
+    harness.pendingReads[1].gate.resolve('new');
+    await flushDeferredWork();
+    harness.pendingReads[0].gate.reject(new Error('stale read failed'));
+    await flushDeferredWork();
+
+    assert.equal(harness.view.openTasksByPath.get(file.path)?.[0]?.text, 'new');
+    assert.equal(harness.view.allTasksByPath.get(file.path)?.[0]?.text, 'new');
+    assert.equal(harness.refreshCount(), 1);
+  });
+
+  await t.test('normal failures stay empty while bullet failures remain retryable', async () => {
+    const taskHarness = createTaskReadHarness(KanbanView);
+    const taskFile = { path: 'Inbox/Task Failure.md' };
+    taskHarness.filesByPath.set(taskFile.path, taskFile);
+    taskHarness.view.loadOpenTasksForFile(taskFile);
+    taskHarness.pendingReads[0].gate.reject(new Error('task read failed'));
+    await flushDeferredWork();
+    assert.deepEqual(taskHarness.view.openTasksByPath.get(taskFile.path), []);
+    assert.deepEqual(taskHarness.view.allTasksByPath.get(taskFile.path), []);
+    assert.equal(taskHarness.view.openTaskOverflowByPath.get(taskFile.path), 0);
+    assert.equal(taskHarness.refreshCount(), 1);
+
+    const bulletHarness = createTaskReadHarness(KanbanView);
+    const bulletFile = { path: 'Inbox/Bullet Failure.md' };
+    bulletHarness.filesByPath.set(bulletFile.path, bulletFile);
+    const filter = { mode: 'bullets' };
+    bulletHarness.view.getAllLineItemsForFile(bulletFile, filter);
+    bulletHarness.pendingReads[0].gate.reject(new Error('bullet read failed'));
+    await flushDeferredWork();
+    assert.equal(
+      bulletHarness.view.allTasksByPath.has(`${bulletFile.path}:bullets`),
+      false,
+    );
+    assert.equal(bulletHarness.refreshCount(), 0);
+
+    bulletHarness.view.getAllLineItemsForFile(bulletFile, filter);
+    assert.equal(bulletHarness.pendingReads.length, 2);
+    bulletHarness.pendingReads[1].gate.resolve('retry');
+    await flushDeferredWork();
+    assert.equal(
+      bulletHarness.view.allTasksByPath.get(`${bulletFile.path}:bullets`)?.[0]?.text,
+      'retry',
+    );
+  });
+
+  await t.test('cache teardown blocks late commits, repaints, and replacement reads', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const first = { path: 'Folder/First.md' };
+    const second = { path: 'Folder/Second.md' };
+    harness.filesByPath.set(first.path, first);
+    harness.filesByPath.set(second.path, second);
+    harness.view.loadOpenTasksForFile(first);
+    harness.view.getAllLineItemsForFile(second, { mode: 'bullets' });
+    assert.equal(harness.pendingReads.length, 2);
+
+    harness.view.isViewLoaded = false;
+    harness.view.clearAllTaskCaches();
+    harness.pendingReads[0].gate.resolve('late-task');
+    harness.pendingReads[1].gate.resolve('late-bullet');
+    await flushDeferredWork();
+    harness.view.loadOpenTasksForFile(first);
+    harness.view.getAllLineItemsForFile(second, { mode: 'bullets' });
+
+    assert.equal(harness.view.openTasksByPath.size, 0);
+    assert.equal(harness.view.allTasksByPath.size, 0);
+    assert.equal(harness.view.openTaskOverflowByPath.size, 0);
+    assert.equal(harness.view.taskReadsInFlight.size, 0);
+    assert.equal(harness.pendingReads.length, 2);
+    assert.equal(harness.refreshCount(), 0);
+  });
+
+  assert.match(viewSource, /onload\(\): void \{\s*this\.isViewLoaded = true/);
+  assert.match(viewSource, /onunload\(\): void \{\s*this\.isViewLoaded = false;\s*this\.clearAllTaskCaches\(\)/);
+  assert.match(viewSource, /private render\(preserveScroll = true\): void \{\s*if \(!this\.isViewLoaded\) return/);
+  assert.match(viewSource, /vault\.on\('create', \(file\) => \{\s*if \(!\(file instanceof TFile\)\) return/);
+  assert.match(viewSource, /vault\.on\('rename', \(file, oldPath\) =>/);
+  assert.match(viewSource, /this\.clearTaskCachesForPath\(oldPath\)/);
+  assert.match(viewSource, /this\.clearTaskCachesForPath\(file\.path\)/);
+  assert.match(viewSource, /this\.clearAllTaskCaches\(\)/);
 });
 
 test('task titles hide inline metadata in kanban views', () => {
@@ -766,7 +1020,7 @@ test('hidden Bases kanban instances do not render during initial mixed-view open
   assert.match(viewSource, /if \(!this\.containerEl\?\.isConnected\) return false/);
   assert.match(viewSource, /if \(this\.containerEl\.isShown\(\)\) return true/);
   assert.match(viewSource, /activeContainer\?\.contains\(this\.containerEl\)/);
-  assert.match(viewSource, /private render\(preserveScroll = true\): void \{\s*this\.renderGeneration \+= 1;\s*if \(!this\.shouldRenderView\(\)\) return;/);
+  assert.match(viewSource, /private render\(preserveScroll = true\): void \{\s*if \(!this\.isViewLoaded\) return;\s*this\.renderGeneration \+= 1;\s*if \(!this\.shouldRenderView\(\)\) return;/);
 });
 
 test('reading-mode embedded kanban hides Bases chrome and edit controls', () => {
@@ -857,7 +1111,7 @@ test('saved base file filters are scoped to the configured Bases view name', () 
   assert.match(viewSource, /const folderComparison = expr\.match\(\/\^file\\\.folder/);
   assert.match(viewSource, /file\\\.links\?\\\.\(\?:isEmpty\|empty\)/);
   assert.doesNotMatch(viewSource, /for \(const delay of \[250, 750, 1500\]\)/);
-  assert.match(viewSource, /this\.openTasksLoading\.delete\(file\.path\);[\s\S]*?if \(this\.openTasksLoading\.size === 0\) this\.refreshDebounced\(\);/);
+  assert.match(viewSource, /this\.releaseTaskRead\(owner\)[\s\S]*!this\.hasTaskReadsInFlight\('tasks'\)[\s\S]*this\.refreshDebounced\(\)/);
   assert.doesNotMatch(viewSource, /const knownViewNames = this\.baseFileFilterCache\?\.path === file\.path/);
 });
 
@@ -1027,7 +1281,7 @@ test('status kanban renders tasks as lane items and keeps done tasks addressable
   assert.match(viewSource, /type TaskRenderItem/);
   assert.match(viewSource, /private allTasksByPath = new Map<string, OpenTaskSubitem\[\]>\(\)/);
   assert.match(viewSource, /buildTaskRenderItemsByLane\(\s*groups: BasesEntryGroup\[\],\s*propName: string \| null,/);
-  assert.match(viewSource, /this\.parseOpenTasks\(content, file\.path, Number\.MAX_SAFE_INTEGER, true\)/);
+  assert.match(viewSource, /this\.parseOpenTasks\(content, path, Number\.MAX_SAFE_INTEGER, true\)/);
   assert.match(viewSource, /getLaneIdForStatus\(this\.getStatusForCheckboxState\(task\.checkboxState/);
   assert.match(viewSource, /isStatusPropertyName\(propName\)/);
   assert.match(viewSource, /if \(this\.isStatusPropertyName\(propName\)\)/);

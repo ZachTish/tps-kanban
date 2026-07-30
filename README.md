@@ -1,5 +1,13 @@
 # TPS Kanban
 
+## 0.1.3
+
+- Task and bullet previews now use file-identity ownership for every asynchronous vault read. A result may update the board only while it still owns the captured path and that path still resolves to the same Obsidian file.
+- Modify, rename, delete/recreate, folder rename/delete, and view-unload invalidation can no longer let an older success or failure overwrite newer task state. Scheduled renders are also gated after unload.
+- Concurrent bullet-preview requests for one file are now single-flight: the regression benchmark reduces 100 pending requests from 100 vault reads to one, then reuses the cached result.
+- Parsing, filters, task ordering, overflow counts, failure semantics, settings, commands, and persisted data remain unchanged. Bullet-read failures are logged and remain retryable instead of being cached as an empty success.
+- This backward-compatible reliability/performance patch keeps the minimum supported Obsidian version at 1.10.0 and requires no migration. Validation covers 70 declared checks, a separate final production-mode build/test-vault deployment, and an Obsidian 1.12.7 task-toggle/rerender/restoration smoke test; exact evidence and artifact hashes are in `release-notes/0.1.3.md`.
+
 ## 0.1.2
 
 - Board rendering now waits until task-only synthetic lanes are known before building note parent relationships and lane trees, removing an earlier pair of indexes that was always discarded.
@@ -238,6 +246,7 @@ Run `npm run test:settings` for the focused settings source contract. It checks 
 
 ## Version notes
 
+- 0.1.3: Made task/bullet preview reads single-flight and identity-owned so stale async completions cannot overwrite modified, renamed, replaced, deleted, or unloaded board state.
 - 0.1.2: Removed a discarded pre-synthesis parent index and note-lane tree from each board render, leaving one final build of every render index.
 - 0.1.1: Removed the duplicate task-map construction from each board render while preserving synthetic task lanes and every existing board/task behavior.
 - 0.1.0: Reorganized settings into five shallow accessible destinations, added a compact Base-rules guide, per-route scroll/focus restoration, and mobile navigation while preserving every global/per-view setting and compatibility path.
