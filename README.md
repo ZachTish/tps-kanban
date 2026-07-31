@@ -1,5 +1,12 @@
 # TPS Kanban
 
+## 0.1.5
+
+- A cold task-source read now parses the Markdown once into the complete ordered task set, then derives the bounded open-task card preview from that result. The released `0.1.4` path parsed every source twice.
+- Task status mapping is evaluated only where completion filtering needs it. Preview order, hierarchy, inline fields, custom checkbox mappings, GCM enrichment and overflow authority, stale-read ownership, repaint batching, settings, commands, and persisted data remain unchanged.
+- Against exact public `0.1.4`, the 20,000-line release benchmark reduced 500 cold loads from 1,000 parser calls and 20,000,000 line visits to 500 calls and 10,000,000 visits. Median time improved from 896.2 ms to 625.4 ms per ten-load sample and p95 from 926.2 ms to 644.1 ms, with identical cache output, vault reads, and repaints.
+- This backward-compatible performance/reliability patch keeps the minimum supported Obsidian version at 1.10.0 and requires no migration. Validation covers 75 declared checks plus exact-release parity, a separate final production-mode build, and test-vault reload; exact evidence and artifact hashes are in `release-notes/0.1.5.md`.
+
 ## 0.1.4
 
 - Tag-lane moves and card-nesting parent-link changes now call TPS Global Context Menu's supported `services.frontmatter.process` API explicitly when that service is available.
@@ -48,6 +55,7 @@ Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtish
 - 2026-07-16 isolation validation: all 51 declared tests and the required final `npm run build` passed with `[runtime-deploy] target=test ... unchanged`. Obsidian 1.12.7 loaded the plugin in the registered test vault, where the synthetic Kanban view rendered `todo` and `working` lanes with their expected task cards. No live promotion occurred, and production runtime checksums remained unchanged.
 - 2026-07-24 settings-release validation: all 61 declared contract, filter-composition, utility, and routed-settings tests passed, and source/shipped CSS remained byte-identical. The required final standalone build deployed only to `[runtime-deploy] target=test`. Obsidian 1.12.7 was reloaded with `Reload app without saving`; all five settings destinations, the compact Base guide, and its single full-reference disclosure were inspected in the registered test vault without changing a default or invoking a reset. Runtime-owned state remained absent and production was not accessed or promoted.
 - 2026-07-28 render-efficiency validation: all 62 declared tests passed, including call-count and former-result equivalence coverage for the final parent, task, and note-lane indexes. The required standalone build deployed only to `[runtime-deploy] target=test`. After **Reload app without saving**, Obsidian 1.12.7 rendered the synthetic `Plugin QA.base` Kanban board with the expected `todo` and `working` cards and an empty ungrouped lane. No task, note, setting, or runtime state was changed; production was not accessed or promoted.
+- 2026-07-30 task-cache efficiency validation: exact public `0.1.4` and `0.1.5` produced identical cache output across 17 parity scenarios while cold-source parser calls and line visits fell by 50%; median and p95 timings both improved by about 30%. All 75 declared checks and the required separate build passed. After **Reload app without saving**, Obsidian 1.12.7 rendered `Plugin QA.base` with its open, working, and completed synthetic task rows. The 71-byte runtime settings file remained byte-identical, no note or setting was changed, and production was not accessed or promoted.
 
 ## Mobile modal contract
 
@@ -253,6 +261,7 @@ Run `npm run test:settings` for the focused settings source contract. It checks 
 
 ## Version notes
 
+- 0.1.5: Reused one complete Markdown task parse to derive both task-lane data and bounded card previews, halving cold-source parser passes and line visits without changing results.
 - 0.1.4: Routed tag-lane and card-nesting frontmatter mutations through GCM's supported service when available, with an exactly-once native standalone fallback.
 - 0.1.3: Made task/bullet preview reads single-flight and identity-owned so stale async completions cannot overwrite modified, renamed, replaced, deleted, or unloaded board state.
 - 0.1.2: Removed a discarded pre-synthesis parent index and note-lane tree from each board render, leaving one final build of every render index.

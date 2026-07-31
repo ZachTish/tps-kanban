@@ -1945,17 +1945,17 @@ export class KanbanView extends BasesView {
         if (generation !== this.renderGeneration && !this.isVisibleFile(path) && !this.isTaskSourceFile(file, taskFilter)) return;
         const contentApi = this.getGcmServices()?.cardContent || this.getGcmApi()?.cardContent;
         const limit = this.getOpenTaskPreviewLimit();
-        const fallback = this.parseOpenTasks(content, path, limit);
+        const allTasks = this.parseOpenTasks(content, path, Number.MAX_SAFE_INTEGER, true).openTasks;
+        const localPreview = this.selectOpenTaskPreview(allTasks, limit);
         const parsed = typeof contentApi?.extractOpenTasksFromMarkdown === 'function'
           ? contentApi.extractOpenTasksFromMarkdown(path, content, { openTaskLimit: limit })
-          : fallback;
-        const allTasks = this.parseOpenTasks(content, path, Number.MAX_SAFE_INTEGER, true).openTasks;
+          : localPreview;
         const gcmTasksByLine = new Map<number, OpenTaskSubitem>(
           (Array.isArray(parsed?.openTasks) ? parsed.openTasks : [])
             .filter((task: OpenTaskSubitem) => Number.isFinite(Number(task.line)))
             .map((task: OpenTaskSubitem) => [Number(task.line), task])
         );
-        const openTasks = fallback.openTasks.map((task: OpenTaskSubitem) => {
+        const openTasks = localPreview.openTasks.map((task: OpenTaskSubitem) => {
           const enriched = gcmTasksByLine.get(task.line);
           const merged = {
             ...task,
@@ -1981,11 +1981,11 @@ export class KanbanView extends BasesView {
             displayText: this.getTaskVisibleTitle(merged),
           };
         });
-        const overflowCount = Number(parsed?.overflowCount ?? fallback.overflowCount);
+        const overflowCount = Number(parsed?.overflowCount ?? localPreview.overflowCount);
         if (!this.ownsTaskRead(owner)) return;
         this.openTasksByPath.set(path, openTasks);
         this.allTasksByPath.set(path, enrichedAllTasks);
-        this.openTaskOverflowByPath.set(path, Number.isFinite(overflowCount) ? Math.max(0, overflowCount) : fallback.overflowCount);
+        this.openTaskOverflowByPath.set(path, Number.isFinite(overflowCount) ? Math.max(0, overflowCount) : localPreview.overflowCount);
       })
       .catch(() => {
         if (!this.ownsTaskRead(owner)) return;
@@ -2000,6 +2000,25 @@ export class KanbanView extends BasesView {
       });
   }
 
+  private selectOpenTaskPreview(
+    tasks: OpenTaskSubitem[],
+    limit = this.getOpenTaskPreviewLimit(),
+  ): { openTasks: OpenTaskSubitem[]; overflowCount: number } {
+    const doneStatuses = this.getDoneStatuses();
+    const numericLimit = Number(limit);
+    const normalizedLimit = Number.isFinite(numericLimit)
+      ? Math.max(0, Math.floor(numericLimit || 0))
+      : Number.MAX_SAFE_INTEGER;
+    const openTasks: OpenTaskSubitem[] = [];
+    let openTaskCount = 0;
+    for (const task of tasks) {
+      if (task.itemKind === 'task' && doneStatuses.has(this.getStatusForCheckboxState(task.checkboxState || '[ ]'))) continue;
+      if (openTasks.length < normalizedLimit) openTasks.push(task);
+      openTaskCount += 1;
+    }
+    return { openTasks, overflowCount: Math.max(0, openTaskCount - openTasks.length) };
+  }
+
   private parseOpenTasks(
     content: string,
     filePath = '',
@@ -2009,7 +2028,7 @@ export class KanbanView extends BasesView {
   ): { openTasks: OpenTaskSubitem[]; overflowCount: number } {
     const tasks: OpenTaskSubitem[] = [];
     const lines = content.split(/\r?\n/);
-    const doneStatuses = this.getDoneStatuses();
+    const doneStatuses = includeDone ? null : this.getDoneStatuses();
     const hierarchyStack: Array<{ line: number; indent: number }> = [];
     lines.forEach((line, index) => {
       const lineNumber = index + 1;
@@ -2026,8 +2045,10 @@ export class KanbanView extends BasesView {
       const parsed = this.parseLineItem(line, includeBullets);
       if (!parsed) return;
       const checkboxState = parsed.checkboxState;
-      const mappedStatus = parsed.itemKind === 'task' ? this.getStatusForCheckboxState(checkboxState || '[ ]') : '';
-      if (parsed.itemKind === 'task' && !includeDone && doneStatuses.has(mappedStatus)) return;
+      if (
+        parsed.itemKind === 'task'
+        && doneStatuses?.has(this.getStatusForCheckboxState(checkboxState || '[ ]'))
+      ) return;
       const text = this.cleanTaskText(parsed.text);
       if (!text) return;
       const inlineFields = this.extractTaskInlineFields(text);

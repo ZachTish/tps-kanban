@@ -163,6 +163,7 @@ function createTaskReadHarness(KanbanView) {
   const pendingReads = [];
   const filesByPath = new Map();
   let refreshCount = 0;
+  let parseCount = 0;
   const view = Object.create(KanbanView.prototype);
   view.openTasksByPath = new Map();
   view.allTasksByPath = new Map();
@@ -199,23 +200,29 @@ function createTaskReadHarness(KanbanView) {
   view.getGcmServices = () => null;
   view.getGcmApi = () => null;
   view.getOpenTaskPreviewLimit = () => 5;
+  view.getDoneStatuses = () => new Set(['complete']);
+  view.getStatusForCheckboxState = (state) => state === '[x]' ? 'complete' : 'todo';
   view.getTaskVisibleTitle = (task) => task.text;
-  view.parseOpenTasks = (content, path, _limit, _includeDone, includeBullets = false) => ({
-    openTasks: [{
-      itemKind: includeBullets ? 'bullet' : 'task',
-      line: 1,
-      checkboxState: includeBullets ? undefined : '[ ]',
-      text: String(content),
-      displayText: String(content),
-      inlineFields: [{ key: 'path', value: path }],
-    }],
-    overflowCount: 0,
-  });
+  view.parseOpenTasks = (content, path, _limit, _includeDone, includeBullets = false) => {
+    parseCount += 1;
+    return {
+      openTasks: [{
+        itemKind: includeBullets ? 'bullet' : 'task',
+        line: 1,
+        checkboxState: includeBullets ? undefined : '[ ]',
+        text: String(content),
+        displayText: String(content),
+        inlineFields: [{ key: 'path', value: path }],
+      }],
+      overflowCount: 0,
+    };
+  };
   return {
     view,
     pendingReads,
     filesByPath,
     refreshCount: () => refreshCount,
+    parseCount: () => parseCount,
   };
 }
 
@@ -599,8 +606,9 @@ test('card task previews are bounded and use source markdown labels', () => {
   assert.match(settingsSource, /showTaskOverflowCount: true/);
   assert.match(viewSource, /cardContent/);
   assert.match(viewSource, /private getPreviewTasksForFile\(file: TFile\): \{ tasks: OpenTaskSubitem\[\]; overflowCount: number \}/);
-  assert.match(viewSource, /const fallback = this\.parseOpenTasks\(content, path, limit\)/);
-  assert.match(viewSource, /const openTasks = fallback\.openTasks\.map/);
+  assert.match(viewSource, /const allTasks = this\.parseOpenTasks\(content, path, Number\.MAX_SAFE_INTEGER, true\)\.openTasks/);
+  assert.match(viewSource, /const localPreview = this\.selectOpenTaskPreview\(allTasks, limit\)/);
+  assert.match(viewSource, /const openTasks = localPreview\.openTasks\.map/);
   assert.match(viewSource, /displayText: this\.getTaskVisibleTitle\(merged\)/);
   assert.doesNotMatch(viewSource, /displayText: enriched\?\.displayText \|\| task\.displayText/);
   assert.match(viewSource, /openTaskOverflowByPath/);
@@ -608,8 +616,75 @@ test('card task previews are bounded and use source markdown labels', () => {
   assert.match(viewSource, /openTaskLine\(entry\.file, task\.line\)/);
 });
 
+test('one all-task parse derives the same bounded open previews as direct parsing', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const defaultStatusByState = {
+    '[ ]': 'todo',
+    '[x]': 'complete',
+    '[/]': 'working',
+    '[-]': 'wont-do',
+    '[?]': 'holding',
+    '[!]': 'important',
+  };
+  const content = [
+    '- [ ] Open parent #alpha [area:: Work]',
+    '  - [x] Done child',
+    '    1. [/] Working grandchild [owner:: Sam]',
+    '  - [-] Cancelled child',
+    '- [?] Holding task',
+    '- [!] Important task',
+    '- [ ] Final open task',
+  ].join('\n');
+
+  for (const scenario of [
+    { doneStatuses: ['complete', 'wont-do'], statusByState: defaultStatusByState },
+    {
+      doneStatuses: ['complete', 'wont-do', 'working', 'holding'],
+      statusByState: { ...defaultStatusByState, '[/]': 'working', '[?]': 'holding' },
+    },
+  ]) {
+    view.getDoneStatuses = () => new Set(scenario.doneStatuses);
+    view.getStatusForCheckboxState = (state) => scenario.statusByState[state] || 'todo';
+    const allTasks = view.parseOpenTasks(content, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER, true).openTasks;
+    for (const limit of [
+      Number.NEGATIVE_INFINITY,
+      -1,
+      -0.5,
+      0,
+      0.5,
+      1,
+      1.9,
+      5,
+      20,
+      Number.POSITIVE_INFINITY,
+      Number.NaN,
+    ]) {
+      assert.deepEqual(
+        view.selectOpenTaskPreview(allTasks, limit),
+        view.parseOpenTasks(content, 'Inbox/Tasks.md', limit),
+        `derived preview changed for limit ${String(limit)}`,
+      );
+    }
+  }
+});
+
 test('task preview reads reject stale owners and deduplicate bullet work', async (t) => {
   const { KanbanView } = await importKanbanView();
+
+  await t.test('one cold task read performs one parser pass', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const file = { path: 'Inbox/One Pass.md' };
+    harness.filesByPath.set(file.path, file);
+    harness.view.loadOpenTasksForFile(file);
+    harness.pendingReads[0].gate.resolve('one-pass');
+    await flushDeferredWork();
+
+    assert.equal(harness.parseCount(), 1);
+    assert.equal(harness.view.openTasksByPath.get(file.path)?.[0]?.text, 'one-pass');
+    assert.equal(harness.view.allTasksByPath.get(file.path)?.[0]?.text, 'one-pass');
+    assert.equal(harness.refreshCount(), 1);
+  });
 
   await t.test('a modify can start a fresh read and the older success cannot overwrite it', async () => {
     const harness = createTaskReadHarness(KanbanView);

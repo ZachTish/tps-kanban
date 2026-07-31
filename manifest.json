@@ -1,7 +1,7 @@
 {
   "id": "tps-kanban",
   "name": "TPS Kanban (Dev)",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "minAppVersion": "1.10.0",
   "author": "TishOS",
   "description": "Simple Kanban board with draggable lanes and cards (dev).",
