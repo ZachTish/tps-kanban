@@ -4735,8 +4735,10 @@ export class KanbanView extends BasesView {
       if (rule.active === false) continue;
       const conditions = Array.isArray(rule.conditions) ? rule.conditions : [];
       if (!conditions.length) continue;
-      const results = conditions.map((condition: KanbanStyleCondition) => this.evaluateStyleCondition(data, condition));
-      const matches = rule.match === 'any' ? results.some(Boolean) : results.every(Boolean);
+      const evaluateCondition = (condition: KanbanStyleCondition) => this.evaluateStyleCondition(data, condition);
+      const matches = rule.match === 'any'
+        ? conditions.some(evaluateCondition)
+        : conditions.every(evaluateCondition);
       if (matches) return rule;
     }
     return null;
@@ -4773,8 +4775,10 @@ export class KanbanView extends BasesView {
       if (rule.active === false) continue;
       const conditions = Array.isArray(rule.conditions) ? rule.conditions : [];
       if (!conditions.length) continue;
-      const results = conditions.map((condition: KanbanStyleCondition) => this.evaluateStyleCondition(data, condition));
-      const matches = rule.match === 'any' ? results.some(Boolean) : results.every(Boolean);
+      const evaluateCondition = (condition: KanbanStyleCondition) => this.evaluateStyleCondition(data, condition);
+      const matches = rule.match === 'any'
+        ? conditions.some(evaluateCondition)
+        : conditions.every(evaluateCondition);
       if (matches) return rule;
     }
     return null;

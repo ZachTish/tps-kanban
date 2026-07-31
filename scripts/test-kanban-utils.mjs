@@ -900,6 +900,117 @@ test('frontmatter color is card-only until explicit icon color behavior exists',
   assert.match(settingsSource, /DEFAULT_PRIORITY_CARD_STYLE_RULES/);
 });
 
+test('card style rules short-circuit condition evaluation for notes and tasks', async () => {
+  const { KanbanView } = await importKanbanView();
+  const trueCondition = { field: 'state', operator: 'is', value: 'ready' };
+  const falseCondition = { field: 'state', operator: 'is', value: 'blocked' };
+
+  const createResolver = (kind) => {
+    const view = Object.create(KanbanView.prototype);
+    view.plugin = { settings: { cardStyleRules: [] } };
+    view.app = {
+      metadataCache: {
+        getFileCache: () => ({ frontmatter: { state: 'ready', owner: 'frontmatter-owner' } }),
+      },
+    };
+    view.getStatusForCheckboxState = (state) => state === '[/]' ? 'working' : 'todo';
+    const evaluateCondition = view.evaluateStyleCondition.bind(view);
+    let conditionCalls = 0;
+    view.evaluateStyleCondition = (...args) => {
+      conditionCalls += 1;
+      return evaluateCondition(...args);
+    };
+
+    return (rules, taskOverrides = {}) => {
+      view.plugin.settings.cardStyleRules = rules;
+      conditionCalls = 0;
+      const matchedRule = kind === 'note'
+        ? view.resolveCardStyleRule({ state: 'ready' }, {}, null)
+        : view.resolveTaskCardStyleRule(
+          { path: 'Inbox/Task.md' },
+          {
+            itemKind: 'task',
+            checkboxState: '[ ]',
+            inlineFields: [],
+            ...taskOverrides,
+          },
+          null,
+        );
+      return { matchedRule, conditionCalls };
+    };
+  };
+
+  const rule = (id, match, conditions, active = true) => ({
+    id,
+    active,
+    match,
+    conditions,
+  });
+
+  for (const kind of ['note', 'task']) {
+    const resolve = createResolver(kind);
+    const cases = [
+      { id: 'any-continue-match', match: 'any', conditions: [falseCondition, trueCondition], matches: true, calls: 2 },
+      { id: 'any-worst-null', match: 'any', conditions: [falseCondition, falseCondition], matches: false, calls: 2 },
+      { id: 'all-continue-null', match: 'all', conditions: [trueCondition, falseCondition], matches: false, calls: 2 },
+      { id: 'all-worst-match', match: 'all', conditions: [trueCondition, trueCondition], matches: true, calls: 2 },
+      { id: 'any-short-match', match: 'any', conditions: [trueCondition, falseCondition], matches: true, calls: 1 },
+      { id: 'all-short-null', match: 'all', conditions: [falseCondition, trueCondition], matches: false, calls: 1 },
+    ];
+
+    for (const testCase of cases) {
+      const testedRule = rule(`${kind}-${testCase.id}`, testCase.match, testCase.conditions);
+      const result = resolve([testedRule]);
+      assert.equal(
+        result.matchedRule,
+        testCase.matches ? testedRule : null,
+        `${kind} ${testCase.id} result`,
+      );
+      assert.equal(result.conditionCalls, testCase.calls, `${kind} ${testCase.id} calls`);
+    }
+
+    const firstRule = rule(`${kind}-first`, 'any', [trueCondition]);
+    const laterRule = rule(`${kind}-later`, 'any', [trueCondition]);
+    const firstMatch = resolve([firstRule, laterRule]);
+    assert.equal(firstMatch.matchedRule, firstRule, `${kind} returns the exact first matching rule`);
+    assert.equal(firstMatch.conditionCalls, 1, `${kind} stops before later matching rules`);
+
+    const finalRule = rule(`${kind}-after-skips`, 'all', [trueCondition]);
+    const afterSkips = resolve([
+      rule(`${kind}-inactive`, 'any', [trueCondition], false),
+      rule(`${kind}-empty`, 'any', []),
+      rule(`${kind}-non-array`, 'any', 'not-an-array'),
+      finalRule,
+    ]);
+    assert.equal(afterSkips.matchedRule, finalRule, `${kind} skips inactive and invalid rules`);
+    assert.equal(afterSkips.conditionCalls, 1, `${kind} does not evaluate skipped rules`);
+
+    const undefinedMatch = rule(`${kind}-undefined-match`, undefined, [trueCondition, trueCondition]);
+    const undefinedResult = resolve([undefinedMatch]);
+    assert.equal(undefinedResult.matchedRule, undefinedMatch, `${kind} undefined match remains all`);
+    assert.equal(undefinedResult.conditionCalls, 2, `${kind} undefined match checks every all condition`);
+
+    const bogusMatch = rule(`${kind}-bogus-match`, 'bogus', [trueCondition, falseCondition]);
+    const bogusResult = resolve([bogusMatch]);
+    assert.equal(bogusResult.matchedRule, null, `${kind} unsupported match remains all`);
+    assert.equal(bogusResult.conditionCalls, 2, `${kind} unsupported match preserves all continuation`);
+  }
+
+  const resolveTask = createResolver('task');
+  const taskDataRule = rule('task-frontmatter-inline-status', 'all', [
+    { field: 'owner', operator: 'is', value: 'frontmatter-owner' },
+    { field: 'state', operator: 'is', value: 'inline-ready' },
+    { field: 'status', operator: 'is', value: 'working' },
+    { field: 'kind', operator: 'is', value: 'task' },
+  ]);
+  const taskDataResult = resolveTask([taskDataRule], {
+    checkboxState: '[/]',
+    inlineFields: [{ key: 'state', value: 'inline-ready' }],
+  });
+  assert.equal(taskDataResult.matchedRule, taskDataRule);
+  assert.equal(taskDataResult.conditionCalls, 4);
+});
+
 test('settings normalization preserves an explicit empty style-rule list and every supported color target', async () => {
   assert.match(mainSource, /frontmatterColorTarget: normalizeFrontmatterColorTarget\(stored\.frontmatterColorTarget\)/);
   assert.match(mainSource, /cardStyleRules: normalizeCardStyleRules\(stored\.cardStyleRules\)/);
