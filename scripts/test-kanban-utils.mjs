@@ -669,6 +669,68 @@ test('one all-task parse derives the same bounded open previews as direct parsin
   }
 });
 
+test('markdown item parsing classifies each source line once in both inclusion modes', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  view.getDoneStatuses = () => new Set(['complete']);
+  view.getStatusForCheckboxState = (state) => state === '[x]' ? 'complete' : 'todo';
+
+  const content = [
+    '- [ ] Parent task',
+    '  - Nested bullet',
+    '    - [x] Done child',
+    'Paragraph resets the hierarchy',
+    '  1. [/] Working task',
+  ].join('\n');
+  const lineCount = content.split('\n').length;
+  const parseLineItem = view.parseLineItem.bind(view);
+  let parseCalls = 0;
+  view.parseLineItem = (...args) => {
+    parseCalls += 1;
+    return parseLineItem(...args);
+  };
+
+  const tasksOnly = view.parseOpenTasks(content, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER);
+  assert.equal(parseCalls, lineCount);
+  assert.deepEqual(
+    tasksOnly.openTasks.map(({ itemKind, line, parentLine, checkboxState, text }) => ({
+      itemKind,
+      line,
+      parentLine,
+      checkboxState,
+      text,
+    })),
+    [
+      { itemKind: 'task', line: 1, parentLine: undefined, checkboxState: '[ ]', text: 'Parent task' },
+      { itemKind: 'task', line: 5, parentLine: undefined, checkboxState: '[/]', text: 'Working task' },
+    ],
+  );
+
+  parseCalls = 0;
+  const withBullets = view.parseOpenTasks(
+    content,
+    'Inbox/Tasks.md',
+    Number.MAX_SAFE_INTEGER,
+    false,
+    true,
+  );
+  assert.equal(parseCalls, lineCount);
+  assert.deepEqual(
+    withBullets.openTasks.map(({ itemKind, line, parentLine, checkboxState, text }) => ({
+      itemKind,
+      line,
+      parentLine,
+      checkboxState,
+      text,
+    })),
+    [
+      { itemKind: 'task', line: 1, parentLine: undefined, checkboxState: '[ ]', text: 'Parent task' },
+      { itemKind: 'bullet', line: 2, parentLine: 1, checkboxState: undefined, text: 'Nested bullet' },
+      { itemKind: 'task', line: 5, parentLine: undefined, checkboxState: '[/]', text: 'Working task' },
+    ],
+  );
+});
+
 test('task preview reads reject stale owners and deduplicate bullet work', async (t) => {
   const { KanbanView } = await importKanbanView();
 

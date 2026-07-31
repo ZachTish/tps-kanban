@@ -1,5 +1,12 @@
 # TPS Kanban
 
+## 0.1.7
+
+- Markdown task and bullet discovery now classifies each source line once, then reuses that result for hierarchy and output. The released path called the same pure parser twice for every line.
+- Task-only views still exclude ordinary bullets explicitly; bullet-inclusive views, nesting, line identity, status filtering, limits, inline fields, text cleanup, creation, drag/drop, settings, commands, and persisted data remain unchanged.
+- Against exact public `0.1.6`, 800,000 comparisons across 100,000 randomized CRLF lines and eight inclusion/status scenarios produced zero output differences while parser calls fell from 1,600,000 to 800,000. In the controlled 25,000-line benchmark, median time improved from 208.87 ms to 198.28 ms and p95 from 210.80 ms to 201.44 ms.
+- This backward-compatible performance/reliability patch keeps the minimum supported Obsidian version at 1.10.0 and requires no migration. Validation details and artifact hashes are in `release-notes/0.1.7.md`.
+
 ## 0.1.6
 
 - Note-card and task-card style rules now stop evaluating as soon as an `any` rule is true or an `all` rule is false. The released path evaluated every condition and allocated a temporary result array even after the answer was known.
@@ -64,6 +71,7 @@ Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtish
 - 2026-07-28 render-efficiency validation: all 62 declared tests passed, including call-count and former-result equivalence coverage for the final parent, task, and note-lane indexes. The required standalone build deployed only to `[runtime-deploy] target=test`. After **Reload app without saving**, Obsidian 1.12.7 rendered the synthetic `Plugin QA.base` Kanban board with the expected `todo` and `working` cards and an empty ungrouped lane. No task, note, setting, or runtime state was changed; production was not accessed or promoted.
 - 2026-07-30 task-cache efficiency validation: exact public `0.1.4` and `0.1.5` produced identical cache output across 17 parity scenarios while cold-source parser calls and line visits fell by 50%; median and p95 timings both improved by about 30%. All 75 declared checks and the required separate build passed. After **Reload app without saving**, Obsidian 1.12.7 rendered `Plugin QA.base` with its open, working, and completed synthetic task rows. The 71-byte runtime settings file remained byte-identical, no note or setting was changed, and production was not accessed or promoted.
 - 2026-07-30 style-rule efficiency validation: exact public `0.1.5` and `0.1.6` selected the same rule in 200,000 deterministic note/task cases. Decisive 12 × 8 work fell by 87.5%, worst-case work stayed identical, and the five-rule one-condition guard did not regress. All 76 declared checks and the required separate build passed. After **Reload app without saving**, Obsidian 1.12.7 rendered `Plugin QA.base` with its open and working task lanes, retained the completed-task visibility control, and exposed the unchanged five priority rules under Appearance. The 71-byte runtime settings file remained byte-identical, no note or setting was changed, and production was not accessed or promoted.
+- 2026-07-31 line-parser efficiency validation: exact public `0.1.6` and `0.1.7` produced identical task/bullet output across 800,000 randomized comparisons while source-line classifications fell exactly by 50%; controlled median and p95 timings improved 5.07% and 4.44%. All 77 declared checks and the required separate build passed. After **Reload app without saving**, Obsidian 1.12.7 rendered `Plugin QA.base` with unchanged `todo` and `working` task lanes and completed-task visibility off. The 71-byte runtime settings file remained byte-identical, no task, note, setting, or outbound action was invoked, and production was not accessed or promoted.
 
 ## Mobile modal contract
 
@@ -269,6 +277,7 @@ Run `npm run test:settings` for the focused settings source contract. It checks 
 
 ## Version notes
 
+- 0.1.7: Reused one Markdown line classification for hierarchy and emitted task/bullet data, halving parser calls without changing released output.
 - 0.1.6: Short-circuited note/task card style-rule conditions without changing selected rules, worst-case work, or the released style-rule contract.
 - 0.1.5: Reused one complete Markdown task parse to derive both task-lane data and bounded card previews, halving cold-source parser passes and line visits without changing results.
 - 0.1.4: Routed tag-lane and card-nesting frontmatter mutations through GCM's supported service when available, with an exactly-once native standalone fallback.

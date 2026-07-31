@@ -2032,18 +2032,17 @@ export class KanbanView extends BasesView {
     const hierarchyStack: Array<{ line: number; indent: number }> = [];
     lines.forEach((line, index) => {
       const lineNumber = index + 1;
-      const structuralItem = this.parseLineItem(line, true);
+      const parsed = this.parseLineItem(line, true);
       const indent = getMarkdownIndentColumns(line);
       let parentLine: number | undefined;
-      if (structuralItem) {
+      if (parsed) {
         while (hierarchyStack.length && hierarchyStack[hierarchyStack.length - 1].indent >= indent) hierarchyStack.pop();
         parentLine = hierarchyStack[hierarchyStack.length - 1]?.line;
         hierarchyStack.push({ line: lineNumber, indent });
       } else if (line.trim() && indent === 0) {
         hierarchyStack.length = 0;
       }
-      const parsed = this.parseLineItem(line, includeBullets);
-      if (!parsed) return;
+      if (!parsed || (!includeBullets && parsed.itemKind === 'bullet')) return;
       const checkboxState = parsed.checkboxState;
       if (
         parsed.itemKind === 'task'
