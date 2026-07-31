@@ -1,5 +1,13 @@
 # TPS Kanban
 
+## 0.1.8
+
+- Fallback note-tag filtering now reads one Obsidian metadata-cache snapshot per file and reuses its frontmatter and inline tags; the released path requested the same file cache twice.
+- Frontmatter-first ordering, inline-tag ordering, normalization, duplicate removal, filter results, note/card/task behavior, settings, commands, and persisted data remain unchanged.
+- Exact public `0.1.7` and candidate actual methods matched across 100,000 seeded tag shapes with zero output or error mismatches while metadata reads fell from 200,000 to 100,000.
+- A representative one-frontmatter/one-inline-tag workload improved median time 3.04% and p95 3.82% across 41 interleaved rounds. A tag-heavy workload stayed timing-neutral while still halving metadata reads, and the production bundle is 45 bytes smaller.
+- This backward-compatible performance/reliability patch adds no cache, state, fallback, retry, monkeypatch, listener, timer, setting, migration, or unsupported API and keeps the minimum supported Obsidian version at 1.10.0.
+
 ## 0.1.7
 
 - Markdown task and bullet discovery now classifies each source line once, then reuses that result for hierarchy and output. The released path called the same pure parser twice for every line.

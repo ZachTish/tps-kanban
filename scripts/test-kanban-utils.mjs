@@ -2036,6 +2036,34 @@ test('semantic note kinds stay note-only while structural task kinds keep task b
   assert.match(filterKindUtilsSource, /'task',[\s\S]*'tasks',[\s\S]*'bullet',[\s\S]*'bullets',[\s\S]*'note',[\s\S]*'notes',[\s\S]*'all',[\s\S]*'mixed'/);
 });
 
+test('fallback note tag filters merge one metadata snapshot in stable order', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  let cacheReads = 0;
+  const cache = {
+    frontmatter: { tags: ['#Project', 'shared'] },
+    tags: [{ tag: '#Inline' }, { tag: '#project' }],
+  };
+  view.app = {
+    metadataCache: {
+      getFileCache: () => {
+        cacheReads += 1;
+        return cache;
+      },
+    },
+  };
+
+  const values = view.getNoteComparableValues({
+    path: 'Inbox/Tagged.md',
+    basename: 'Tagged',
+    name: 'Tagged.md',
+    extension: 'md',
+  }, 'file.tags');
+
+  assert.deepEqual(values, ['#project', 'project', '#shared', 'shared', '#inline', 'inline']);
+  assert.equal(cacheReads, 1);
+});
+
 test('kanban creation defaults can be controlled by Base task filters', () => {
   assert.match(viewSource, /targetPath\?: string \| null/);
   assert.match(viewSource, /private inferTaskPathCreationDefaultsFromString\(expr: string\): TaskCreationDefaults \| null/);

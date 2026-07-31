@@ -1,6 +1,6 @@
 {
   "name": "tps-kanban",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "TPS Kanban (Dev) - simple kanban plugin",
   "main": "main.js",
   "type": "module",
