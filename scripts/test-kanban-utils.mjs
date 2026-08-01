@@ -10,6 +10,7 @@ const taskCreationUtilsSource = readFileSync(new URL('../src/task-creation-utils
 const taskCheckboxUtilsSource = readFileSync(new URL('../src/task-checkbox-utils.ts', import.meta.url), 'utf8');
 const taskDropUtilsSource = readFileSync(new URL('../src/task-drop-utils.ts', import.meta.url), 'utf8');
 const filterKindUtilsSource = readFileSync(new URL('../src/filter-kind-utils.ts', import.meta.url), 'utf8');
+const gcmApiSource = readFileSync(new URL('../src/tps-gcm-api.ts', import.meta.url), 'utf8');
 const mainSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
 const settingsSource = readFileSync(new URL('../src/settings.ts', import.meta.url), 'utf8');
 const settingsTabSource = readFileSync(new URL('../src/settings/SettingsTab.ts', import.meta.url), 'utf8');
@@ -103,6 +104,24 @@ async function importKanbanSettingsPersistence() {
   return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
 }
 
+async function importGcmApiBridge() {
+  const build = await esbuild.build({
+    entryPoints: [fileURLToPath(new URL('../src/tps-gcm-api.ts', import.meta.url))],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    write: false,
+    plugins: [{
+      name: 'obsidian-stub',
+      setup(build) {
+        build.onResolve({ filter: /^obsidian$/ }, () => ({ path: 'obsidian-stub', namespace: 'stub' }));
+        build.onLoad({ filter: /.*/, namespace: 'stub' }, () => ({ loader: 'js', contents: 'export class App {}' }));
+      },
+    }],
+  });
+  return import(`data:text/javascript;base64,${Buffer.from(build.outputFiles[0].text).toString('base64')}`);
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -135,14 +154,25 @@ async function importKanbanView() {
               export class BasesEntryGroup {}
               export function setIcon() {}
               export class TFile {}
+              globalThis.__KanbanTestTFile = TFile;
               export function debounce(callback) { return callback; }
               export function normalizePath(value) { return String(value || '').replace(/\\\\/g, '/'); }
               export class Modal {}
               export class Setting {}
               export function getAllTags() { return []; }
               export class WorkspaceLeaf {}
-              export function parseYaml() { return {}; }
-              export class Notice {}
+              export function parseYaml(value) {
+                return typeof globalThis.__KanbanParseYaml === 'function'
+                  ? globalThis.__KanbanParseYaml(value)
+                  : {};
+              }
+              export class Notice {
+                constructor(message) {
+                  if (Array.isArray(globalThis.__KanbanFormulaNotices)) {
+                    globalThis.__KanbanFormulaNotices.push(String(message));
+                  }
+                }
+              }
               export const Platform = { isMobile: false };
             `,
           }));
@@ -159,6 +189,43 @@ async function flushDeferredWork() {
   }
 }
 
+function createEntityIndexApiMock() {
+  return {
+    version: 3,
+    ensureReady: async () => {},
+    queryAsync: async () => [],
+    getRevision: () => 1,
+    onChanged: () => () => {},
+  };
+}
+
+function provideGcmProtocolApi(view, {
+  formulas = createFormulaApiMock().api,
+  lineMetadata = createLineMetadataApiMock().api,
+  entityIndex = createEntityIndexApiMock(),
+  api: extraApi = {},
+} = {}) {
+  const api = {
+    ...extraApi,
+    ...(formulas ? { formulas } : {}),
+    ...(lineMetadata ? { lineMetadata } : {}),
+    ...(entityIndex ? { entityIndex } : {}),
+  };
+  const accepted = view.acceptGcmApiEvent({
+    source: 'tps-global-context-menu',
+    timestamp: Date.now(),
+    available: true,
+    api,
+    formulasVersion: formulas?.version ?? null,
+    lineMetadataVersion: lineMetadata?.version ?? null,
+    entityIndexVersion: entityIndex?.version ?? null,
+    taskLinesVersion: extraApi?.taskLines?.version ?? null,
+    taskCheckboxesVersion: extraApi?.taskCheckboxes?.version ?? null,
+  });
+  assert.equal(accepted, true);
+  return api;
+}
+
 function createTaskReadHarness(KanbanView) {
   const pendingReads = [];
   const filesByPath = new Map();
@@ -169,6 +236,11 @@ function createTaskReadHarness(KanbanView) {
   view.allTasksByPath = new Map();
   view.openTaskOverflowByPath = new Map();
   view.taskReadsInFlight = new Map();
+  view.taskReadQueue = [];
+  view.activeTaskReadCount = 0;
+  view.taskReadFailures = new Map();
+  view.taskReadRetryTimer = null;
+  view.taskReadExhaustionNotified = false;
   view.isViewLoaded = true;
   view.renderGeneration = 0;
   view.refreshDebounced = () => {
@@ -203,17 +275,24 @@ function createTaskReadHarness(KanbanView) {
   view.getDoneStatuses = () => new Set(['complete']);
   view.getStatusForCheckboxState = (state) => state === '[x]' ? 'complete' : 'todo';
   view.getTaskVisibleTitle = (task) => task.text;
+  view.getTaskReadRetryDelayMs = () => 1;
   view.parseOpenTasks = (content, path, _limit, _includeDone, includeBullets = false) => {
     parseCount += 1;
     return {
       openTasks: [{
-        itemKind: includeBullets ? 'bullet' : 'task',
+        itemKind: 'task',
         line: 1,
-        checkboxState: includeBullets ? undefined : '[ ]',
+        checkboxState: '[ ]',
         text: String(content),
         displayText: String(content),
         inlineFields: [{ key: 'path', value: path }],
-      }],
+      }, ...(includeBullets ? [{
+        itemKind: 'bullet',
+        line: 2,
+        text: String(content),
+        displayText: String(content),
+        inlineFields: [{ key: 'path', value: path }],
+      }] : [])],
       overflowCount: 0,
     };
   };
@@ -434,11 +513,9 @@ test('embedded kanban resolves markdown context before neighboring base tabs', (
   assert.ok(viewSource.includes('.internal-embed[src$=".base"]'));
   assert.match(viewSource, /this\.getEmbeddedBasePathFromDom\(\)/);
   assert.match(viewSource, /if \(directFile\) return directFile\.path/);
-  assert.match(viewSource, /const activeFile = this\.app\.workspace\.getActiveFile\?\.\(\)/);
-  assert.match(viewSource, /this\.isEmbeddedKanbanContext\(\) && activeFile instanceof TFile && activeFile\.extension === 'md'/);
-  assert.match(viewSource, /return activeFile\.path/);
   assert.match(viewSource, /const embeddedMarkdownContext = this\.getWorkspaceLeafMarkdownContextPath\(\)/);
   assert.match(viewSource, /if \(embeddedMarkdownContext\) return embeddedMarkdownContext/);
+  assert.doesNotMatch(viewSource, /getActiveWorkspaceBasePath|resolveBasePathFromDomTitle|resolveBasePathFromDocumentTitle/);
   assert.match(viewSource, /const markdownContextPath = this\.getWorkspaceLeafMarkdownContextPath\(\)/);
   assert.match(viewSource, /if \(markdownContextFile instanceof TFile\) return markdownContextFile/);
   assert.doesNotMatch(viewSource, /private getBaseFile\(\): TFile \| null \{\s*const directFile = this\.getRuntimeBaseFile\(\)/);
@@ -446,8 +523,38 @@ test('embedded kanban resolves markdown context before neighboring base tabs', (
   assert.match(viewSource, /file instanceof TFile && file\.extension === 'md'/);
   assert.match(viewSource, /value\.endsWith\('\.md'\)/);
   assert.match(viewSource, /private getEmbeddedKanbanBlockMatch\(parsed: Record<string, unknown> \| null \| undefined, viewName: string\): 'exact' \| 'fallback' \| null/);
-  assert.match(viewSource, /const roots = exactRoots\.length \? exactRoots : fallbackRoots/);
+  assert.match(viewSource, /const roots = exactFormulaSets\.length \? exactRoots : fallbackRoots/);
   assert.match(viewSource, /return kanbanViews\.length === 1 \? 'fallback' : null/);
+});
+
+test('Base formula authority never falls back to an active neighboring tab or ambiguous title', async () => {
+  const { KanbanView } = await importKanbanView();
+  const TFile = globalThis.__KanbanTestTFile;
+  const wrongActiveBase = Object.assign(new TFile(), {
+    path: 'Other/Schedule.base', name: 'Schedule.base', basename: 'Schedule', extension: 'base',
+  });
+  const duplicateBase = Object.assign(new TFile(), {
+    path: 'Archive/Schedule.base', name: 'Schedule.base', basename: 'Schedule', extension: 'base',
+  });
+  const view = Object.create(KanbanView.prototype);
+  view.getRuntimeBaseFile = () => null;
+  view.getWorkspaceLeafMarkdownContextPath = () => 'Inbox/Embedded Host.md';
+  view.getWorkspaceLeafBasePath = () => null;
+  view.app = {
+    workspace: {
+      getActiveFile: () => wrongActiveBase,
+      activeLeaf: { view: { file: wrongActiveBase }, getDisplayText: () => 'Schedule' },
+    },
+    vault: {
+      getFileByPath: () => null,
+      getFiles: () => [wrongActiveBase, duplicateBase],
+    },
+  };
+
+  assert.equal(view.getBaseSourcePath(), 'Inbox/Embedded Host.md', 'the owning embedded Markdown leaf wins over the active tab');
+  view.getWorkspaceLeafMarkdownContextPath = () => null;
+  assert.equal(view.getBaseSourcePath(), null, 'an unresolved owner fails closed instead of borrowing the active Base');
+  assert.equal(view.resolveBasePathFromName('Schedule'), null, 'same-named Base titles are never guessed');
 });
 
 test('extracts multi-value lane labels from Bases value shapes', () => {
@@ -473,9 +580,9 @@ test('root task creation utilities normalize targets and build lane-matching tas
   assert.match(taskCreationUtilsSource, /export function resolveKanbanLaneAddPresentation/);
   assert.match(viewSource, /resolveKanbanLaneAddPresentation\(laneAddMode, displayLane\.label\)/);
   assert.match(viewSource, /if \(laneAdd\.shouldCreateTask\)/);
-  assert.match(viewSource, /'aria-label': createCommandOverride \? `Run \$\{createCommandOverride\.name\}` : laneAdd\.ariaLabel/);
-  assert.match(viewSource, /title: createCommandOverride \? `Run \$\{createCommandOverride\.name\}` : laneAdd\.title/);
-  assert.match(viewSource, /text: createCommandOverride \? `\+ \$\{createCommandOverride\.name\}` : laneAdd\.buttonText/);
+  assert.match(viewSource, /createCommandOverride \? `Run \$\{createCommandOverride\.name\}` : laneAdd\.ariaLabel/);
+  assert.match(viewSource, /createCommandOverride \? `Run \$\{createCommandOverride\.name\}` : laneAdd\.title/);
+  assert.match(viewSource, /createCommandOverride \? `\+ \$\{createCommandOverride\.name\}` : laneAdd\.buttonText/);
 
   assert.equal(normalizeKanbanTaskTargetPath('Inbox/Tasks'), 'Inbox/Tasks.md');
   assert.equal(normalizeKanbanTaskTargetPath('[[Inbox/Tasks|Task Inbox]]'), 'Inbox/Tasks.md');
@@ -606,7 +713,8 @@ test('card task previews are bounded and use source markdown labels', () => {
   assert.match(settingsSource, /showTaskOverflowCount: true/);
   assert.match(viewSource, /cardContent/);
   assert.match(viewSource, /private getPreviewTasksForFile\(file: TFile\): \{ tasks: OpenTaskSubitem\[\]; overflowCount: number \}/);
-  assert.match(viewSource, /const allTasks = this\.parseOpenTasks\(content, path, Number\.MAX_SAFE_INTEGER, true\)\.openTasks/);
+  assert.match(viewSource, /const allLineItems = this\.parseOpenTasks\(content, path, Number\.MAX_SAFE_INTEGER, true, true\)\.openTasks/);
+  assert.match(viewSource, /const allTasks = allLineItems\.filter\(\(item\) => item\.itemKind !== 'bullet'\)/);
   assert.match(viewSource, /const localPreview = this\.selectOpenTaskPreview\(allTasks, limit\)/);
   assert.match(viewSource, /const openTasks = localPreview\.openTasks\.map/);
   assert.match(viewSource, /displayText: this\.getTaskVisibleTitle\(merged\)/);
@@ -862,39 +970,117 @@ test('task preview reads reject stale owners and deduplicate bullet work', async
     assert.equal(harness.refreshCount(), 1);
   });
 
-  await t.test('normal failures stay empty while bullet failures remain retryable', async () => {
+  await t.test('line read failures remain not-ready and recover after bounded backoff', async () => {
     const taskHarness = createTaskReadHarness(KanbanView);
     const taskFile = { path: 'Inbox/Task Failure.md' };
     taskHarness.filesByPath.set(taskFile.path, taskFile);
     taskHarness.view.loadOpenTasksForFile(taskFile);
     taskHarness.pendingReads[0].gate.reject(new Error('task read failed'));
     await flushDeferredWork();
-    assert.deepEqual(taskHarness.view.openTasksByPath.get(taskFile.path), []);
-    assert.deepEqual(taskHarness.view.allTasksByPath.get(taskFile.path), []);
-    assert.equal(taskHarness.view.openTaskOverflowByPath.get(taskFile.path), 0);
+    assert.equal(taskHarness.view.openTasksByPath.has(taskFile.path), false);
+    assert.equal(taskHarness.view.allTasksByPath.has(taskFile.path), false);
+    assert.equal(taskHarness.view.openTaskOverflowByPath.has(taskFile.path), false);
+    assert.equal(taskHarness.view.taskReadFailures.get(`lines:${taskFile.path}`)?.attempts, 1);
     assert.equal(taskHarness.refreshCount(), 1);
 
-    const bulletHarness = createTaskReadHarness(KanbanView);
-    const bulletFile = { path: 'Inbox/Bullet Failure.md' };
-    bulletHarness.filesByPath.set(bulletFile.path, bulletFile);
-    const filter = { mode: 'bullets' };
-    bulletHarness.view.getAllLineItemsForFile(bulletFile, filter);
-    bulletHarness.pendingReads[0].gate.reject(new Error('bullet read failed'));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    taskHarness.view.loadOpenTasksForFile(taskFile);
+    assert.equal(taskHarness.pendingReads.length, 2);
+    taskHarness.pendingReads[1].gate.resolve('recovered');
     await flushDeferredWork();
-    assert.equal(
-      bulletHarness.view.allTasksByPath.has(`${bulletFile.path}:bullets`),
-      false,
-    );
-    assert.equal(bulletHarness.refreshCount(), 0);
+    assert.equal(taskHarness.view.openTasksByPath.get(taskFile.path)?.[0]?.text, 'recovered');
+    assert.equal(taskHarness.view.allTasksByPath.get(`${taskFile.path}:bullets`)?.[1]?.itemKind, 'bullet');
+    assert.equal(taskHarness.view.taskReadFailures.has(`lines:${taskFile.path}`), false);
 
-    bulletHarness.view.getAllLineItemsForFile(bulletFile, filter);
-    assert.equal(bulletHarness.pendingReads.length, 2);
-    bulletHarness.pendingReads[1].gate.resolve('retry');
+    const sharedHarness = createTaskReadHarness(KanbanView);
+    const bulletFile = { path: 'Inbox/Shared Read.md' };
+    sharedHarness.filesByPath.set(bulletFile.path, bulletFile);
+    const filter = { mode: 'bullets' };
+    sharedHarness.view.loadOpenTasksForFile(bulletFile);
+    sharedHarness.view.getAllLineItemsForFile(bulletFile, filter);
+    assert.equal(sharedHarness.pendingReads.length, 1, 'task preview and bullet rows share one cold source read');
+    sharedHarness.pendingReads[0].gate.resolve('shared');
     await flushDeferredWork();
-    assert.equal(
-      bulletHarness.view.allTasksByPath.get(`${bulletFile.path}:bullets`)?.[0]?.text,
-      'retry',
-    );
+    assert.equal(sharedHarness.view.allTasksByPath.get(bulletFile.path)?.[0]?.text, 'shared');
+    assert.equal(sharedHarness.view.getAllLineItemsForFile(bulletFile, filter)?.[1]?.itemKind, 'bullet');
+    assert.equal(sharedHarness.parseCount(), 1, 'the shared source is parsed once');
+  });
+
+  await t.test('vault-wide bullet reads repaint once after the whole batch settles', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const files = Array.from({ length: 4 }, (_, index) => ({ path: `Inbox/Bullet Batch ${index}.md` }));
+    for (const file of files) {
+      harness.filesByPath.set(file.path, file);
+      harness.view.getAllLineItemsForFile(file, { mode: 'bullets' });
+    }
+    assert.equal(harness.pendingReads.length, files.length);
+
+    harness.pendingReads[1].gate.resolve('second');
+    harness.pendingReads[0].gate.resolve('first');
+    harness.pendingReads[2].gate.reject(new Error('bounded batch failure'));
+    await flushDeferredWork();
+    assert.equal(harness.refreshCount(), 0, 'partial batches never repaint');
+
+    harness.pendingReads[3].gate.resolve('last');
+    await flushDeferredWork();
+    assert.equal(harness.refreshCount(), 1);
+    assert.equal(harness.view.allTasksByPath.has(`${files[2].path}:bullets`), false);
+    assert.equal(harness.view.taskReadFailures.get(`lines:${files[2].path}`)?.attempts, 1);
+  });
+
+  await t.test('global cold reads cap concurrency and repaint only after the queued batch settles', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const files = Array.from({ length: 20 }, (_, index) => ({ path: `Inbox/Queued ${index}.md` }));
+    for (const file of files) {
+      harness.filesByPath.set(file.path, file);
+      harness.view.getAllLineItemsForFile(file, { mode: 'bullets' });
+    }
+    assert.equal(harness.pendingReads.length, 8, 'only the configured read window starts immediately');
+    assert.equal(harness.view.taskReadQueue.length, 12);
+
+    for (const pending of harness.pendingReads.slice(0, 8)) pending.gate.resolve(pending.file.path);
+    await flushDeferredWork();
+    assert.equal(harness.pendingReads.length, 16);
+    assert.equal(harness.refreshCount(), 0);
+
+    for (const pending of harness.pendingReads.slice(8, 16)) pending.gate.resolve(pending.file.path);
+    await flushDeferredWork();
+    assert.equal(harness.pendingReads.length, 20);
+    assert.equal(harness.refreshCount(), 0);
+
+    for (const pending of harness.pendingReads.slice(16)) pending.gate.resolve(pending.file.path);
+    await flushDeferredWork();
+    assert.equal(harness.refreshCount(), 1);
+    assert.equal(harness.parseCount(), 20);
+  });
+
+  await t.test('persistent line read failures stop at the retry bound and file invalidation resets them', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const file = { path: 'Inbox/Persistent Failure.md' };
+    harness.filesByPath.set(file.path, file);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      harness.view.loadOpenTasksForFile(file);
+      harness.pendingReads[attempt].gate.reject(new Error(`failure ${attempt + 1}`));
+      await flushDeferredWork();
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const terminal = harness.view.taskReadFailures.get(`lines:${file.path}`);
+    assert.equal(terminal?.attempts, 3);
+    assert.equal(terminal?.exhausted, true);
+    assert.equal(harness.view.taskReadRetryTimer, null);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    harness.view.loadOpenTasksForFile(file);
+    assert.equal(harness.pendingReads.length, 3, 'terminal failure does not loop reads');
+
+    harness.view.clearTaskCachesForPath(file.path);
+    assert.equal(harness.view.taskReadFailures.has(`lines:${file.path}`), false);
+    harness.view.loadOpenTasksForFile(file);
+    assert.equal(harness.pendingReads.length, 4, 'file invalidation permits a fresh snapshot attempt');
+    harness.pendingReads[3].gate.resolve('after-modify');
+    await flushDeferredWork();
+    assert.equal(harness.view.allTasksByPath.get(file.path)?.[0]?.text, 'after-modify');
   });
 
   await t.test('cache teardown blocks late commits, repaints, and replacement reads', async () => {
@@ -969,12 +1155,15 @@ test('card style rules short-circuit condition evaluation for notes and tasks', 
 
   const createResolver = (kind) => {
     const view = Object.create(KanbanView.prototype);
+    const lineMetadataApi = createLineMetadataApiMock().api;
+    let activeFrontmatter = { state: 'ready', owner: 'frontmatter-owner' };
     view.plugin = { settings: { cardStyleRules: [] } };
     view.app = {
       metadataCache: {
-        getFileCache: () => ({ frontmatter: { state: 'ready', owner: 'frontmatter-owner' } }),
+        getFileCache: () => ({ frontmatter: activeFrontmatter }),
       },
     };
+    provideGcmProtocolApi(view, { lineMetadata: lineMetadataApi });
     view.getStatusForCheckboxState = (state) => state === '[/]' ? 'working' : 'todo';
     const evaluateCondition = view.evaluateStyleCondition.bind(view);
     let conditionCalls = 0;
@@ -985,15 +1174,25 @@ test('card style rules short-circuit condition evaluation for notes and tasks', 
 
     return (rules, taskOverrides = {}) => {
       view.plugin.settings.cardStyleRules = rules;
+      activeFrontmatter = {
+        state: 'ready',
+        owner: 'frontmatter-owner',
+        ...(kind === 'note' ? taskOverrides : {}),
+      };
       conditionCalls = 0;
       const matchedRule = kind === 'note'
-        ? view.resolveCardStyleRule({ state: 'ready' }, {}, null)
+        ? view.resolveCardStyleRule(activeFrontmatter, {
+          file: { path: 'Inbox/Note.md', name: 'Note.md', basename: 'Note', extension: 'md' },
+          getValue: () => undefined,
+        }, null)
         : view.resolveTaskCardStyleRule(
           { path: 'Inbox/Task.md' },
           {
             itemKind: 'task',
             checkboxState: '[ ]',
             inlineFields: [],
+            rawLine: '- [ ] Task',
+            text: 'Task',
             ...taskOverrides,
           },
           null,
@@ -1071,6 +1270,21 @@ test('card style rules short-circuit condition evaluation for notes and tasks', 
   });
   assert.equal(taskDataResult.matchedRule, taskDataRule);
   assert.equal(taskDataResult.conditionCalls, 4);
+
+  const explicitTaskKindRule = rule('task-explicit-kind', 'all', [
+    { field: 'kind', operator: 'is', value: 'task' },
+    { field: 'kind', operator: 'is', value: 'project' },
+  ]);
+  assert.equal(resolveTask([explicitTaskKindRule], {
+    rawLine: '- [ ] Task [kind:: project]',
+  }).matchedRule, explicitTaskKindRule, 'task style kind uses structural and explicit membership');
+
+  const resolveNote = createResolver('note');
+  const additiveNoteKindRule = rule('note-additive-kind', 'all', [
+    { field: 'kind', operator: 'is', value: 'note' },
+    { field: 'kind', operator: 'is', value: 'task' },
+  ]);
+  assert.equal(resolveNote([additiveNoteKindRule], { kind: 'task' }).matchedRule, additiveNoteKindRule, 'note style kind preserves structural note plus frontmatter kind');
 });
 
 test('settings normalization preserves an explicit empty style-rule list and every supported color target', async () => {
@@ -1338,7 +1552,7 @@ test('completed tasks are hidden by default and can be shown per view for manipu
 });
 
 test('root task cards expose native checkbox completion controls', () => {
-  assert.match(viewSource, /private createTaskLaneCard\(item: TaskRenderItem, propName: string \| null, displayLane: DisplayLaneGroup\): HTMLElement/);
+  assert.match(viewSource, /private createTaskLaneCard\([\s\S]*?item: TaskRenderItem,[\s\S]*?propName: string \| null,[\s\S]*?taskGroupPropId: string \| null,[\s\S]*?displayLane: DisplayLaneGroup,[\s\S]*?\): HTMLElement/);
   assert.match(viewSource, /cls: 'tps-kanban-card-task-checkbox tps-kanban-task-card-checkbox'/);
   assert.match(viewSource, /type: 'checkbox'/);
   assert.match(viewSource, /'aria-label': `Toggle task: \$\{taskTitle\}`/);
@@ -1355,7 +1569,7 @@ test('collapsing task previews preserves kanban scroll position', () => {
   assert.match(viewSource, /private restoreRenderScrollState\(state: KanbanRenderScrollState \| null\): void/);
   assert.match(viewSource, /private render\(preserveScroll = true\): void/);
   assert.match(viewSource, /const scrollState = preserveScroll \? this\.captureRenderScrollState\(\) : null/);
-  assert.match(viewSource, /void this\.renderAsync\(sourceGroups, propName, scrollState\)/);
+  assert.match(viewSource, /void this\.renderAsync\(sourceGroups, propName, taskGroupPropId, scrollState\)/);
   assert.match(viewSource, /this\.restoreRenderScrollState\(scrollState\)/);
   assert.match(viewSource, /window\.requestAnimationFrame\(restore\)/);
 });
@@ -1436,7 +1650,7 @@ test('reading-mode embedded kanban hides Bases chrome and edit controls', () => 
 });
 
 test('saved base file filters are scoped to the configured Bases view name', () => {
-  assert.match(viewSource, /baseFileFilterCache: \{ path: string; mtime: number; viewName: string; viewNames: string\[\]; filters: unknown\[\] \| null \} \| null/);
+  assert.match(viewSource, /baseFileFilterCache: \{ path: string; mtime: number; viewName: string; viewNames: string\[\]; filters: unknown\[\] \| null; formulas: FormulaDefinitions; errorAt\?: number \} \| null/);
   assert.match(viewSource, /this\.getWorkspaceLeafBasePath\(\)/);
   assert.match(viewSource, /const viewName = this\.getConfiguredBaseViewName\(\)/);
   assert.match(viewSource, /this\.baseFileFilterCache\.viewName === viewName/);
@@ -1456,7 +1670,8 @@ test('saved base file filters are scoped to the configured Bases view name', () 
   assert.match(viewSource, /const folderComparison = expr\.match\(\/\^file\\\.folder/);
   assert.match(viewSource, /file\\\.links\?\\\.\(\?:isEmpty\|empty\)/);
   assert.doesNotMatch(viewSource, /for \(const delay of \[250, 750, 1500\]\)/);
-  assert.match(viewSource, /this\.releaseTaskRead\(owner\)[\s\S]*!this\.hasTaskReadsInFlight\('tasks'\)[\s\S]*this\.refreshDebounced\(\)/);
+  assert.match(viewSource, /private getTaskReadConcurrencyLimit\(\): number/);
+  assert.match(viewSource, /if \(released && !this\.taskReadsInFlight\.size\) this\.refreshDebounced\(\)/);
   assert.doesNotMatch(viewSource, /const knownViewNames = this\.baseFileFilterCache\?\.path === file\.path/);
 });
 
@@ -1497,24 +1712,20 @@ test('task lane synthesis builds each render index once without changing final r
   const doingFile = { path: 'Projects/Doing.md' };
   const todoTask = { text: 'First task', laneIds: ['key:todo'] };
   const doingTask = { text: 'Second task', laneIds: ['key:doing', 'key:done'] };
-  let fullVaultVisits = 0;
-
   view.app = {
     vault: {
-      getMarkdownFiles: () => {
-        fullVaultVisits += 1;
-        return [todoFile, doingFile];
-      },
+      getMarkdownFiles: () => { throw new Error('task discovery must not scan every Markdown file'); },
     },
   };
   view.isBaseFileFilterReady = () => true;
   view.getActiveBasesSearchQuery = () => '';
   view.getExplicitTaskSourceFiles = () => [];
   view.shouldScanVaultForTaskFilters = () => true;
+  view.getIndexedLineSourceFiles = () => [todoFile, doingFile];
   view.getAllLineItemsForFile = (file) => file.path === todoFile.path ? [todoTask] : [doingTask];
   view.taskMatchesRootFilter = () => true;
   view.taskMatchesSearchQuery = () => true;
-  view.getTaskLaneIds = (task) => task.laneIds;
+  view.getTaskLaneIds = (_file, task) => task.laneIds;
   view.getLaneId = (group) => group.key == null ? 'ungrouped' : `key:${String(group.key).toLowerCase()}`;
   view.applyManualLaneOrder = (groups) => groups;
 
@@ -1550,7 +1761,6 @@ test('task lane synthesis builds each render index once without changing final r
     new Set([todoFile.path]),
     taskFilter,
   );
-  assert.equal(fullVaultVisits, 2);
   assert.deepEqual(Array.from(afterSynthesisOracle.keys()), Array.from(beforeSynthesis.keys()));
   for (const [laneId, items] of beforeSynthesis) {
     const oracleItems = afterSynthesisOracle.get(laneId) || [];
@@ -1626,12 +1836,12 @@ test('status kanban renders tasks as lane items and keeps done tasks addressable
   assert.match(viewSource, /type TaskRenderItem/);
   assert.match(viewSource, /private allTasksByPath = new Map<string, OpenTaskSubitem\[\]>\(\)/);
   assert.match(viewSource, /buildTaskRenderItemsByLane\(\s*groups: BasesEntryGroup\[\],\s*propName: string \| null,/);
-  assert.match(viewSource, /this\.parseOpenTasks\(content, path, Number\.MAX_SAFE_INTEGER, true\)/);
+  assert.match(viewSource, /this\.parseOpenTasks\(content, path, Number\.MAX_SAFE_INTEGER, true, true\)/);
   assert.match(viewSource, /getLaneIdForStatus\(this\.getStatusForCheckboxState\(task\.checkboxState/);
   assert.match(viewSource, /isStatusPropertyName\(propName\)/);
   assert.match(viewSource, /if \(this\.isStatusPropertyName\(propName\)\)/);
   assert.match(viewSource, /nextLine = buildKanbanTaskDropLine\(\{\s*line: currentLine,\s*propName,\s*value,\s*sourceLaneValues,\s*filterTags,\s*filterStatus,/);
-  assert.match(viewSource, /createTaskLaneCard\(taskItem, propName, displayLane\)/);
+  assert.match(viewSource, /createTaskLaneCard\(mixedItem\.item, propName, taskGroupPropId, displayLane\)/);
   assert.match(viewSource, /role: 'button', tabindex: '0'/);
   assert.doesNotMatch(viewSource, /cls: 'tps-kanban-card-title tps-kanban-task-card-title',[\\s\\S]{0,120}type: 'button'/);
   assert.match(viewSource, /type ActiveTaskPointerDrag/);
@@ -1809,15 +2019,11 @@ test('dragging a linked task writes only to the checklist source line', async ()
 test('root task cards are filtered independently from visible parent note cards', () => {
   assert.match(viewSource, /type KanbanTaskRootFilter/);
   assert.match(viewSource, /private getSourceGroupsForRender\(propId: string \| null, listGrouping: boolean\): BasesEntryGroup\[\]/);
-  assert.match(viewSource, /const groupedEntries = nativeGroups\.flatMap/);
-  assert.match(viewSource, /const nativeEntries: BasesEntry\[\] = groupedEntries\.length \? groupedEntries : \(this\.data\?\.data \?\? \[\]\)/);
-  assert.match(viewSource, /if \(!fallbackEntries\.length && this\.groupsContainEntries\(nativeGroups\)\) return nativeGroups/);
-  assert.match(viewSource, /const entriesByPath = new Map<string, BasesEntry>\(\)/);
-  assert.match(viewSource, /for \(const entry of nativeEntries\)/);
-  assert.match(viewSource, /for \(const entry of fallbackEntries\)/);
-  assert.match(viewSource, /if \(entriesByPath\.size\) \{/);
-  assert.match(viewSource, /this\.groupEntriesByProperty\(Array\.from\(entriesByPath\.values\(\)\), propId\)/);
-  assert.match(viewSource, /private noteMatchesStructuredBaseFilters\(file: TFile\): boolean/);
+  assert.match(viewSource, /if \(this\.groupsContainEntries\(nativeGroups\)\) return nativeGroups/);
+  assert.match(viewSource, /const nativeEntries: BasesEntry\[\] = this\.data\?\.data \?\? \[\]/);
+  assert.match(viewSource, /this\.groupEntriesByProperty\(nativeEntries, propId\)/);
+  assert.doesNotMatch(viewSource, /fallbackEntries/);
+  assert.doesNotMatch(viewSource, /noteMatchesStructuredBaseFilters/);
   assert.match(viewSource, /getTaskRootFilterFromBaseFilters\(\)/);
   assert.match(viewSource, /parseYaml/);
   assert.match(viewSource, /private getBaseFileFilterRoot\(\)/);
@@ -1847,10 +2053,13 @@ test('root task cards are filtered independently from visible parent note cards'
   assert.match(viewSource, /!this\.shouldRenderNoteEntriesForGroups\(groups, taskFilter\)/);
   assert.match(viewSource, /private renderedTaskItemCount = 0/);
   assert.match(viewSource, /if \(taskFilter\.mode === 'tasks'\) return this\.renderedTaskItemCount/);
-  assert.match(viewSource, /this\.renderedTaskItemCount = Array\.from\(taskItemsByDisplayLane\.values\(\)\)/);
+  assert.match(viewSource, /this\.renderedTaskItemCount = this\.countUniqueTaskRenderItems\(taskRenderItemsByLane\)/);
   assert.match(viewSource, /visibleNotePaths\.has\(file\.path\)/);
-  assert.match(viewSource, /this\.app\.vault\.getMarkdownFiles\(\)/);
-  assert.match(viewSource, /getTaskLaneIds\(task, propName\)/);
+  assert.doesNotMatch(viewSource, /this\.app\.vault\.getMarkdownFiles\(\)/);
+  assert.match(viewSource, /getIndexedLineSourceFiles\(\)/);
+  assert.match(viewSource, /entityTypes: \['block'\]/);
+  assert.match(viewSource, /lineKinds: \['task', 'bullet'\]/);
+  assert.match(viewSource, /getTaskLaneIds\(file, task, propName\)/);
   assert.match(viewSource, /getTaskInlineValues\(task, 'tags'\)/);
   assert.match(viewSource, /private includeNativeEmptyGroups\(groups: BasesEntryGroup\[\], nativeGroups: BasesEntryGroup\[\]\): BasesEntryGroup\[\]/);
   assert.match(viewSource, /return this\.includeNativeEmptyGroups\(/);
@@ -1868,7 +2077,7 @@ test('root task cards are filtered independently from visible parent note cards'
 
 test('task-only kanban creation and matching preserve complex boolean filters', () => {
   assert.match(viewSource, /private taskMatchesStructuredBaseFilters\(task: OpenTaskSubitem, file: TFile \| null = null\): boolean \| null/);
-  assert.match(viewSource, /private evaluateTaskFilterNode\(node: unknown, task: OpenTaskSubitem, file: TFile \| null = null\): boolean \| null/);
+  assert.match(viewSource, /private evaluateTaskFilterNode\([\s\S]*node: unknown,[\s\S]*task: OpenTaskSubitem,[\s\S]*state: TaskFilterEvaluationState/);
   assert.doesNotMatch(viewSource, /if \(structuredMatch === true\) \{\s*return true;/);
   assert.match(viewSource, /Object\.prototype\.hasOwnProperty\.call\(record, 'and'\)/);
   assert.match(viewSource, /Object\.prototype\.hasOwnProperty\.call\(record, 'or'\)/);
@@ -1890,7 +2099,8 @@ test('task-only kanban creation and matching preserve complex boolean filters', 
   assert.match(viewSource, /taskFileExtensionPattern/);
   assert.match(viewSource, /const itemExtensionPattern = `\(\?:extension\|ext\|file\[/);
   assert.doesNotMatch(viewSource, /const fileExtensionPattern = `\(\?:task\\\\\.\)\?file/);
-  assert.match(viewSource, /const kindMatch = expr\.match\(\/\^\(\?:\(\?:tps\|kanban\)\\\.\)\?\(\?:itemtype\|itemkind\|kind\)/);
+  assert.match(viewSource, /if \(this\.parseAdditiveKindExpression\(expr\)\)/);
+  assert.match(viewSource, /const kindMatch = expr\.match\(\/\^\(\?:\(\?:tps\|kanban\)\\\.\)\?\(\?:itemtype\|itemkind\)/);
   assert.match(viewSource, /task\|tasks\|bullet\|bullets\|note\|notes\|all\|mixed/);
   assert.match(viewSource, /if \(value\.startsWith\('bullet'\)\) return task\.itemKind === 'bullet'/);
   assert.match(viewSource, /const laneAddMode = this\.resolveCardAddMode\(taskFilter\)/);
@@ -1898,7 +2108,7 @@ test('task-only kanban creation and matching preserve complex boolean filters', 
   assert.match(viewSource, /if \(this\.runCreateCommandOverride\(\)\) return/);
   assert.match(viewSource, /const laneAdd = resolveKanbanLaneAddPresentation\(laneAddMode, displayLane\.label\)/);
   assert.match(viewSource, /if \(laneAdd\.shouldCreateTask\)/);
-  assert.match(viewSource, /text: createCommandOverride \? `\+ \$\{createCommandOverride\.name\}` : laneAdd\.buttonText/);
+  assert.match(viewSource, /createCommandOverride \? `\+ \$\{createCommandOverride\.name\}` : laneAdd\.buttonText/);
   assert.match(viewSource, /await this\.createRootTaskForLane\(propName, displayLane, taskFilter\)/);
   assert.match(viewSource, /void this\.createTaskForEntry\(entry\.file, propName, displayLane, taskFilter\)/);
   assert.match(viewSource, /private async createTaskForEntry\([\s\S]*?propName: string \| null = null,[\s\S]*?displayLane: DisplayLaneGroup \| null = null,[\s\S]*?taskFilter = this\.getTaskRootFilterFromBaseFilters\(\)/);
@@ -1926,6 +2136,9 @@ test('task-only kanban creation and matching preserve complex boolean filters', 
 test('synthesized Kanban tasks honor Home archive guards and done defaults', async () => {
   const { KanbanView } = await importKanbanView();
   const view = Object.create(KanbanView.prototype);
+  const lineMetadataApi = createLineMetadataApiMock().api;
+  view.app = {};
+  provideGcmProtocolApi(view, { lineMetadata: lineMetadataApi });
   view.getStatusForCheckboxState = (state) => String(state).toLowerCase() === '[x]' ? 'complete' : 'todo';
   view.getDoneStatuses = () => new Set(['complete', 'wont-do']);
   view.getTaskInlineValues = (task, key) => (task.inlineFields || [])
@@ -1937,7 +2150,7 @@ test('synthesized Kanban tasks honor Home archive guards and done defaults', asy
   view.isEmbeddedScheduledDailyTaskBoard = () => false;
   view.shouldShowCompletedTasks = () => false;
 
-  const task = (checkboxState) => ({ itemKind: 'task', checkboxState, inlineFields: [], text: 'Task' });
+  const task = (checkboxState) => ({ itemKind: 'task', checkboxState, inlineFields: [], rawLine: `- ${checkboxState} Task`, text: 'Task' });
   const file = (path) => ({
     path,
     basename: path.split('/').at(-1).replace(/\.md$/i, ''),
@@ -2006,7 +2219,7 @@ test('synthesized Kanban tasks honor Home archive guards and done defaults', asy
   assert.equal(scheduled, true);
 });
 
-test('semantic note kinds stay note-only while structural task kinds keep task behavior', async () => {
+test('bare kind is additive across notes and line entities while itemKind stays structural', async () => {
   const {
     isBareSemanticKindFilter,
     isKanbanStructuralKindValue,
@@ -2025,24 +2238,127 @@ test('semantic note kinds stay note-only while structural task kinds keep task b
   assert.equal(isBareSemanticKindFilter('kind', ['task']), false);
   assert.equal(isBareSemanticKindFilter('itemKind', ['workout']), false);
 
-  assert.match(viewSource, /if \(parseBareSemanticKindExpression\(expr\)\) \{\s*filter\.mode = 'notes';\s*return;/);
-  assert.match(viewSource, /if \(isBareSemanticKindFilter\(propRaw, values\)\) \{\s*filter\.mode = 'notes';\s*return;/);
-  assert.match(viewSource, /if \(parseBareSemanticKindExpression\(raw\)\) return false;/);
-  assert.match(viewSource, /if \(isBareSemanticKindFilter\(propRaw, values\)\) return false;/);
-  assert.match(viewSource, /if \(parseBareSemanticKindExpression\(raw\)\) \{\s*return \{ mode: 'notes'/);
-  assert.match(viewSource, /if \(isBareSemanticKindFilter\(propRaw, values\)\) \{\s*return \{ mode: 'notes'/);
-  assert.match(viewSource, /const currentValues = this\.getNoteComparableValues\(file, propRaw\);\s*result = values\.some/);
+  const { view, file, frontmatter, task } = await createFormulaViewHarness();
+  frontmatter.kind = ['task', 'project'];
+  const bullet = {
+    ...task,
+    itemKind: 'bullet',
+    checkboxState: undefined,
+    line: 9,
+    rawLine: task.rawLine.replace('- [ ] Formula task', '- Formula bullet'),
+    sourceText: task.sourceText.replace('Formula task', 'Formula bullet'),
+    displayText: 'Formula bullet',
+  };
+
+  assert.deepEqual(view.getNoteAdditiveKinds(file), ['note', 'task', 'project'], 'native note styles expose structural and frontmatter kinds without a fallback note evaluator');
+
+  assert.equal(view.evaluateTaskFilterString('kind == "task"', task, file), true, 'checkbox structure satisfies additive task kind');
+  assert.equal(view.evaluateTaskFilterString('kind == "project"', task, file), true, 'explicit line kind augments structure');
+  assert.equal(view.evaluateTaskFilterString('kind !== "task"', task, file), false, 'strict inequality parses as one operator');
+  assert.equal(view.evaluateTaskFilterString('kind !== "client"', task, file), true);
+  assert.equal(view.evaluateTaskFilterString('itemKind == "task"', task, file), true);
+  assert.equal(view.evaluateTaskFilterString('itemKind == "bullet"', task, file), false);
+  assert.equal(view.evaluateTaskFilterString('kind == "task"', bullet, file), true, 'an explicit task kind can augment a bullet');
+  assert.equal(view.evaluateTaskFilterString('kind == "bullet"', bullet, file), true);
+  assert.equal(view.evaluateTaskFilterString('kind.contains("project")', bullet, file), true);
+  assert.equal(view.evaluateTaskFilterString('kind.containsAny("client", "project")', bullet, file), true);
+  assert.equal(view.evaluateTaskFilterString('kind equals "project"', bullet, file), true);
+  assert.equal(view.evaluateTaskFilterString('kind.exists()', bullet, file), true);
+  assert.equal(view.evaluateTaskFilterString('kind.isEmpty()', bullet, file), false);
+  assert.equal(view.evaluateTaskFilterString('itemKind == "bullet"', bullet, file), true);
+  assert.equal(view.evaluateTaskFilterString('itemKind == "task"', bullet, file), false);
+  const duplicateKindsTask = {
+    ...task,
+    rawLine: '- [ ] Duplicate kinds [kind:: task, Tasks, PROJECT, project]',
+    sourceText: 'Duplicate kinds [kind:: task, Tasks, PROJECT, project]',
+    inlineFields: [{ key: 'kind', value: 'task, Tasks, PROJECT, project' }],
+    lineMetadata: undefined,
+  };
+  assert.deepEqual(view.getTaskAdditiveKinds(duplicateKindsTask, file), ['task', 'project']);
+
+  for (const lineItem of [task, bullet]) {
+    assert.equal(view.evaluateTaskFilterObject({ property: 'kind', operator: '===', value: lineItem.itemKind }, lineItem, file), true);
+    assert.equal(view.evaluateTaskFilterObject({ property: 'kind', operator: 'exists' }, lineItem, file), true);
+    assert.equal(view.evaluateTaskFilterObject({ property: 'kind', operator: '!exists' }, lineItem, file), false);
+    assert.equal(view.evaluateTaskFilterObject({ property: 'kind', operator: 'empty' }, lineItem, file), false);
+    assert.equal(view.evaluateTaskFilterObject({ property: 'kind', operator: 'isNotEmpty' }, lineItem, file), true);
+  }
+  globalThis.__KanbanFormulaNotices = [];
+  assert.equal(view.evaluateTaskFilterObject({ property: 'kind', operator: 'matchesRegex', value: 'task' }, task, file), false);
+  assert.equal(view.evaluateTaskFilterObject({ property: 'kind', operator: '!matchesRegex', value: 'client' }, task, file), false, 'unsupported negated operators cannot fail open');
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1);
+  assert.match(globalThis.__KanbanFormulaNotices[0], /entity filter unavailable/i);
+  delete globalThis.__KanbanFormulaNotices;
+  assert.equal(view.filterExpressionReferencesFormula('description.contains("formula.score")'), false);
+  assert.equal(view.filterExpressionReferencesFormula('note.formula.value == 1'), false);
+  assert.equal(view.filterExpressionReferencesFormula('formula.score == 1'), true);
+  assert.equal(view.filterExpressionReferencesFormula('formula["Total Cost"] >= 1'), true);
+
+  view.getBaseFilterRoots = () => ['kind == "project"'];
+  view.shouldShowCompletedTasks = () => false;
+  const rootFilter = view.getTaskRootFilterFromBaseFilters();
+  assert.equal(rootFilter.mode, 'mixed');
+  assert.equal(rootFilter.hasTaskDirective, true);
+  assert.equal(rootFilter.mayMatchBullets, true, 'additive kinds force bullet discovery');
+  assert.equal(view.resolveCardAddMode(rootFilter), 'note', 'mixed additive filters preserve the configured add mode');
+  view.plugin.settings.cardAddButtonDefault = 'task';
+  assert.equal(view.resolveCardAddMode(rootFilter), 'task');
+
+  for (const root of [
+    'kind.contains("project")',
+    'kind.containsAny("client", "project")',
+    'kind equals "project"',
+    'kind.exists()',
+    'kind.isEmpty()',
+    { property: 'kind', operator: 'contains', value: 'project' },
+  ]) {
+    view.getBaseFilterRoots = () => [root];
+    const classified = view.getTaskRootFilterFromBaseFilters();
+    assert.equal(classified.hasTaskDirective, true);
+    assert.equal(classified.mayMatchBullets, true, `${JSON.stringify(root)} must include bullet candidates`);
+  }
+
+  const stringDefaults = view.inferTaskCreationDefaultsFromString('kind == "project"');
+  assert.equal(stringDefaults.mode, 'mixed');
+  assert.deepEqual(stringDefaults.inlineFields.get('kind'), { key: 'kind', value: 'project' });
+  const objectDefaults = view.inferTaskCreationDefaultsFromObject({ property: 'kind', operator: 'is', value: 'project' });
+  assert.deepEqual(objectDefaults.inlineFields.get('kind'), { key: 'kind', value: 'project' });
+  assert.deepEqual(
+    view.inferTaskCreationDefaultsFromObject({ property: 'kind', operator: '===', value: 'project' }).inlineFields.get('kind'),
+    { key: 'kind', value: 'project' },
+  );
+  assert.equal(view.inferTaskCreationDefaultsFromString('kind == "task"').inlineFields.size, 0, 'checkbox structure needs no redundant kind field');
+  assert.deepEqual(view.extractNoteFrontmatterDefaults('kind == "project"'), { kind: 'project' });
+
+  globalThis.__KanbanFormulaNotices = [];
+  const missing = await createFormulaViewHarness({ lineMetadataApi: null });
+  assert.equal(missing.view.evaluateTaskFilterString('kind == "task"', missing.task, missing.file), false);
+  assert.equal(missing.view.evaluateTaskFilterString('kind != "project"', missing.task, missing.file), false, 'negative filters also fail closed on incomplete kind data');
+  assert.equal(missing.view.evaluateTaskFilterString('itemKind == "task"', missing.task, missing.file), true, 'structural aliases remain independent');
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1, 'missing canonical line metadata is visible and deduplicated');
+  assert.match(globalThis.__KanbanFormulaNotices[0], /line metadata unavailable/i);
+  delete globalThis.__KanbanFormulaNotices;
+
+  globalThis.__KanbanFormulaNotices = [];
+  const throwingLineMetadata = createLineMetadataApiMock().api;
+  throwingLineMetadata.parseLine = () => { throw new Error('canonical parse failed'); };
+  const parseFailure = await createFormulaViewHarness({ lineMetadataApi: throwingLineMetadata });
+  assert.equal(parseFailure.view.evaluateTaskFilterString('kind == "task"', parseFailure.task, parseFailure.file), false, 'a canonical parse failure cannot reuse fallback inline fields');
+  assert.equal(parseFailure.view.evaluateTaskFilterString('itemKind == "task"', parseFailure.task, parseFailure.file), true);
+  assert.match(globalThis.__KanbanFormulaNotices[0], /canonical parse failed/i);
+  delete globalThis.__KanbanFormulaNotices;
+
+  assert.doesNotMatch(viewSource, /parseBareSemanticKindExpression|isBareSemanticKindFilter/);
   assert.match(viewSource, /private extractNoteFrontmatterDefaults[\s\S]*defaults\[key\.trim\(\)\] = value;/);
   assert.match(filterKindUtilsSource, /'task',[\s\S]*'tasks',[\s\S]*'bullet',[\s\S]*'bullets',[\s\S]*'note',[\s\S]*'notes',[\s\S]*'all',[\s\S]*'mixed'/);
 });
 
-test('fallback note tag filters merge one metadata snapshot in stable order', async () => {
+test('native note additive kinds read one metadata snapshot in stable order', async () => {
   const { KanbanView } = await importKanbanView();
   const view = Object.create(KanbanView.prototype);
   let cacheReads = 0;
   const cache = {
-    frontmatter: { tags: ['#Project', 'shared'] },
-    tags: [{ tag: '#Inline' }, { tag: '#project' }],
+    frontmatter: { KiNd: ['Task', 'Project, client', 'project'] },
   };
   view.app = {
     metadataCache: {
@@ -2053,14 +2369,14 @@ test('fallback note tag filters merge one metadata snapshot in stable order', as
     },
   };
 
-  const values = view.getNoteComparableValues({
+  const values = view.getNoteAdditiveKinds({
     path: 'Inbox/Tagged.md',
     basename: 'Tagged',
     name: 'Tagged.md',
     extension: 'md',
-  }, 'file.tags');
+  });
 
-  assert.deepEqual(values, ['#project', 'project', '#shared', 'shared', '#inline', 'inline']);
+  assert.deepEqual(values, ['note', 'task', 'project', 'client']);
   assert.equal(cacheReads, 1);
 });
 
@@ -2190,8 +2506,102 @@ test('scheduled daily task filters compare by day and render in the daily lane',
 
 test('Kanban task titles hand off to the exact-line virtual editor', () => {
   assert.match(viewSource, /private openTaskQuickEditor\(event: Event, taskEl: HTMLElement, sourceEl: HTMLElement \| null = taskEl\): boolean/);
-  assert.match(viewSource, /service\.openQuickEditorForElement\(taskEl, sourceEl\)/);
+  assert.match(viewSource, /getGcmTaskLinesApi\(this\.app\)/);
+  assert.match(viewSource, /taskLines\.openQuickEditorForElement\(taskEl, sourceEl\)/);
   assert.match(viewSource, /if \(this\.openTaskQuickEditor\(e, cardEl, titleEl\)\) return/);
+});
+
+test('Kanban task interactions and checkbox mappings use only exact public GCM capabilities', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  view.app = {};
+  view.getDoneStatuses = () => new Set(['complete']);
+
+  const contextEvents = [];
+  const editorCalls = [];
+  const sourceMappings = [
+    { checkboxState: '!', statuses: [' Review ', ''], toggleTargetStatus: 'Complete', icon: 'eye', label: 'Review' },
+    { checkboxState: '[x]', statuses: ['complete'], toggleTargetStatus: 'todo', icon: 'check', label: 'Complete' },
+    { checkboxState: '[ ]', statuses: ['todo'], toggleTargetStatus: 'complete', icon: 'square', label: 'Todo' },
+  ];
+  provideGcmProtocolApi(view, {
+    api: {
+      services: {
+        parents: {
+          getChildKeys: () => ['offspring', 'parentOf'],
+        },
+      },
+      taskLines: {
+        version: 1,
+        handleContextMenu(event) {
+          contextEvents.push(event);
+          return true;
+        },
+        async openQuickEditorForElement(taskEl, sourceEl) {
+          editorCalls.push({ taskEl, sourceEl });
+          return true;
+        },
+      },
+      taskCheckboxes: {
+        version: 1,
+        getMappings: () => sourceMappings,
+        stateForStatus: (status) => String(status) === 'review' ? '[!]' : '[ ]',
+        statusForState: (state) => String(state) === '[!]' ? 'review' : 'todo',
+      },
+    },
+  });
+
+  const contextEvent = { type: 'contextmenu' };
+  assert.equal(view.openTaskLineContextMenu(contextEvent), true);
+  assert.deepEqual(contextEvents, [contextEvent]);
+
+  const stopped = [];
+  const editorEvent = {
+    preventDefault: () => stopped.push('preventDefault'),
+    stopPropagation: () => stopped.push('stopPropagation'),
+    stopImmediatePropagation: () => stopped.push('stopImmediatePropagation'),
+  };
+  const taskEl = { id: 'task-row' };
+  const sourceEl = { id: 'task-title' };
+  assert.equal(view.openTaskQuickEditor(editorEvent, taskEl, sourceEl), true);
+  assert.deepEqual(stopped, ['preventDefault', 'stopPropagation', 'stopImmediatePropagation']);
+  assert.deepEqual(editorCalls, [{ taskEl, sourceEl }]);
+
+  assert.deepEqual(view.getGcmCheckboxMappings(), [
+    { checkboxState: '[!]', statuses: ['review'], toggleTargetStatus: 'Complete', icon: 'eye', label: 'Review' },
+    { checkboxState: '[x]', statuses: ['complete'], toggleTargetStatus: 'todo', icon: 'check', label: 'Complete' },
+    { checkboxState: '[ ]', statuses: ['todo'], toggleTargetStatus: 'complete', icon: 'square', label: 'Todo' },
+  ]);
+  assert.equal(view.getStatusForCheckboxState('[!]'), 'review');
+  assert.equal(view.getCheckboxStateForStatus('review'), '[!]');
+  assert.equal(view.getToggleCheckboxStateForTask({ checkboxState: '[!]' }), '[x]');
+  assert.deepEqual(view.getChildLinkKeys(), ['offspring', 'parentOf'], 'custom relationship keys come from the public parent service');
+  assert.equal(sourceMappings[0].checkboxState, '!', 'Kanban normalizes a local copy instead of mutating provider state');
+
+  provideGcmProtocolApi(view, {
+    api: {
+      taskLines: {
+        version: 2,
+        handleContextMenu: () => true,
+        openQuickEditorForElement: () => true,
+      },
+      taskCheckboxes: {
+        version: 2,
+        getMappings: () => sourceMappings,
+        stateForStatus: () => '[!]',
+        statusForState: () => 'review',
+      },
+    },
+  });
+  assert.equal(view.openTaskLineContextMenu({}), false, 'an unsupported task-lines version fails closed');
+  assert.equal(view.openTaskQuickEditor(editorEvent, taskEl, sourceEl), false, 'an unsupported task-lines version does not consume the click');
+  assert.equal(view.getCheckboxStateForStatus('review'), null, 'an unsupported checkbox capability cannot leak custom mappings');
+
+  assert.doesNotMatch(viewSource, /getGcmPlugin|getGcmSettings|contextTargetService|taskLineContextMenuService|linkedSubitemCheckboxMappings/);
+  assert.doesNotMatch(viewSource, /tps-global-context-menu|TPS-Global-Context-Menu|gcmPlugin/);
+  assert.match(viewSource, /this\.getGcmServices\(\)\?\.parents\?\.getChildKeys\?\.\(\)/);
+  assert.match(gcmApiSource, /taskLines\.version === TPS_TASK_LINES_API_VERSION/);
+  assert.match(gcmApiSource, /taskCheckboxes\.version === TPS_TASK_CHECKBOXES_API_VERSION/);
 });
 
 test('kanban does not register vault-wide or Notebook Navigator open interception', () => {
@@ -2201,4 +2611,1366 @@ test('kanban does not register vault-wide or Notebook Navigator open interceptio
   assert.doesNotMatch(mainSource, /registerNotebookNavigatorPreviewClicks/);
   assert.doesNotMatch(mainSource, /handleNotebookNavigatorFilePointer/);
   assert.doesNotMatch(mainSource, /this\.registerNotebookNavigatorPreviewClicks\(\)/);
+});
+
+function createLineMetadataApiMock() {
+  let parseCount = 0;
+  const scanFields = (line) => {
+    const source = String(line || '');
+    const fields = [];
+    for (let index = 0; index < source.length; index += 1) {
+      const open = source[index];
+      if (open !== '[' && open !== '(') continue;
+      const close = open === '[' ? ']' : ')';
+      let cursor = index + 1;
+      while (/\s/.test(source[cursor] || '')) cursor += 1;
+      const keyStart = cursor;
+      while (/[A-Za-z0-9_.-]/.test(source[cursor] || '')) cursor += 1;
+      const key = source.slice(keyStart, cursor);
+      while (/\s/.test(source[cursor] || '')) cursor += 1;
+      if (!key || source.slice(cursor, cursor + 2) !== '::') continue;
+      cursor += 2;
+      const valueStart = cursor;
+      let depth = 1;
+      let end = -1;
+      for (; cursor < source.length; cursor += 1) {
+        if (source[cursor] === '\\') {
+          cursor += 1;
+          continue;
+        }
+        if (source[cursor] === open) depth += 1;
+        else if (source[cursor] === close && --depth === 0) {
+          end = cursor;
+          break;
+        }
+      }
+      if (end < 0) continue;
+      fields.push({ key, value: source.slice(valueStart, end).trim() });
+      index = end;
+    }
+    return fields;
+  };
+  const hasBalancedOuterListBrackets = (raw) => {
+    const source = String(raw || '').trim();
+    if (!source.startsWith('[') || !source.endsWith(']') || source.startsWith('[[')) return false;
+    let depth = 0;
+    let quote = '';
+    let escaped = false;
+    for (let index = 0; index < source.length; index += 1) {
+      const character = source[index];
+      if (escaped) { escaped = false; continue; }
+      if (character === '\\') { escaped = true; continue; }
+      if (quote) { if (character === quote) quote = ''; continue; }
+      if (character === '"' || character === "'") { quote = character; continue; }
+      if (character === '[') depth += 1;
+      else if (character === ']') depth -= 1;
+      if (depth === 0 && index < source.length - 1) return false;
+      if (depth < 0) return false;
+    }
+    return depth === 0 && !quote;
+  };
+  const splitStringListText = (raw) => {
+    let source = String(raw || '').trim();
+    if (hasBalancedOuterListBrackets(source)) source = source.slice(1, -1).trim();
+    if (!source) return [];
+    const values = [];
+    let current = '';
+    let quote = '';
+    let escaped = false;
+    let squareDepth = 0;
+    let roundDepth = 0;
+    let curlyDepth = 0;
+    for (const character of source) {
+      if (escaped) { current += character; escaped = false; continue; }
+      if (character === '\\') { current += character; escaped = true; continue; }
+      if (quote) { current += character; if (character === quote) quote = ''; continue; }
+      if (character === '"' || character === "'") { current += character; quote = character; continue; }
+      if (character === '[') squareDepth += 1;
+      else if (character === ']') squareDepth = Math.max(0, squareDepth - 1);
+      else if (character === '(') roundDepth += 1;
+      else if (character === ')') roundDepth = Math.max(0, roundDepth - 1);
+      else if (character === '{') curlyDepth += 1;
+      else if (character === '}') curlyDepth = Math.max(0, curlyDepth - 1);
+      if ((character === ',' || character === '\n') && squareDepth === 0 && roundDepth === 0 && curlyDepth === 0) {
+        if (current.trim()) values.push(current.trim());
+        current = '';
+        continue;
+      }
+      current += character;
+    }
+    if (current.trim()) values.push(current.trim());
+    return values;
+  };
+  const parseStringList = (value) => {
+    const values = [];
+    const visit = (item) => {
+      if (Array.isArray(item)) { item.forEach(visit); return; }
+      if (item == null || item === false) return;
+      values.push(...splitStringListText(item));
+    };
+    visit(value);
+    return Array.from(new Set(values));
+  };
+  const readTags = (line) => {
+    const source = String(line || '').replace(/`[^`]*`/g, '');
+    const inline = scanFields(source)
+      .filter((field) => /^(?:tag|tags)$/i.test(field.key))
+      .flatMap((field) => parseStringList(field.value));
+    const visible = Array.from(source.matchAll(/(?:^|\s)#([\p{L}\p{N}/_-]+)/gu), (match) => match[1]);
+    return Array.from(new Set([...inline, ...visible].map((tag) => String(tag).replace(/^#/, '').toLowerCase())));
+  };
+  const parseLine = (line) => {
+    parseCount += 1;
+    const source = String(line || '');
+    const fields = scanFields(source);
+    const withoutFields = fields.reduce((current, field) => current.replace(`[${field.key}:: ${field.value}]`, ''), source);
+    const displayTitle = withoutFields
+      .replace(/^\s*(?:[-*+]\s+)?(?:\[[^\]]*\]\s+)?/, '')
+      .replace(/<!--.*?-->/g, '')
+      .replace(/(?:^|\s)#[\p{L}\p{N}/_-]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return { fields, tags: readTags(source), displayTitle };
+  };
+  const api = {
+    version: 1,
+    readInlineFields: scanFields,
+    readInlineFieldValue(line, key) {
+      return scanFields(line).find((field) => field.key.toLowerCase() === String(key).toLowerCase())?.value ?? null;
+    },
+    readTags,
+    parseStringList,
+    parseTags(value) {
+      return parseStringList(value).map((tag) => tag.replace(/^#/, '').toLowerCase());
+    },
+    getDisplayTitle(line) {
+      return parseLine(line).displayTitle;
+    },
+    parseLine,
+  };
+  return { api, getParseCount: () => parseCount };
+}
+
+function createFormulaApiMock() {
+  let lastContext = null;
+  let compileCount = 0;
+  const getCounts = new Map();
+  const expressionCounts = new Map();
+  const result = (formula, value) => ({
+    status: value == null || value === '' || (Array.isArray(value) && value.length === 0) ? 'empty' : 'value',
+    value: value ?? null,
+    formula,
+  });
+  const formulaValue = (name, context, get) => {
+    if (name === 'score') return result(name, Number(context.row?.eighth || 0) * 2);
+    if (name === 'derived') return result(name, `${get('score').value}-${context.row?.owner}-${context.note?.owner}`);
+    if (name === 'lane') return result(name, context.row?.seventh || '');
+    if (name === 'flag') return result(name, context.row?.owner === 'row');
+    if (name === 'Total Cost') return result(name, get('score').value);
+    if (name === 'clock') return result(name, context.now);
+    if (name === 'labels') return result(name, ['Alpha', 'Beta']);
+    if (name === 'linkLane') return result(name, { __tpsFormulaType: 'link', path: 'People/Ada.md', display: 'Ada' });
+    if (name === 'emptyList') return result(name, []);
+    if (name === 'conditional') {
+      return context.row?.owner === 'bad'
+        ? { status: 'error', value: null, formula: name, code: 'conditional-error', message: 'conditional formula failed' }
+        : result(name, Number(context.row?.eighth || 0));
+    }
+    if (name === 'bad') return { status: 'error', value: null, formula: name, code: 'syntax-error', message: 'bad formula' };
+    if (name === 'unsupported') return { status: 'unsupported', value: null, formula: name, code: 'unsupported-function', message: 'unsupported formula' };
+    return { status: 'error', value: null, formula: name, code: 'unknown-formula', message: `unknown ${name}` };
+  };
+  const api = {
+    version: 1,
+    hasReference(expression) {
+      const source = String(expression ?? '');
+      let searchable = '';
+      let quote = '';
+      for (let index = 0; index < source.length; index += 1) {
+        const char = source[index];
+        if (quote) {
+          if (char === '\\') {
+            searchable += '  ';
+            index += 1;
+            continue;
+          }
+          if (char === quote) quote = '';
+          searchable += ' ';
+          continue;
+        }
+        if (char === '"' || char === "'" || char === '`') {
+          quote = char;
+          searchable += ' ';
+          continue;
+        }
+        searchable += char;
+      }
+      return /(?:^|[^\w.])formula\s*(?:\.|\[)/i.test(searchable);
+    },
+    compile(definitions, sourceId) {
+      compileCount += 1;
+      return { definitions, sourceId, revision: JSON.stringify(definitions) };
+    },
+    createSession(compiled, context) {
+      lastContext = context;
+      const memo = new Map();
+      const get = (name) => {
+        const normalized = String(name || '').replace(/^formula\./i, '');
+        if (!memo.has(normalized)) {
+          getCounts.set(normalized, (getCounts.get(normalized) || 0) + 1);
+          memo.set(normalized, formulaValue(normalized, context, get));
+        }
+        return memo.get(normalized);
+      };
+      const evaluateExpression = (expression, label = '$expression') => {
+        const raw = String(expression || '').trim();
+        expressionCounts.set(raw, (expressionCounts.get(raw) || 0) + 1);
+        const direct = raw.match(/^(!)?formula\.([\w$-]+)$/i);
+        if (direct) {
+          const current = get(direct[2]);
+          if (current.status === 'error' || current.status === 'unsupported') return { ...current, formula: label };
+          const truthy = api.isTruthy(current.value);
+          return result(label, direct[1] ? !truthy : truthy);
+        }
+        const bracketComparison = raw.match(/^(!)?formula\[(?:"([^"]+)"|'([^']+)')\]\s*(==|!=|>=|<=|>|<)\s*(?:"([^"]*)"|'([^']*)'|([^\s]+))$/i);
+        if (bracketComparison) {
+          const current = get(bracketComparison[2] ?? bracketComparison[3]);
+          if (current.status === 'error' || current.status === 'unsupported') return { ...current, formula: label };
+          const expectedRaw = bracketComparison[5] ?? bracketComparison[6] ?? bracketComparison[7] ?? '';
+          const expected = /^-?(?:\d+(?:\.\d*)?|\.\d+)$/.test(expectedRaw) ? Number(expectedRaw) : expectedRaw;
+          const operator = bracketComparison[4];
+          let matches;
+          if (operator === '==') matches = current.value === expected;
+          else if (operator === '!=') matches = current.value !== expected;
+          else if (operator === '>=') matches = current.value >= expected;
+          else if (operator === '<=') matches = current.value <= expected;
+          else if (operator === '>') matches = current.value > expected;
+          else matches = current.value < expected;
+          return result(label, bracketComparison[1] ? !matches : matches);
+        }
+        const comparison = raw.match(/^(!)?formula\.([\w$-]+)\s*(==|!=|>=|<=|>|<)\s*(?:"([^"]*)"|'([^']*)'|([^\s]+))$/i);
+        if (comparison) {
+          const current = get(comparison[2]);
+          if (current.status === 'error' || current.status === 'unsupported') return { ...current, formula: label };
+          const expectedRaw = comparison[4] ?? comparison[5] ?? comparison[6] ?? '';
+          const expected = /^-?(?:\d+(?:\.\d*)?|\.\d+)$/.test(expectedRaw) ? Number(expectedRaw) : expectedRaw;
+          let matches;
+          if (comparison[3] === '==') matches = current.value === expected;
+          else if (comparison[3] === '!=') matches = current.value !== expected;
+          else if (comparison[3] === '>=') matches = current.value >= expected;
+          else if (comparison[3] === '<=') matches = current.value <= expected;
+          else if (comparison[3] === '>') matches = current.value > expected;
+          else matches = current.value < expected;
+          return result(label, comparison[1] ? !matches : matches);
+        }
+        const empty = raw.match(/^formula\.([\w$-]+)\.(isEmpty|isNotEmpty)\(\)$/i);
+        if (empty) {
+          const current = get(empty[1]);
+          if (current.status === 'error' || current.status === 'unsupported') return { ...current, formula: label };
+          const isEmpty = current.value == null || current.value === '' || (Array.isArray(current.value) && current.value.length === 0);
+          return result(label, empty[2].toLowerCase() === 'isempty' ? isEmpty : !isEmpty);
+        }
+        const contains = raw.match(/^(!)?formula\.([\w$-]+)\.contains\("([^"]*)"\)$/i);
+        if (contains) {
+          const current = get(contains[2]);
+          if (current.status === 'error' || current.status === 'unsupported') return { ...current, formula: label };
+          const matched = Array.isArray(current.value)
+            ? current.value.includes(contains[3])
+            : String(current.value ?? '').includes(contains[3]);
+          return result(label, contains[1] ? !matched : matched);
+        }
+        return { status: 'error', value: null, formula: label, code: 'unsupported-test-expression', message: raw };
+      };
+      return {
+        compiled,
+        get,
+        getAll: () => Object.fromEntries(Object.keys(compiled.definitions).map((name) => [name, get(name)])),
+        evaluateExpression,
+      };
+    },
+    evaluateExpression() {
+      throw new Error('Kanban should reuse its row session for filter expressions');
+    },
+    format(value) {
+      if (value instanceof Date) {
+        const pad = (part) => String(part).padStart(2, '0');
+        return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+      }
+      if (Array.isArray(value)) return value.join(', ');
+      return value == null ? '' : String(value);
+    },
+    comparableValues(value) {
+      return Array.isArray(value) ? value : value == null ? [] : [value];
+    },
+    sortKey(value) {
+      return typeof value === 'number' ? `1:${String(value).padStart(8, '0')}` : `3:${String(value ?? '').toLowerCase()}`;
+    },
+    groupValues(value) {
+      const unwrap = (item) => {
+        if (item?.constructor?.type === 'list' && typeof item.length === 'function' && typeof item.get === 'function') {
+          return Array.from({ length: item.length() }, (_, index) => item.get(index)).flatMap(unwrap);
+        }
+        if (item instanceof Set || Array.isArray(item)) return Array.from(item).flatMap(unwrap);
+        return item == null ? [] : [item];
+      };
+      const values = unwrap(value);
+      const seen = new Set();
+      return values.flatMap((item) => {
+        const text = item?.__tpsFormulaType === 'link' || item?.constructor?.type === 'link'
+          ? String(item.path || '').trim()
+          : api.format(item).trim();
+        const key = text.toLowerCase();
+        if (!text || seen.has(key)) return [];
+        seen.add(key);
+        return [text];
+      });
+    },
+    compare(left, right) {
+      if (left?.__tpsFormulaType === 'link' || right?.__tpsFormulaType === 'link') {
+        const path = (value) => String(value?.path ?? value ?? '').replace(/\.md$/i, '').toLowerCase();
+        return path(left).localeCompare(path(right), undefined, { numeric: true, sensitivity: 'base' });
+      }
+      if (left instanceof Date || right instanceof Date) return new Date(left).getTime() - new Date(right).getTime();
+      const leftNumber = Number(left);
+      const rightNumber = Number(right);
+      if (String(left ?? '').trim() && String(right ?? '').trim() && Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+        return leftNumber - rightNumber;
+      }
+      return String(left ?? '').localeCompare(String(right ?? ''), undefined, { numeric: true, sensitivity: 'base' });
+    },
+    isTruthy(value) {
+      return Boolean(value);
+    },
+  };
+  return {
+    api,
+    getLastContext: () => lastContext,
+    getCompileCount: () => compileCount,
+    getFormulaCount: (name) => getCounts.get(name) || 0,
+    getExpressionCount: (expression) => expressionCounts.get(String(expression || '').trim()) || 0,
+  };
+}
+
+async function createFormulaViewHarness({
+  formulasApi = createFormulaApiMock().api,
+  lineMetadataApi = createLineMetadataApiMock().api,
+} = {}) {
+  const { KanbanView } = await importKanbanView();
+  const TFile = globalThis.__KanbanTestTFile;
+  const file = Object.assign(new TFile(), {
+    path: 'Inbox/Formula Tasks.md',
+    name: 'Formula Tasks.md',
+    basename: 'Formula Tasks',
+    extension: 'md',
+    parent: { path: 'Inbox' },
+    stat: { size: 128, ctime: 10, mtime: 20 },
+  });
+  const frontmatter = { owner: 'note', category: 'source-note' };
+  const view = Object.create(KanbanView.prototype);
+  view.app = {
+    metadataCache: {
+      getFileCache(received) {
+        assert.equal(received, file);
+        return { frontmatter, tags: [{ tag: '#source' }], links: [{ link: 'Target' }] };
+      },
+    },
+  };
+  provideGcmProtocolApi(view, { formulas: formulasApi, lineMetadata: lineMetadataApi });
+  view.plugin = { settings: {} };
+  view.config = {};
+  view.formulaCompileCache = null;
+  view.taskFormulaSessions = new WeakMap();
+  view.formulaFileContexts = new Map();
+  view.formulaLaneLabels = new Map();
+  view.formulaDiagnostics = new Set();
+  view.formulaNow = new Date(2026, 6, 31, 12, 0, 0);
+  const formulaDefinitions = {
+    score: 'number(eighth) * 2',
+    derived: 'formula.score.toString() + "-" + owner + "-" + note.owner',
+    lane: 'seventh',
+    flag: 'owner == "row"',
+    'Total Cost': 'formula.score',
+    clock: 'now()',
+    labels: '["Alpha", "Beta"]',
+    linkLane: 'link("People/Ada.md", "Ada")',
+    emptyList: '[]',
+    conditional: 'owner == "bad" ? missing() : number(eighth)',
+    bad: '(',
+    unsupported: 'random()',
+  };
+  view.getActiveFormulaDefinitions = () => formulaDefinitions;
+  view.getBaseSourcePath = () => 'Formula QA.base';
+  view.getConfiguredBaseViewName = () => 'Formula board';
+  view.getBaseContextFile = () => null;
+  view.getBaseFile = () => null;
+  view.createFormulaThisValue = () => ({ scheduled: '2026-07-31' });
+  view.getTaskVisibleTitle = (task) => task.displayText || task.text;
+  view.getStatusForCheckboxState = () => 'todo';
+  view.getDoneStatuses = () => new Set(['complete']);
+  view.getGcmServices = () => null;
+  const task = {
+    itemKind: 'task',
+    line: 7,
+    checkboxState: '[ ]',
+    text: 'Formula task',
+    sourceText: 'Formula task [first:: 1] [second:: 2] [third:: 3] [fourth:: 4] [fifth:: 5] [sixth:: 6] [seventh:: Urgent] [eighth:: 7] [owner:: row] [kind:: project, task] [status:: relational] [blank:: ] [project:: [[Projects/Alpha]]]',
+    rawLine: '- [ ] Formula task [first:: 1] [second:: 2] [third:: 3] [fourth:: 4] [fifth:: 5] [sixth:: 6] [seventh:: Urgent] [eighth:: 7] [owner:: row] [kind:: project, task] [status:: relational] [blank:: ] [project:: [[Projects/Alpha]]] #work',
+    displayText: 'Formula task',
+    inlineFields: [
+      { key: 'first', value: '1' },
+      { key: 'second', value: '2' },
+      { key: 'third', value: '3' },
+      { key: 'fourth', value: '4' },
+      { key: 'fifth', value: '5' },
+      { key: 'sixth', value: '6' },
+      { key: 'seventh', value: 'Urgent' },
+      { key: 'eighth', value: '7' },
+      { key: 'owner', value: 'row' },
+      { key: 'kind', value: 'project, task' },
+      { key: 'status', value: 'relational' },
+    ],
+  };
+  return { KanbanView, view, file, frontmatter, task };
+}
+
+test('synthesized Kanban rows use the GCM formula session across context, dependencies, display, filters, lanes, sort, and search', async () => {
+  const formulaMock = createFormulaApiMock();
+  const lineMetadataMock = createLineMetadataApiMock();
+  const { view, file, task } = await createFormulaViewHarness({ formulasApi: formulaMock.api, lineMetadataApi: lineMetadataMock.api });
+  assert.deepEqual(
+    view.extractBaseFormulaDefinitions({ formulas: { score: ' number(eighth) * 2 ', empty: '', 'formula.prefixed': ' 1 ', invalid: 4 } }),
+    { score: 'number(eighth) * 2', empty: '', 'formula.prefixed': '1' },
+    'formula names remain exact and empty expressions reach the GCM compiler for visible validation',
+  );
+  const parsedFields = view.extractTaskInlineFields('[a:: 1] [b:: 2] [c:: 3] [d:: 4] [e:: 5] [f:: 6] [g:: 7] [h:: 8]');
+  assert.equal(parsedFields.length, 8, 'formula row context must not truncate after six inline fields');
+  const nestedFields = view.extractTaskInlineFields('- [ ] Nested [project:: [[Projects/Alpha]]] [blank:: ] [tags:: alpha, beta] #home');
+  assert.equal(nestedFields.find((field) => field.key === 'project')?.value, '[[Projects/Alpha]]');
+  assert.equal(nestedFields.find((field) => field.key === 'blank')?.value, '', 'blank properties remain distinct from missing properties');
+  const nestedTask = { itemKind: 'task', line: 1, text: 'Nested', inlineFields: nestedFields };
+  assert.deepEqual(view.getTaskInlineValues(nestedTask, 'tags').sort(), ['#alpha', '#beta', '#home']);
+  assert.deepEqual(lineMetadataMock.api.parseStringList('project'), ['project']);
+  assert.deepEqual(lineMetadataMock.api.parseStringList('project, task'), ['project', 'task']);
+  assert.deepEqual(lineMetadataMock.api.parseStringList('[project, task]'), ['project', 'task']);
+  assert.deepEqual(lineMetadataMock.api.parseStringList('Project, project, Project, '), ['Project', 'project']);
+  assert.deepEqual(lineMetadataMock.api.parseStringList('[[People/Doe, Jane]], project'), ['[[People/Doe, Jane]]', 'project']);
+  assert.equal(lineMetadataMock.api.readInlineFieldValue('[blank:: ]', 'blank'), '');
+  assert.equal(lineMetadataMock.api.readInlineFieldValue('[blank:: ]', 'missing'), null);
+
+  const parseCountBeforeRow = lineMetadataMock.getParseCount();
+  const derived = view.getTaskPropertyValue(file, task, 'formula.derived', new Set());
+  assert.equal(derived.text, '14-row-note');
+  assert.equal(derived.editable, false);
+  assert.equal(view.getTaskPropertyValue(file, task, 'formula.clock', new Set()).text, '2026-07-31 12:00:00');
+  const context = formulaMock.getLastContext();
+  assert.equal(context.row.owner, 'row', 'bare values must prefer synthesized-row fields');
+  assert.equal(context.note.owner, 'note', 'note namespace must retain source frontmatter');
+  assert.equal(context.row.line, 7, 'line numbers must remain 1-based');
+  assert.equal(context.row.status, 'relational', 'row.status remains the semantic inline field');
+  assert.equal(context.task.status, 'todo', 'task.status remains checkbox workflow state');
+  assert.equal(context.row.checkboxState, '[ ]', 'row.checkboxState preserves the raw checkbox marker');
+  assert.equal(context.task.checkboxState, '[ ]', 'task.checkboxState preserves the raw checkbox marker');
+  assert.equal(context.row.checkboxStatus, 'todo', 'row.checkboxStatus remains the normalized workflow status');
+  assert.equal(context.row.blank, '', 'blank canonical fields remain addressable');
+  assert.equal(context.row.project, '[[Projects/Alpha]]');
+  assert.deepEqual(context.row.kinds, ['task', 'project']);
+  assert.deepEqual(context.row.explicitKind, ['project', 'task']);
+  assert.deepEqual(context.row.tags, ['#work'], 'synthetic row tags use canonical #tag values');
+  assert.deepEqual(context.task.tags, ['#work'], 'task.tags matches the shared synthetic tag contract');
+  assert.equal(context.row.itemKind, 'task');
+  assert.equal(context.row.itemkind, 'task');
+  assert.equal(context.row.file, undefined, 'row.file is not a duplicate structural namespace');
+  assert.match(context.line.raw, /^- \[ \] Formula task/);
+  assert.deepEqual(context.file.tags, ['source'], 'file.tags uses canonical unprefixed metadata tags');
+  assert.equal(context.line.number, 7);
+  assert.equal(context.file.path, file.path);
+  assert.equal(context.now, view.formulaNow, 'all formula sessions in one render share one frozen now value');
+  assert.equal(view.createFormulaFileContext(file), view.createFormulaFileContext(file), 'one render reuses immutable source-file formula context');
+  assert.equal(lineMetadataMock.getParseCount(), parseCountBeforeRow + 1, 'one canonical parsed-line bundle is cached for every formula consumer on the row');
+  const caseTask = {
+    itemKind: 'task',
+    line: 12,
+    checkboxState: '[ ]',
+    text: 'Case aliases',
+    rawLine: '- [ ] Case aliases [Owner:: A] [owner:: B] [Project:: Alpha] [project:: Beta] [blank:: ]',
+    sourceText: 'Case aliases [Owner:: A] [owner:: B] [Project:: Alpha] [project:: Beta] [blank:: ]',
+    inlineFields: [],
+  };
+  const caseContext = view.createTaskFormulaContext(file, caseTask);
+  assert.deepEqual(caseContext.row.owner, ['A', 'B']);
+  assert.equal(caseContext.row.Owner, caseContext.row.owner, 'case aliases expose the same normalized aggregate instead of divergent exact values');
+  assert.deepEqual(caseContext.row.project, ['Alpha', 'Beta'], 'duplicate normalized inline aliases aggregate in source order');
+  assert.equal(caseContext.row.Project, caseContext.row.project);
+  assert.equal(caseContext.row.blank, '', 'blank duplicate-capable aliases remain present instead of becoming missing');
+
+  assert.equal(view.evaluateTaskFilterString('formula.flag', task, file), true, 'direct boolean formulas use the GCM expression session');
+  assert.equal(view.evaluateTaskFilterString('formula.lane == "Urgent"', task, file), true, 'string formula filters use the GCM expression session');
+  assert.equal(view.evaluateTaskFilterString('formula["Total Cost"] >= 14', task, file), true, 'computed formula references route through the GCM expression session');
+  assert.equal(view.evaluateTaskFilterString('formula.score >= 14', task, file), true);
+  assert.equal(view.evaluateTaskFilterString('formula.score > 14', task, file), false);
+  assert.equal(view.evaluateTaskFilterNode({ not: 'formula.score > 14' }, task, file), true);
+  assert.equal(view.evaluateTaskFilterObject({ property: 'formula.score', operator: '>=', value: 14 }, task, file), true);
+  assert.equal(view.evaluateTaskFilterObject({ property: 'formula.derived', operator: 'contains', value: 'row' }, task, file), true);
+  assert.equal(view.evaluateTaskFilterObject({ property: 'formula.Total Cost', operator: '>=', value: 14 }, task, file), true, 'object filters safely address formula names that require computed references');
+  assert.equal(view.evaluateTaskFilterObject({ property: 'formula.labels', operator: 'is', value: 'alpha' }, task, file), true, 'collection equality compares each typed formula member');
+  assert.equal(view.evaluateTaskFilterObject({ property: 'formula.labels', operator: '!is', value: 'gamma' }, task, file), true);
+  assert.equal(view.evaluateTaskFilterString('formula.emptyList', task, file), true, 'Bases formula truthiness follows JavaScript boolean coercion for plain lists');
+
+  view.getBaseFilterRoots = () => [{ or: ['kind == "task"', 'formula.bad'] }];
+  assert.equal(view.taskMatchesStructuredBaseFilters(task, file), true);
+  assert.equal(formulaMock.getExpressionCount('formula.bad'), 0, 'a true OR branch skips an unreachable formula error');
+  view.getBaseFilterRoots = () => [{ or: ['formula.bad', 'kind == "task"'] }];
+  assert.equal(view.taskMatchesStructuredBaseFilters(task, file), false, 'an evaluated formula error fails the row before later OR branches');
+  assert.equal(formulaMock.getExpressionCount('formula.bad'), 1);
+  view.getBaseFilterRoots = () => [{ and: ['kind == "note"', 'formula.bad'] }];
+  assert.equal(view.taskMatchesStructuredBaseFilters(task, file), false);
+  assert.equal(formulaMock.getExpressionCount('formula.bad'), 1, 'a false AND branch skips an unreachable formula error');
+  view.getBaseFilterRoots = () => [{ and: ['formula.bad', 'kind == "note"'] }];
+  assert.equal(view.taskMatchesStructuredBaseFilters(task, file), false);
+  assert.equal(formulaMock.getExpressionCount('formula.bad'), 2);
+  view.getBaseFilterRoots = () => [{ not: 'formula.bad' }];
+  assert.equal(view.taskMatchesStructuredBaseFilters(task, file), false, 'NOT cannot turn an evaluated formula failure into a match');
+  assert.equal(formulaMock.getExpressionCount('formula.bad'), 3);
+
+  assert.deepEqual(view.getTaskLaneIds(file, task, 'formula.lane'), ['key:urgent']);
+  const multiValueLaneIds = view.getTaskLaneIds(file, task, 'formula.labels');
+  assert.deepEqual(multiValueLaneIds, ['key:alpha', 'key:beta']);
+  const placement = { file, task, laneId: multiValueLaneIds[0] };
+  const placementsByLane = new Map([
+    [multiValueLaneIds[0], [placement]],
+    [multiValueLaneIds[1], [{ ...placement, laneId: multiValueLaneIds[1] }]],
+  ]);
+  assert.equal(view.countUniqueTaskRenderItems(placementsByLane), 1, 'multi-value formula lanes count one stable line entity');
+  assert.equal(view.dedupeTaskRenderItems(Array.from(placementsByLane.values()).flat()).length, 1, 'aliased display lanes render one card per line entity');
+  assert.deepEqual(view.getTaskLaneIds(file, task, 'formula.linkLane'), ['key:people/ada.md'], 'link formula grouping uses canonical paths, not display text');
+  assert.equal(view.createSyntheticGroupFromLaneId('key:urgent').key, 'Urgent', 'task-only formula lanes retain the API-formatted label');
+  assert.equal(view.taskMatchesSearchQuery(file, task, '14-row-note'), true);
+
+  const matchingStyle = {
+    active: true,
+    match: 'all',
+    conditions: [
+      { field: 'formula.score', operator: 'is', value: '14' },
+      { field: 'formula.clock', operator: 'is', value: '2026-07-31 12:00:00' },
+    ],
+    color: '#fff',
+  };
+  view.plugin.settings.cardStyleRules = [matchingStyle];
+  assert.equal(view.resolveTaskCardStyleRule(file, task, null), matchingStyle, 'style rules can consume formula values');
+
+  view.plugin.settings.cardStyleRules = [{
+    active: true,
+    match: 'any',
+    conditions: [
+      { field: 'status', operator: 'is', value: 'todo' },
+      { field: 'formula.bad', operator: '!exists', value: '' },
+    ],
+    color: '#000',
+  }];
+  const lazyAnyRule = view.plugin.settings.cardStyleRules[0];
+  const badEvaluationsBefore = formulaMock.getFormulaCount('bad');
+  assert.equal(view.resolveTaskCardStyleRule(file, task, null), lazyAnyRule, 'an earlier matching any-condition skips unreachable formula work');
+  assert.equal(formulaMock.getFormulaCount('bad'), badEvaluationsBefore);
+
+  const trueBoolean = view.getTaskPropertyValue(file, task, 'formula.flag', new Set());
+  assert.equal(trueBoolean.kind, 'formula-boolean');
+  assert.equal(trueBoolean.booleanValue, true);
+  const falseTask = {
+    ...task,
+    line: 10,
+    rawLine: task.rawLine.replace('[owner:: row]', '[owner:: other]'),
+    sourceText: task.sourceText.replace('[owner:: row]', '[owner:: other]'),
+    inlineFields: task.inlineFields.map((field) => field.key === 'owner' ? { ...field, value: 'other' } : field),
+    lineMetadata: undefined,
+  };
+  const falseBoolean = view.getTaskPropertyValue(file, falseTask, 'formula.flag', new Set());
+  assert.equal(falseBoolean.kind, 'formula-boolean');
+  assert.equal(falseBoolean.booleanValue, false, 'false formula values stay visible as unchecked read-only booleans');
+  assert.equal(view.getTaskPropertyValue(file, task, 'formula.emptyList', new Set()), null, 'empty formulas omit the property chip');
+  assert.equal(view.getTaskPropertyValue(file, task, 'formula.bad', new Set()).kind, 'formula-error', 'formula errors remain visibly distinct from empty values');
+
+  const bullet = {
+    ...task,
+    itemKind: 'bullet',
+    line: 11,
+    checkboxState: undefined,
+    text: 'Formula bullet',
+    sourceText: task.sourceText.replace('Formula task', 'Formula bullet'),
+    rawLine: task.rawLine.replace('- [ ] Formula task', '- Formula bullet'),
+    displayText: 'Formula bullet',
+    lineMetadata: undefined,
+  };
+  assert.equal(view.getTaskPropertyValue(file, bullet, 'formula.derived', new Set()).text, '14-row-note');
+  const bulletContext = formulaMock.getLastContext();
+  assert.equal(bulletContext.row.kind, 'bullet');
+  assert.equal(bulletContext.row.title, 'Formula bullet');
+  assert.equal(bulletContext.row.line, 11);
+  assert.equal(bulletContext.line.number, 11);
+  assert.equal(bulletContext.task, null, 'bullet rows expose line context without masquerading as checkbox tasks');
+  assert.equal(bulletContext.row.checkboxState, undefined, 'plain bullets do not synthesize checkbox aliases');
+  assert.equal(bulletContext.row.status, 'relational');
+  assert.equal(view.evaluateTaskFilterString('formula.flag', bullet, file), true);
+  assert.deepEqual(view.getTaskLaneIds(file, bullet, 'formula.lane'), ['key:urgent']);
+
+  const lowerTask = {
+    ...task,
+    line: 8,
+    rawLine: task.rawLine.replace('[eighth:: 7]', '[eighth:: 3]'),
+    sourceText: task.sourceText.replace('[eighth:: 7]', '[eighth:: 3]'),
+    inlineFields: task.inlineFields.map((field) => field.key === 'eighth' ? { ...field, value: '3' } : field),
+    lineMetadata: undefined,
+  };
+  view.config = { getSort: () => [{ property: 'formula.score', direction: 'desc' }] };
+  const sorted = view.sortTaskRenderItems([
+    { file, task: lowerTask, laneId: 'key:urgent' },
+    { file, task, laneId: 'key:urgent' },
+  ]);
+  assert.equal(sorted[0].task, task);
+  const taskOnlyMixedSorted = view.sortMixedLaneRenderItems([], [
+    { file, task: lowerTask, laneId: 'key:urgent' },
+    { file, task, laneId: 'key:urgent' },
+  ]);
+  assert.equal(taskOnlyMixedSorted[0].item.task, task, 'formula sort descriptors apply even when a lane contains only synthesized rows');
+  const unavailableTask = {
+    ...lowerTask,
+    line: 10,
+    rawLine: lowerTask.rawLine.replace('[owner:: row]', '[owner:: bad]'),
+    sourceText: lowerTask.sourceText.replace('[owner:: row]', '[owner:: bad]'),
+    inlineFields: lowerTask.inlineFields.map((field) => field.key === 'owner' ? { ...field, value: 'bad' } : field),
+    lineMetadata: undefined,
+  };
+  view.config = { getSort: () => [{ property: 'formula.conditional', direction: 'desc' }] };
+  assert.equal(view.sortTaskRenderItems([
+    { file, task: unavailableTask, laneId: 'key:urgent' },
+    { file, task, laneId: 'key:urgent' },
+  ])[0].task, task, 'failed formula sort values stay after available values even in descending order');
+  view.app.vault = {
+    getFileByPath: (path) => path === file.path ? file : null,
+  };
+  const statusResolver = view.getStatusForCheckboxState;
+  view.getStatusForCheckboxState = (state) => state === '[x]' ? 'complete' : 'todo';
+  view.shouldShowCompletedTasks = () => false;
+  view.getBaseFilterRoots = () => ['formula.flag'];
+  const doneTask = { ...task, checkboxState: '[x]', line: 13 };
+  const hiddenDoneFilter = view.getTaskRootFilterFromBaseFilters();
+  assert.equal(hiddenDoneFilter.hasFormulaFilter, true);
+  assert.equal(view.taskMatchesRootFilter(doneTask, hiddenDoneFilter, file), false, 'an unrelated formula filter cannot bypass completed-task visibility');
+  view.shouldShowCompletedTasks = () => true;
+  assert.equal(view.taskMatchesRootFilter(doneTask, view.getTaskRootFilterFromBaseFilters(), file), true);
+  view.getStatusForCheckboxState = statusResolver;
+  view.shouldShowCompletedTasks = () => false;
+  view.getBaseFilterRoots = () => ['formula.flag'];
+  view.getExplicitTaskSourceFiles = () => [];
+  view.getIndexedLineSourceFiles = () => [file];
+  view.isBaseFileFilterReady = () => true;
+  view.getActiveBasesSearchQuery = () => '';
+  view.getAllLineItemsForFile = () => [task];
+  const formulaOnlyTaskFilter = view.getTaskRootFilterFromBaseFilters();
+  assert.equal(formulaOnlyTaskFilter.hasTaskDirective, true);
+  assert.equal(view.shouldScanVaultForTaskFilters(formulaOnlyTaskFilter), true);
+  assert.equal(view.buildTaskRenderItemsByLane([], null, new Set(), formulaOnlyTaskFilter).get('ungrouped')?.length, 1, 'formula-only filters discover synthetic rows even when native note groups are empty');
+  assert.equal(formulaMock.getCompileCount(), 1, 'one authoritative Base definition compiles once across all task formula consumers');
+});
+
+test('formula API absence, version mismatch, formula errors, and unsupported operations fail visibly and closed', async () => {
+  globalThis.__KanbanFormulaNotices = [];
+  const missing = await createFormulaViewHarness({ formulasApi: null });
+  assert.deepEqual(missing.view.getTaskLaneIds(missing.file, missing.task, 'formula.lane'), ['ungrouped']);
+  assert.deepEqual(missing.view.getTaskLaneIds(missing.file, missing.task, 'formula.lane'), ['ungrouped']);
+  missing.view.getBaseFilterRoots = () => [{ not: 'formula.score == 14' }];
+  assert.equal(missing.view.taskMatchesStructuredBaseFilters(missing.task, missing.file), false);
+  assert.equal(missing.view.taskMatchesStructuredBaseFilters(missing.task, null), false, 'missing row context cannot be inverted into a passing formula filter');
+  assert.equal(missing.view.getTaskPropertyValue(missing.file, missing.task, 'formula.score', new Set()).text, '⚠ Formula');
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1, 'missing API diagnostics must be deduplicated');
+
+  globalThis.__KanbanFormulaNotices = [];
+  const incompatibleApi = { ...createFormulaApiMock().api, version: 2 };
+  const incompatible = await createFormulaViewHarness({ formulasApi: incompatibleApi });
+  incompatible.view.getBaseFilterRoots = () => ['formula.score == 14'];
+  assert.equal(incompatible.view.taskMatchesStructuredBaseFilters(incompatible.task, incompatible.file), false);
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1);
+  assert.match(globalThis.__KanbanFormulaNotices[0], /version 1 is required/i);
+
+  globalThis.__KanbanFormulaNotices = [];
+  const incompleteApi = { ...createFormulaApiMock().api };
+  delete incompleteApi.hasReference;
+  const incomplete = await createFormulaViewHarness({ formulasApi: incompleteApi });
+  incomplete.view.getBaseFilterRoots = () => ['formula.score == 14'];
+  assert.equal(incomplete.view.taskMatchesStructuredBaseFilters(incomplete.task, incomplete.file), false);
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1);
+  assert.match(globalThis.__KanbanFormulaNotices[0], /complete formula contract was not available/i);
+
+  for (const [label, hasReference] of [
+    ['throwing', () => { throw new Error('reference detector unavailable'); }],
+    ['invalid', () => 'yes'],
+  ]) {
+    globalThis.__KanbanFormulaNotices = [];
+    const unavailableApi = { ...createFormulaApiMock().api, hasReference };
+    const unavailable = await createFormulaViewHarness({ formulasApi: unavailableApi });
+    const computedReference = 'kind == "task" && formula["score"] > 1';
+    unavailable.view.getBaseFilterRoots = () => [computedReference];
+    assert.equal(
+      unavailable.view.taskMatchesStructuredBaseFilters(unavailable.task, unavailable.file),
+      false,
+      `${label} reference detection cannot admit a compound formula filter`,
+    );
+    unavailable.view.getBaseFilterRoots = () => [{ not: computedReference }];
+    assert.equal(
+      unavailable.view.taskMatchesStructuredBaseFilters(unavailable.task, unavailable.file),
+      false,
+      `${label} reference detection cannot be inverted by NOT`,
+    );
+    unavailable.view.getBaseFilterRoots = () => [{ or: ['kind == "task"', computedReference] }];
+    assert.equal(
+      unavailable.view.taskMatchesStructuredBaseFilters(unavailable.task, unavailable.file),
+      false,
+      `${label} reference detection cannot be bypassed by an earlier passing OR branch`,
+    );
+    assert.equal(globalThis.__KanbanFormulaNotices.length, 1, `${label} diagnostics are visible and deduplicated`);
+    assert.match(globalThis.__KanbanFormulaNotices[0], /formula reference/i);
+  }
+
+  globalThis.__KanbanFormulaNotices = [];
+  const broken = await createFormulaViewHarness();
+  assert.equal(broken.view.getTaskPropertyValue(broken.file, broken.task, 'formula.bad', new Set()).text, '⚠ Formula');
+  assert.deepEqual(broken.view.getTaskLaneIds(broken.file, broken.task, 'formula.unsupported'), ['ungrouped']);
+  broken.view.getBaseFilterRoots = () => ['formula.bad == true'];
+  assert.equal(broken.view.taskMatchesStructuredBaseFilters(broken.task, broken.file), false);
+  broken.view.getBaseFilterRoots = () => [{ property: 'formula.score', operator: 'matchesRegex', value: '^14$' }];
+  assert.equal(broken.view.taskMatchesStructuredBaseFilters(broken.task, broken.file), false, 'unknown object operators cannot silently degrade to equality');
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 4, 'one visible diagnostic is emitted per distinct formula failure route');
+  assert.match(globalThis.__KanbanFormulaNotices.at(-1), /not supported/i);
+  delete globalThis.__KanbanFormulaNotices;
+});
+
+test('recognized line fields reject unsupported object operators without equality or NOT fallbacks', async () => {
+  const { view, file, task } = await createFormulaViewHarness();
+  assert.equal(view.evaluateTaskFilterObject({ property: 'owner', operator: 'is', value: 'row' }, task, file), true);
+  assert.equal(view.evaluateTaskFilterObject({ property: 'owner', operator: 'contains', value: 'ow' }, task, file), true);
+  assert.equal(view.evaluateTaskFilterObject({ property: 'owner', operator: 'isNotEmpty' }, task, file), true);
+  assert.equal(view.evaluateTaskFilterObject({ property: 'owner', operator: 'notexists' }, task, file), false);
+  assert.equal(view.evaluateTaskFilterObject({ property: 'open', operator: 'is', value: false }, task, file), false);
+
+  globalThis.__KanbanFormulaNotices = [];
+  const unsupported = { property: 'owner', operator: 'matchesRegex', value: 'row' };
+  assert.equal(view.evaluateTaskFilterObject(unsupported, task, file), false, 'unknown positive operators never degrade to equality');
+  assert.equal(view.evaluateTaskFilterObject({ ...unsupported, operator: '!matchesRegex' }, task, file), false, 'unknown negated operators fail closed directly');
+  view.getBaseFilterRoots = () => [{ not: unsupported }];
+  assert.equal(view.taskMatchesStructuredBaseFilters(task, file), false, 'NOT cannot invert an unsupported operation into a match');
+  view.getBaseFilterRoots = () => [{ or: [unsupported, 'kind == "task"'] }];
+  assert.equal(view.taskMatchesStructuredBaseFilters(task, file), false, 'an evaluated unsupported branch fails the full structured row filter');
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1, 'unsupported-operator diagnostics are visible and deduplicated');
+  delete globalThis.__KanbanFormulaNotices;
+});
+
+test('public GCM capability handshake supports either load order and clears atomically on unload', async () => {
+  const bridge = await importGcmApiBridge();
+  const createWorkspace = () => {
+    const listeners = new Map();
+    return {
+      on(name, callback) {
+        const callbacks = listeners.get(name) ?? new Set();
+        callbacks.add(callback);
+        listeners.set(name, callbacks);
+        return () => callbacks.delete(callback);
+      },
+      trigger(name, payload) {
+        for (const callback of listeners.get(name) ?? []) callback(payload);
+      },
+    };
+  };
+  const createExactEvent = (api) => ({
+    source: 'tps-global-context-menu',
+    timestamp: 1,
+    available: true,
+    api,
+    formulasVersion: 1,
+    lineMetadataVersion: 1,
+    entityIndexVersion: 3,
+    taskLinesVersion: api?.taskLines?.version ?? null,
+    taskCheckboxesVersion: api?.taskCheckboxes?.version ?? null,
+  });
+  const api = {
+    formulas: createFormulaApiMock().api,
+    lineMetadata: createLineMetadataApiMock().api,
+    entityIndex: createEntityIndexApiMock(),
+  };
+
+  const providerFirstApp = { workspace: createWorkspace() };
+  providerFirstApp.workspace.on(bridge.TPS_GCM_API_CHANGED_EVENT, (event) => bridge.acceptGcmApiChanged(providerFirstApp, event));
+  providerFirstApp.workspace.on(bridge.TPS_GCM_API_REQUEST_EVENT, () => {
+    providerFirstApp.workspace.trigger(bridge.TPS_GCM_API_CHANGED_EVENT, createExactEvent(api));
+  });
+  bridge.requestGcmApi(providerFirstApp);
+  assert.equal(bridge.getGcmApi(providerFirstApp), api, 'a synchronous request recovers when the provider loaded first');
+
+  const consumerFirstApp = { workspace: createWorkspace() };
+  consumerFirstApp.workspace.on(bridge.TPS_GCM_API_CHANGED_EVENT, (event) => bridge.acceptGcmApiChanged(consumerFirstApp, event));
+  bridge.requestGcmApi(consumerFirstApp);
+  assert.equal(bridge.getGcmApi(consumerFirstApp), null, 'a request before provider load remains unavailable');
+  consumerFirstApp.workspace.trigger(bridge.TPS_GCM_API_CHANGED_EVENT, createExactEvent(api));
+  assert.equal(bridge.getGcmApi(consumerFirstApp), api, 'the provider install announcement recovers the waiting consumer');
+
+  consumerFirstApp.workspace.trigger(bridge.TPS_GCM_API_CHANGED_EVENT, {
+    source: 'tps-global-context-menu',
+    timestamp: 2,
+    available: false,
+    formulasVersion: null,
+    lineMetadataVersion: null,
+    entityIndexVersion: null,
+    taskLinesVersion: null,
+    taskCheckboxesVersion: null,
+  });
+  assert.equal(bridge.getGcmApi(consumerFirstApp), null, 'provider unload clears all cached capabilities');
+
+  const incompatibleEvent = { ...createExactEvent(api), entityIndexVersion: 2 };
+  consumerFirstApp.workspace.trigger(bridge.TPS_GCM_API_CHANGED_EVENT, incompatibleEvent);
+  assert.equal(bridge.getGcmApi(consumerFirstApp), null, 'a partial version mismatch rejects the complete capability snapshot');
+  assert.deepEqual(bridge.getGcmApiStatus(consumerFirstApp), {
+    available: true,
+    formulasVersion: 1,
+    lineMetadataVersion: 1,
+    entityIndexVersion: 2,
+    taskLinesVersion: null,
+    taskCheckboxesVersion: null,
+  });
+  assert.doesNotMatch(gcmApiSource, /app\s*as any\)\?\.plugins|getPlugin\?\.|plugins\?\.plugins/);
+});
+
+test('GCM API lifecycle events recover Kanban-first startup and invalidate reload caches', async () => {
+  const formulaMock = createFormulaApiMock();
+  const lineMetadataMock = createLineMetadataApiMock();
+  const harness = await createFormulaViewHarness({ formulasApi: null, lineMetadataApi: null });
+  const entityIndex = createEntityIndexApiMock();
+  harness.view.openTasksByPath = new Map([['stale', [harness.task]]]);
+  harness.view.allTasksByPath = new Map([['stale', [harness.task]]]);
+  harness.view.openTaskOverflowByPath = new Map([['stale', 1]]);
+  harness.view.taskReadsInFlight = new Map();
+  let refreshes = 0;
+  harness.view.refreshDebounced = () => { refreshes += 1; };
+
+  const activeApi = { formulas: formulaMock.api, lineMetadata: lineMetadataMock.api, entityIndex };
+  harness.view.handleGcmApiChanged({
+    source: 'tps-global-context-menu',
+    timestamp: 1,
+    available: true,
+    api: activeApi,
+    formulasVersion: 1,
+    lineMetadataVersion: 1,
+    entityIndexVersion: 3,
+  });
+  assert.equal(refreshes, 1);
+  assert.equal(harness.view.openTasksByPath.size, 0);
+  assert.equal(harness.view.evaluateTaskFilterString('formula.score == 14', harness.task, harness.file), true, 'Kanban-first startup recovers when GCM announces the exact API');
+
+  harness.view.handleGcmApiChanged({
+    source: 'tps-global-context-menu',
+    timestamp: 2,
+    available: false,
+    formulasVersion: null,
+    lineMetadataVersion: null,
+    entityIndexVersion: null,
+  });
+  assert.equal(refreshes, 2);
+  assert.equal(harness.view.evaluateTaskFilterString('formula.score == 14', harness.task, harness.file), null, 'GCM unload invalidates the prior compiled/session authority');
+  harness.view.handleGcmApiChanged({ source: 'someone-else', timestamp: 3, available: true, api: activeApi, formulasVersion: 1, lineMetadataVersion: 1, entityIndexVersion: 3 });
+  assert.equal(refreshes, 2, 'unrelated workspace events are ignored');
+
+  assert.match(viewSource, /registerEvent\(\(this\.app\.workspace as any\)\.on\(\s*TPS_GCM_API_CHANGED_EVENT/);
+  assert.match(viewSource, /requestGcmApi\(this\.app\)/);
+  assert.match(viewSource, /private handleGcmApiChanged/);
+});
+
+test('Entity Index v3 supplies exact task and bullet sources and follows add/remove revisions', async () => {
+  const { KanbanView } = await importKanbanView();
+  const TFile = globalThis.__KanbanTestTFile;
+  const makeFile = (path) => Object.assign(new TFile(), {
+    path,
+    name: path.split('/').at(-1),
+    basename: path.split('/').at(-1).replace(/\.md$/i, ''),
+    extension: 'md',
+  });
+  const first = makeFile('Inbox/First.md');
+  const removed = makeFile('Inbox/Removed.md');
+  const added = makeFile('Inbox/Added.md');
+  const headingOnly = makeFile('Inbox/Heading Only.md');
+  const files = new Map([first, removed, added, headingOnly].map((file) => [file.path, file]));
+  let revision = 1;
+  let records = [
+    { sourcePath: first.path, entityType: 'block', lineKind: 'task' },
+    { sourcePath: removed.path, entityType: 'block', lineKind: 'bullet' },
+    { sourcePath: headingOnly.path, entityType: 'block', lineKind: 'heading' },
+    { sourcePath: 'Inbox/Note.md', entityType: 'note' },
+  ];
+  const queries = [];
+  const callbacks = new Set();
+  let unsubscribed = 0;
+  const entityIndex = {
+    version: 3,
+    ensureReady: async () => { throw new Error('queryAsync owns readiness'); },
+    queryAsync: async (query) => { queries.push(query); return records; },
+    getRevision: () => revision,
+    onChanged(callback) {
+      callbacks.add(callback);
+      return () => { callbacks.delete(callback); unsubscribed += 1; };
+    },
+  };
+  const view = Object.create(KanbanView.prototype);
+  view.entityIndexLineSourceCache = null;
+  view.entityIndexLineSourceLoad = null;
+  view.entityIndexLineSourceGeneration = 0;
+  view.entityIndexRetryAttempts = 0;
+  view.entityIndexRetryTimer = null;
+  view.entityIndexReloadPending = false;
+  view.formulaDiagnostics = new Set();
+  view.isViewLoaded = true;
+  let refreshes = 0;
+  view.refreshDebounced = () => { refreshes += 1; };
+  view.app = {
+    vault: { getFileByPath: (path) => files.get(path) ?? null },
+  };
+  provideGcmProtocolApi(view, { entityIndex });
+
+  view.bindEntityIndexChangeListener();
+  assert.equal(view.getIndexedLineSourceFiles(), null, 'the first request stays not-ready instead of returning a partial snapshot');
+  await flushDeferredWork();
+  assert.deepEqual(queries, [{ entityTypes: ['block'], lineKinds: ['task', 'bullet'] }]);
+  assert.deepEqual(view.getIndexedLineSourceFiles().map((file) => file.path), [first.path, removed.path]);
+  assert.equal(refreshes, 1);
+
+  records = [
+    { sourcePath: added.path, entityType: 'block', lineKind: 'task' },
+    { sourcePath: first.path, entityType: 'block', lineKind: 'bullet' },
+  ];
+  revision += 1;
+  for (const callback of callbacks) callback(revision);
+  assert.equal(view.getIndexedLineSourceFiles(), null, 'a changed revision invalidates the whole prior source set');
+  await flushDeferredWork();
+  assert.deepEqual(view.getIndexedLineSourceFiles().map((file) => file.path), [added.path, first.path], 'new first sources appear and removed last sources disappear atomically');
+  assert.equal(queries.length, 2);
+
+  view.unbindEntityIndexChangeListener();
+  assert.equal(unsubscribed, 1);
+
+  globalThis.__KanbanFormulaNotices = [];
+  provideGcmProtocolApi(view, { entityIndex: { ...entityIndex, version: 2 } });
+  view.invalidateEntityIndexLineSources();
+  assert.equal(view.getIndexedLineSourceFiles(), null, 'the weaker published v2 contract is rejected');
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1);
+  assert.match(globalThis.__KanbanFormulaNotices[0], /version 3/i);
+  delete globalThis.__KanbanFormulaNotices;
+});
+
+test('Entity Index reads serialize event storms and retry transient failures with a hard terminal bound', async () => {
+  const { KanbanView } = await importKanbanView();
+  const TFile = globalThis.__KanbanTestTFile;
+  const file = Object.assign(new TFile(), {
+    path: 'Inbox/Indexed.md', name: 'Indexed.md', basename: 'Indexed', extension: 'md',
+  });
+  const callbacks = new Set();
+  const gates = [deferred(), deferred()];
+  let revision = 1;
+  let queryCalls = 0;
+  let activeQueries = 0;
+  let maxActiveQueries = 0;
+  const entityIndex = {
+    version: 3,
+    ensureReady: async () => {},
+    queryAsync: async () => {
+      const gate = gates[queryCalls];
+      queryCalls += 1;
+      activeQueries += 1;
+      maxActiveQueries = Math.max(maxActiveQueries, activeQueries);
+      try {
+        return await gate.promise;
+      } finally {
+        activeQueries -= 1;
+      }
+    },
+    getRevision: () => revision,
+    onChanged(callback) { callbacks.add(callback); return () => callbacks.delete(callback); },
+  };
+  const view = Object.create(KanbanView.prototype);
+  Object.assign(view, {
+    entityIndexLineSourceCache: null,
+    entityIndexLineSourceLoad: null,
+    entityIndexLineSourceGeneration: 0,
+    entityIndexReloadPending: false,
+    entityIndexRetryAttempts: 0,
+    entityIndexRetryTimer: null,
+    formulaDiagnostics: new Set(),
+    isViewLoaded: true,
+  });
+  view.refreshDebounced = () => {};
+  view.app = {
+    vault: { getFileByPath: (path) => path === file.path ? file : null },
+  };
+  provideGcmProtocolApi(view, { entityIndex });
+  view.bindEntityIndexChangeListener();
+  view.getIndexedLineSourceFiles();
+  await flushDeferredWork();
+  assert.equal(queryCalls, 1);
+  for (let index = 0; index < 12; index += 1) {
+    revision += 1;
+    for (const callback of callbacks) callback(revision);
+    view.getIndexedLineSourceFiles();
+  }
+  assert.equal(queryCalls, 1, 'an active provider query retains ownership during an event storm');
+  gates[0].resolve([{ sourcePath: file.path, entityType: 'block', lineKind: 'task' }]);
+  await flushDeferredWork();
+  assert.equal(queryCalls, 2, 'all invalidations collapse into one replacement query after settlement');
+  assert.equal(maxActiveQueries, 1);
+  gates[1].resolve([{ sourcePath: file.path, entityType: 'block', lineKind: 'task' }]);
+  await flushDeferredWork();
+  assert.deepEqual(view.getIndexedLineSourceFiles(), [file]);
+  view.unbindEntityIndexChangeListener();
+
+  const createRetryView = (queryAsync) => {
+    let retryRevision = 1;
+    const retryIndex = {
+      version: 3,
+      ensureReady: async () => {},
+      queryAsync,
+      getRevision: () => retryRevision,
+      onChanged: () => () => {},
+    };
+    const retryView = Object.create(KanbanView.prototype);
+    Object.assign(retryView, {
+      entityIndexLineSourceCache: null,
+      entityIndexLineSourceLoad: null,
+      entityIndexLineSourceGeneration: 0,
+      entityIndexReloadPending: false,
+      entityIndexRetryAttempts: 0,
+      entityIndexRetryTimer: null,
+      formulaDiagnostics: new Set(),
+      isViewLoaded: true,
+    });
+    retryView.getEntityIndexRetryDelayMs = () => 1;
+    retryView.getEntityIndexRetryMaxAttempts = () => 3;
+    retryView.refreshDebounced = () => {};
+    retryView.app = {
+      vault: { getFileByPath: (path) => path === file.path ? file : null },
+    };
+    provideGcmProtocolApi(retryView, { entityIndex: retryIndex });
+    return retryView;
+  };
+
+  let transientCalls = 0;
+  const transient = createRetryView(async () => {
+    transientCalls += 1;
+    if (transientCalls === 1) throw new Error('transient incomplete index');
+    return [{ sourcePath: file.path, entityType: 'block', lineKind: 'task' }];
+  });
+  transient.getIndexedLineSourceFiles();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  await flushDeferredWork();
+  assert.equal(transientCalls, 2);
+  assert.deepEqual(transient.getIndexedLineSourceFiles(), [file], 'a transient provider rejection recovers without unrelated activity');
+
+  let permanentCalls = 0;
+  const permanent = createRetryView(async () => {
+    permanentCalls += 1;
+    throw new Error('permanently incomplete index');
+  });
+  globalThis.__KanbanFormulaNotices = [];
+  permanent.getIndexedLineSourceFiles();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await flushDeferredWork();
+  assert.equal(permanentCalls, 3, 'permanent failures stop at the declared attempt bound');
+  assert.equal(permanent.entityIndexRetryAttempts, 3);
+  assert.equal(permanent.entityIndexRetryTimer, null);
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1, 'terminal exhaustion is visible once');
+  delete globalThis.__KanbanFormulaNotices;
+});
+
+test('native note formulas stay authoritative and formula properties can never become Kanban write targets', async () => {
+  const formulaMock = createFormulaApiMock();
+  const { view, file, frontmatter, task } = await createFormulaViewHarness({ formulasApi: formulaMock.api });
+  class PublicLinkValue {
+    static type = 'link';
+    constructor(path) { this.path = path; }
+  }
+  class PublicListValue {
+    static type = 'list';
+    constructor(values) { this.values = values; }
+    length() { return this.values.length; }
+    get(index) { return this.values[index]; }
+    isTruthy() { return Boolean(this.values); }
+  }
+  class PublicErrorValue {
+    static type = 'error';
+    toString() { return 'native formula error'; }
+  }
+  const nativeCalls = [];
+  const nativeEntry = {
+    file,
+    getValue(propId) {
+      nativeCalls.push(propId);
+      if (propId === 'formula.score') return 99;
+      if (propId === 'formula.labels') return new PublicListValue(['Alpha', new PublicLinkValue('People/Ada.md')]);
+      if (propId === 'formula.linkLane') return new PublicLinkValue('People/Ada.md');
+      return null;
+    },
+  };
+  assert.equal(view.getEntryValue(nativeEntry, 'formula.score'), 99);
+  assert.deepEqual(nativeCalls, ['formula.score']);
+  const nativeFormulaStyle = {
+    active: true,
+    match: 'all',
+    conditions: [{ field: 'formula.score', operator: 'is', value: '99' }],
+    color: '#fff',
+  };
+  view.plugin.settings.cardStyleRules = [nativeFormulaStyle];
+  assert.equal(view.resolveCardStyleRule(frontmatter, nativeEntry, null), nativeFormulaStyle, 'native formula styles read exact formula IDs from the Bases entry');
+
+  view.plugin.settings.cardStyleRules = [{
+    active: true,
+    match: 'all',
+    conditions: [{ field: 'formula.score', operator: '!exists', value: '' }],
+    color: '#000',
+  }];
+  assert.equal(view.resolveCardStyleRule(frontmatter, { file, getValue: () => { throw new Error('native formula failed'); } }, null), null, 'native formula read failures fail style rules closed');
+  assert.equal(view.resolveCardStyleRule(frontmatter, { file, getValue: () => new PublicErrorValue() }, null), null, 'public native ErrorValue results fail style rules closed');
+
+  view.data = { data: [nativeEntry] };
+  view.config = { groupBy: { property: 'formula.labels' } };
+  assert.equal(view.isLikelyListGroupingProperty('labels', 'formula.labels'), true);
+  assert.deepEqual(
+    view.groupEntriesByProperty([nativeEntry], 'formula.labels').map((group) => group.key),
+    ['Alpha', 'People/Ada.md'],
+    'native public ListValue members route through the exact GCM groupValues adapter before string conversion',
+  );
+  view.config = { groupBy: { property: 'formula.linkLane' } };
+  const nativeLinkGroup = view.groupEntriesByProperty([nativeEntry], 'formula.linkLane')[0];
+  assert.equal(view.getLaneId(nativeLinkGroup), view.getTaskLaneIds(file, task, 'formula.linkLane')[0], 'native and synthesized link values coalesce by canonical path');
+  const nativeGroup = { key: 'native', entries: [nativeEntry], hasKey: () => true };
+  view.data = { data: [nativeEntry], groupedData: [nativeGroup] };
+  view.app.vault = { getMarkdownFiles: () => { throw new Error('native note authority must not scan the vault'); } };
+  assert.deepEqual(view.getSourceGroupsForRender('formula.linkLane', false), [nativeGroup]);
+  assert.doesNotMatch(viewSource, /getFallbackNoteEntriesFromBaseFilters/, 'native Bases data is the sole note source');
+
+  view.config = { getSort: () => [{ property: 'formula.score', direction: 'asc' }] };
+  const mixedSorted = view.sortMixedLaneRenderItems(
+    [{ entry: nativeEntry }],
+    [{ file, task, laneId: 'ungrouped' }],
+  );
+  assert.equal(mixedSorted[0].kind, 'line', 'native notes and synthesized lines share the exact formula sort adapter');
+  const lowerNativeEntry = { file, getValue: (propId) => propId === 'formula.score' ? 10 : null };
+  const noteOnlySorted = view.sortMixedLaneRenderItems(
+    [{ entry: nativeEntry }, { entry: lowerNativeEntry }],
+    [],
+  );
+  assert.equal(noteOnlySorted[0].item.entry, lowerNativeEntry, 'formula sort descriptors apply even when a lane contains only native notes');
+  frontmatter.score = 12;
+  frontmatter['formula.score'] = 13;
+  assert.doesNotMatch(viewSource, /FALLBACK_BASES_ENTRY|createFallbackBasesEntry|getFallbackNoteValue|evaluateNoteFilter/, 'native Bases data must remain the sole note-query and note-formula authority');
+  assert.deepEqual(view.extractNoteFrontmatterDefaults({ property: 'formula.score', operator: '==', value: 99 }), {}, 'note creation never writes a same-name formula property');
+  assert.equal(view.inferTaskCreationDefaultsFromObject({ property: 'formula.score', operator: '==', value: 99 }), null, 'task creation never writes a same-name formula field');
+
+  view.config = { groupBy: { property: 'formula.lane' } };
+  assert.equal(view.getGroupByPropName(), null, 'formula lanes remain non-writable');
+  assert.equal(view.getGroupByPropId(null), 'formula.lane', 'formula lanes remain readable for synthesized rows');
+  view.config = { groupBy: { property: 'file.folder' } };
+  assert.equal(view.getGroupByPropId(null), null, 'formula support does not reinterpret other read-only group properties as task fields');
+  assert.equal(view.getTaskPropertyValue(file, task, 'formula.score', new Set()).editable, false);
+  assert.doesNotMatch(viewSource, /getFrontmatterPropNameFromId\([^)]*formula/i);
+  assert.match(viewSource, /const isReadOnlyFormulaLane = this\.isFormulaProperty\(taskGroupPropId\)/);
+  assert.match(viewSource, /headerAdd\.disabled = isReadOnlyFormulaLane/);
+  assert.match(viewSource, /addButton\.disabled = isReadOnlyFormulaLane/);
+  assert.match(viewSource, /Formula lane \(read-only\)/);
+});
+
+test('embedded formula definitions come only from one authoritative matching Base block', async () => {
+  const { KanbanView } = await importKanbanView();
+  const TFile = globalThis.__KanbanTestTFile;
+  const file = Object.assign(new TFile(), {
+    path: 'Inbox/Embedded Formula QA.md',
+    name: 'Embedded Formula QA.md',
+    basename: 'Embedded Formula QA',
+    extension: 'md',
+    stat: { mtime: 1 },
+  });
+  let content = '```base\nexact-empty\n```\n```base\nfallback-formulas\n```';
+  const parsedByMarker = {
+    'exact-empty': { match: 'exact', filters: null, formulas: {} },
+    'fallback-formulas': { match: 'fallback', filters: ['kind == task'], formulas: { borrowed: '1' } },
+    'exact-formulas': { match: 'exact', filters: ['kind == task'], formulas: { valid: '1' } },
+  };
+  globalThis.__KanbanParseYaml = (source) => parsedByMarker[String(source || '').trim()] || {};
+  globalThis.__KanbanFormulaNotices = [];
+  const view = Object.create(KanbanView.prototype);
+  view.app = { vault: { cachedRead: async () => content } };
+  view.embeddedBaseFilterCache = null;
+  view.embeddedBaseFiltersLoadingKey = null;
+  view.formulaDiagnostics = new Set();
+  view.refreshDebounced = () => {};
+  view.getBaseSourcePath = () => file.path;
+  view.getBaseFile = () => null;
+  view.getBaseContextFile = () => file;
+  view.getConfiguredBaseViewName = () => 'Formula board';
+  view.getEmbeddedKanbanBlockMatch = (parsed) => parsed.match || null;
+  view.extractBaseFileFilterRoots = (parsed) => ({ viewName: 'Formula board', viewNames: ['Formula board'], filters: parsed.filters });
+
+  assert.equal(view.isBaseFileFilterReady(), false, 'embedded definitions hold synthesized rows until the authoritative block is loaded');
+  await view.loadEmbeddedBaseFilters(file, 1, 'Formula board');
+  assert.equal(view.isBaseFileFilterReady(), true);
+  assert.deepEqual(view.embeddedBaseFilterCache.formulas, {}, 'an exact block without formulas cannot borrow them from a fallback block');
+  assert.equal(view.embeddedBaseFilterCache.filters, null, 'an exact block without filters cannot borrow fallback-block filters either');
+
+  content = '```base\nexact-empty\n```\n```base\nexact-formulas\n```';
+  await view.loadEmbeddedBaseFilters(file, 2, 'Formula board');
+  assert.deepEqual(view.embeddedBaseFilterCache.formulas, {}, 'multiple exact matches disable formula evaluation instead of choosing one');
+  assert.equal(view.embeddedBaseFilterCache.filters, null, 'ambiguous blocks disable filters and formulas together');
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1);
+  assert.match(globalThis.__KanbanFormulaNotices[0], /Multiple embedded Base definitions/i);
+
+  const older = deferred();
+  const newer = deferred();
+  let readIndex = 0;
+  view.app.vault.cachedRead = () => (readIndex++ === 0 ? older.promise : newer.promise);
+  const olderLoad = view.loadEmbeddedBaseFilters(file, 3, 'Formula board');
+  const newerLoad = view.loadEmbeddedBaseFilters(file, 4, 'Formula board');
+  newer.resolve('```base\nexact-formulas\n```');
+  await newerLoad;
+  older.resolve('```base\nfallback-formulas\n```');
+  await olderLoad;
+  assert.equal(view.embeddedBaseFilterCache.mtime, 4, 'a stale embedded read cannot overwrite a newer authoritative result');
+  assert.deepEqual(view.embeddedBaseFilterCache.formulas, { valid: '1' });
+  delete globalThis.__KanbanParseYaml;
+  delete globalThis.__KanbanFormulaNotices;
+});
+
+test('Base definition read failures remain not-ready and retry successfully after bounded backoff', async () => {
+  const { KanbanView } = await importKanbanView();
+  const TFile = globalThis.__KanbanTestTFile;
+  const directFile = Object.assign(new TFile(), {
+    path: 'QA.base', name: 'QA.base', basename: 'QA', extension: 'base', stat: { mtime: 1 },
+  });
+  const embeddedFile = Object.assign(new TFile(), {
+    path: 'Inbox/QA.md', name: 'QA.md', basename: 'QA', extension: 'md', stat: { mtime: 2 },
+  });
+  const view = Object.create(KanbanView.prototype);
+  view.baseFileFilterCache = null;
+  view.embeddedBaseFilterCache = null;
+  view.baseFileFiltersLoadingKey = null;
+  view.embeddedBaseFiltersLoadingKey = null;
+  view.formulaDiagnostics = new Set();
+  view.getBaseFilterRetryDelayMs = () => 0;
+  view.getConfiguredBaseViewName = () => 'QA';
+  view.getCurrentBaseViewName = () => 'QA';
+  view.extractBaseFileFilterRoots = (parsed) => ({ viewName: 'QA', viewNames: ['QA'], filters: parsed.filters || null });
+  view.getEmbeddedKanbanBlockMatch = () => 'exact';
+  let refreshes = 0;
+  view.refreshDebounced = () => { refreshes += 1; };
+  const attempts = new Map();
+  view.app = { vault: {
+    cachedRead: (file) => {
+      const count = (attempts.get(file.path) || 0) + 1;
+      attempts.set(file.path, count);
+      if (count === 1) return Promise.reject(new Error(`${file.path} transient failure`));
+      return Promise.resolve(file === directFile ? 'direct-success' : '```base\nembedded-success\n```');
+    },
+    getFileByPath: (path) => path === directFile.path ? directFile : path === embeddedFile.path ? embeddedFile : null,
+  } };
+  globalThis.__KanbanParseYaml = (source) => String(source).includes('success')
+    ? { formulas: { score: '1' } }
+    : {};
+
+  view.getBaseFile = () => directFile;
+  view.getBaseContextFile = () => null;
+  await view.loadBaseFileFilters(directFile, 1, 'QA');
+  assert.equal(view.baseFileFilterCache.errorAt > 0, true);
+  assert.equal(view.isBaseFileFilterReady(), false);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await flushDeferredWork();
+  assert.equal(view.baseFileFilterCache.errorAt, undefined);
+  assert.equal(view.isBaseFileFilterReady(), true);
+  assert.deepEqual(view.baseFileFilterCache.formulas, { score: '1' });
+  assert.equal(attempts.get(directFile.path), 2, 'direct recovery is autonomous');
+
+  view.getBaseFile = () => null;
+  view.getBaseContextFile = () => embeddedFile;
+  await view.loadEmbeddedBaseFilters(embeddedFile, 2, 'QA');
+  assert.equal(view.embeddedBaseFilterCache.errorAt > 0, true);
+  assert.equal(view.isBaseFileFilterReady(), false);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await flushDeferredWork();
+  assert.equal(view.embeddedBaseFilterCache.errorAt, undefined);
+  assert.equal(view.isBaseFileFilterReady(), true);
+  assert.deepEqual(view.embeddedBaseFilterCache.formulas, { score: '1' });
+  assert.equal(attempts.get(embeddedFile.path), 2, 'embedded recovery is autonomous');
+  assert.equal(refreshes, 2, 'formula-only successful authoritative reads repaint after an error');
+  delete globalThis.__KanbanParseYaml;
+});
+
+test('Base definition retry state is bounded and follows the newest exact snapshot', async () => {
+  const { KanbanView } = await importKanbanView();
+  const TFile = globalThis.__KanbanTestTFile;
+  const makeFile = (path, mtime) => Object.assign(new TFile(), {
+    path,
+    name: path.split('/').at(-1),
+    basename: path.split('/').at(-1).replace(/\.base$/i, ''),
+    extension: 'base',
+    stat: { mtime },
+  });
+  const persistentFile = makeFile('Persistent.base', 1);
+  const persistent = Object.create(KanbanView.prototype);
+  persistent.baseFileFilterCache = null;
+  persistent.baseFileFiltersLoadingKey = null;
+  persistent.baseFileFilterRetry = null;
+  persistent.getBaseFilterRetryDelayMs = () => 0;
+  persistent.getBaseFilterRetryMaxAttempts = () => 3;
+  persistent.getCurrentBaseViewName = () => 'QA';
+  persistent.extractBaseFileFilterRoots = () => ({ viewName: 'QA', viewNames: ['QA'], filters: null });
+  persistent.refreshDebounced = () => {};
+  let persistentReads = 0;
+  persistent.app = { vault: {
+    cachedRead: async () => { persistentReads += 1; throw new Error('still unavailable'); },
+    getFileByPath: (path) => path === persistentFile.path ? persistentFile : null,
+  } };
+  globalThis.__KanbanFormulaNotices = [];
+
+  await persistent.loadBaseFileFilters(persistentFile, 1, 'QA');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await flushDeferredWork();
+  assert.equal(persistentReads, 3);
+  assert.equal(persistent.baseFileFilterRetry?.attempts, 3);
+  assert.equal(persistent.baseFileFilterRetry?.exhausted, true);
+  assert.equal(persistent.baseFileFilterRetry?.timer, null);
+  assert.equal(globalThis.__KanbanFormulaNotices.length, 1, 'terminal retry exhaustion is visible once');
+
+  const oldFile = makeFile('Old.base', 2);
+  const currentFile = makeFile('Current.base', 3);
+  const moving = Object.create(KanbanView.prototype);
+  moving.baseFileFilterCache = null;
+  moving.baseFileFiltersLoadingKey = null;
+  moving.baseFileFilterRetry = null;
+  moving.getBaseFilterRetryDelayMs = () => 5;
+  moving.getCurrentBaseViewName = () => 'QA';
+  moving.extractBaseFileFilterRoots = (parsed) => ({ viewName: 'QA', viewNames: ['QA'], filters: parsed.filters || null });
+  moving.refreshDebounced = () => {};
+  const counts = new Map();
+  moving.app = { vault: {
+    cachedRead: async (file) => {
+      const count = (counts.get(file.path) || 0) + 1;
+      counts.set(file.path, count);
+      if (file === oldFile || count === 1) throw new Error('snapshot read failed');
+      return 'current-success';
+    },
+    getFileByPath: (path) => path === oldFile.path ? oldFile : path === currentFile.path ? currentFile : null,
+  } };
+  globalThis.__KanbanParseYaml = () => ({ formulas: { score: '1' } });
+
+  await moving.loadBaseFileFilters(oldFile, 2, 'QA');
+  await moving.loadBaseFileFilters(currentFile, 3, 'QA');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await flushDeferredWork();
+  assert.equal(counts.get(oldFile.path), 1, 'the superseded retry timer is canceled');
+  assert.equal(counts.get(currentFile.path), 2, 'the newest snapshot owns the retry');
+  assert.equal(moving.baseFileFilterCache.path, currentFile.path);
+  assert.equal(moving.baseFileFilterCache.errorAt, undefined);
+  assert.deepEqual(moving.baseFileFilterCache.formulas, { score: '1' });
+
+  delete globalThis.__KanbanParseYaml;
+  delete globalThis.__KanbanFormulaNotices;
 });

@@ -24,9 +24,25 @@ import {
   normalizeKanbanWritableTaskTag,
   parseKanbanLineItem,
 } from '../task-drop-utils';
-import { emitFilesUpdated, shouldForceBaseLinkPreview } from '../tps-gcm-api';
+import {
+  acceptGcmApiChanged,
+  emitFilesUpdated,
+  getGcmApi,
+  getGcmApiStatus,
+  getGcmEntityIndexApi,
+  getGcmFormulaApi,
+  getGcmLineMetadataApi,
+  getGcmTaskCheckboxesApi,
+  getGcmTaskLinesApi,
+  requestGcmApi,
+  shouldForceBaseLinkPreview,
+  TPS_FORMULA_API_VERSION,
+  TPS_GCM_API_CHANGED_EVENT,
+  TPS_ENTITY_INDEX_API_VERSION,
+  TPS_LINE_METADATA_API_VERSION,
+} from '../tps-gcm-api';
+import type { GcmApiChangedEvent, GcmEntityIndexApi, GcmFormulaApi, GcmFormulaResult, GcmFormulaSession, GcmLineMetadataApi, GcmParsedLineMetadata } from '../tps-gcm-api';
 import { flow, flowError, flowWarn } from '../logger';
-import { isBareSemanticKindFilter, parseBareSemanticKindExpression } from '../filter-kind-utils';
 import { composeEffectiveFilterRoots, extractPersistedFilterRoots } from '../base-filter-roots';
 import { getMarkdownIndentColumns } from '../task-indent-utils';
 
@@ -46,6 +62,10 @@ type TaskRenderItem = {
   laneId: string;
 };
 
+type MixedLaneRenderItem =
+  | { kind: 'note'; item: LaneRenderItem }
+  | { kind: 'line'; item: TaskRenderItem };
+
 type TpsSortDescriptor = {
   prop: string;
   direction: 'asc' | 'desc';
@@ -58,6 +78,7 @@ type TaskPropertyDisplay = {
   editable?: boolean;
   propName?: string;
   rawValue?: string;
+  booleanValue?: boolean;
 };
 
 type ActiveTaskPointerDrag = {
@@ -86,12 +107,21 @@ type KanbanRenderScrollState = {
 type KanbanTaskRootFilter = {
   mode: 'mixed' | 'notes' | 'tasks' | 'bullets';
   hasTaskDirective: boolean;
+  hasFormulaFilter: boolean;
+  mayMatchBullets: boolean;
   includeDone: boolean;
   statuses: Set<string>;
   excludeStatuses: Set<string>;
   tags: Set<string>;
   excludeTags: Set<string>;
 };
+
+type TaskFilterEvaluationState = {
+  formulaFailure: boolean;
+  unsupportedFailure: boolean;
+};
+
+type FormulaReferenceDetection = 'yes' | 'no' | 'unavailable';
 
 type DisplayLaneGroup = {
   id: string;
@@ -108,17 +138,49 @@ type OpenTaskSubitem = {
   parentLine?: number;
   checkboxState?: string;
   text: string;
+  sourceText?: string;
+  rawLine?: string;
+  lineMetadata?: GcmParsedLineMetadata;
   displayText?: string;
   inlineFields?: Array<{ key: string; value: string }>;
 };
 
-type TaskReadKind = 'tasks' | 'bullets';
+type TaskReadKind = 'lines';
 
 type TaskReadOwner = {
   key: string;
   kind: TaskReadKind;
   path: string;
   file: TFile;
+};
+
+type QueuedTaskRead = {
+  owner: TaskReadOwner;
+  run: () => Promise<void>;
+};
+
+type TaskReadFailure = TaskReadOwner & {
+  errorAt: number;
+  attempts: number;
+  exhausted: boolean;
+};
+
+type BaseFilterRetryState = {
+  key: string;
+  file: TFile;
+  path: string;
+  mtime: number;
+  viewName: string;
+  errorAt: number;
+  attempts: number;
+  exhausted: boolean;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
+type EntityIndexLineSourceCache = {
+  api: GcmEntityIndexApi;
+  revision: number;
+  paths: Set<string>;
 };
 
 type TaskDropPayload = {
@@ -149,6 +211,17 @@ type TaskCreationDefaults = {
   tags: Set<string>;
   excludedStatuses: Set<string>;
   excludedTags: Set<string>;
+};
+
+type FormulaDefinitions = Record<string, string>;
+
+type FormulaCompileCache = {
+  api: GcmFormulaApi;
+  definitions: FormulaDefinitions;
+  signature: string;
+  sourceId: string;
+  compiled: unknown;
+  revision: string;
 };
 
 type NoteCreationDefaults = {
@@ -477,12 +550,33 @@ export class KanbanView extends BasesView {
   private allTasksByPath = new Map<string, OpenTaskSubitem[]>();
   private openTaskOverflowByPath = new Map<string, number>();
   private taskReadsInFlight = new Map<string, TaskReadOwner>();
-  private baseFileFilterCache: { path: string; mtime: number; viewName: string; viewNames: string[]; filters: unknown[] | null } | null = null;
+  private taskReadQueue: QueuedTaskRead[] = [];
+  private activeTaskReadCount = 0;
+  private taskReadFailures = new Map<string, TaskReadFailure>();
+  private taskReadRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private taskReadExhaustionNotified = false;
+  private baseFileFilterCache: { path: string; mtime: number; viewName: string; viewNames: string[]; filters: unknown[] | null; formulas: FormulaDefinitions; errorAt?: number } | null = null;
   private baseFileFiltersLoadingKey: string | null = null;
-  private embeddedBaseFilterCache: { path: string; mtime: number; viewName: string; filters: unknown[] | null } | null = null;
+  private baseFileFilterRetry: BaseFilterRetryState | null = null;
+  private embeddedBaseFilterCache: { path: string; mtime: number; viewName: string; filters: unknown[] | null; formulas: FormulaDefinitions; errorAt?: number } | null = null;
   private embeddedBaseFiltersLoadingKey: string | null = null;
+  private embeddedBaseFilterRetry: BaseFilterRetryState | null = null;
   private baseFilterSignature = '';
   private baseFilterPollInterval: ReturnType<typeof window.setInterval> | null = null;
+  private formulaCompileCache: FormulaCompileCache | null = null;
+  private taskFormulaSessions = new WeakMap<OpenTaskSubitem, { revision: string; session: GcmFormulaSession }>();
+  private formulaFileContexts = new Map<TFile, Record<string, unknown>>();
+  private formulaThisValueCache: Record<string, unknown> | null | undefined;
+  private formulaLaneLabels = new Map<string, string>();
+  private formulaDiagnostics = new Set<string>();
+  private formulaNow: Date | undefined;
+  private entityIndexLineSourceCache: EntityIndexLineSourceCache | null = null;
+  private entityIndexLineSourceLoad: Promise<void> | null = null;
+  private entityIndexLineSourceGeneration = 0;
+  private entityIndexUnsubscribe: (() => void) | null = null;
+  private entityIndexReloadPending = false;
+  private entityIndexRetryAttempts = 0;
+  private entityIndexRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private isViewLoaded = false;
   private renderGeneration = 0;
   private wheelHandlerTarget: HTMLElement | null = null;
@@ -575,8 +669,8 @@ export class KanbanView extends BasesView {
   private inferPriorityCreationModeFromFilterNode(node: unknown): TaskCreationDefaults['mode'] | null {
     if (!node) return null;
     if (typeof node === 'string') {
-      if (parseBareSemanticKindExpression(node)) return 'notes';
-      const match = node.trim().match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=|is|equals?)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
+      if (this.parseAdditiveKindExpression(node)) return 'mixed';
+      const match = node.trim().match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind)\s*(?:==|=|is|equals?)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
       const value = String(match?.[1] || '').toLowerCase();
       return value.startsWith('task') ? 'tasks'
         : value.startsWith('bullet') ? 'bullets'
@@ -607,9 +701,9 @@ export class KanbanView extends BasesView {
     }
     const propRaw = String(record.property ?? record.field ?? '').trim();
     const values = this.readFilterObjectValues(record);
-    if (isBareSemanticKindFilter(propRaw, values)) return 'notes';
+    if (this.isAdditiveKindProperty(propRaw) && values.length) return 'mixed';
     const normalizedProp = this.normalizeInlinePropertyKey(propRaw.replace(/^(?:tps|kanban)\./i, ''));
-    if (!['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) return null;
+    if (!['itemtype', 'itemkind'].includes(normalizedProp)) return null;
     const value = String(values[0] || '').trim().toLowerCase();
     return value.startsWith('task') ? 'tasks'
       : value.startsWith('bullet') ? 'bullets'
@@ -650,19 +744,7 @@ export class KanbanView extends BasesView {
   }
 
   private getGcmApi(): any {
-    return this.getGcmPlugin()?.api || this.getGcmPlugin() || null;
-  }
-
-  private getGcmPlugin(): any {
-    if (this.plugin?.gcmPlugin) return this.plugin.gcmPlugin;
-    const plugins = (this.app as any)?.plugins;
-    return (
-      plugins?.getPlugin?.('tps-global-context-menu') ||
-      plugins?.plugins?.['tps-global-context-menu'] ||
-      plugins?.getPlugin?.('TPS-Global-Context-Menu (Dev)') ||
-      plugins?.plugins?.['TPS-Global-Context-Menu (Dev)'] ||
-      null
-    );
+    return getGcmApi(this.app);
   }
 
   private getGcmServices(): any {
@@ -681,84 +763,22 @@ export class KanbanView extends BasesView {
     return this.app.fileManager.processFrontMatter(file, mutator);
   }
 
-  private openTaskLineContextMenu(evt: MouseEvent, fallbackPath?: string | null, fallbackLine?: number | null): boolean {
-    const plugin = this.getGcmPlugin();
-    const contextTargetService = plugin?.contextTargetService || this.getGcmApi()?.contextTargetService;
-    const taskLineContextMenuService = plugin?.taskLineContextMenuService || this.getGcmApi()?.taskLineContextMenuService;
-    if (typeof taskLineContextMenuService?.handleContextMenu !== 'function') {
-      return false;
-    }
-
-    if (!evt) {
-      return false;
-    }
-
-    const rawTarget = evt.target instanceof HTMLElement
-      ? evt.target
-      : evt.currentTarget instanceof HTMLElement
-        ? evt.currentTarget
-        : null;
-
-    const rootTarget = rawTarget
-      ? rawTarget.closest<HTMLElement>([
-          '.tps-kanban-card-task[data-task-path][data-task-line]',
-          '.tps-kanban-task-card[data-task-path][data-task-line]',
-          '[data-task-path][data-task-line][data-tps-gcm-context="kanban-task"]',
-          '[data-tps-gcm-context="kanban-task"]',
-        ].join(', '))
-      : null;
-
-    if (typeof contextTargetService?.recordContextTarget === 'function') {
-      if (rootTarget) {
-        contextTargetService.recordContextTarget(rootTarget);
-      } else if (typeof fallbackLine === 'number' && fallbackPath) {
-        const line = Number(fallbackLine);
-        const expectedLine = String(Math.max(1, Math.floor(line) + 1));
-        const escapedPath = (typeof CSS !== 'undefined' && typeof CSS.escape === 'function')
-          ? CSS.escape(fallbackPath)
-          : fallbackPath.replace(/"/g, '\\"');
-        const selector = [
-          `.tps-kanban-card-task[data-task-path="${escapedPath}"][data-task-line="${expectedLine}"]`,
-          `.tps-kanban-task-card[data-task-path="${escapedPath}"][data-task-line="${expectedLine}"]`,
-          `[data-task-path="${escapedPath}"][data-task-line="${expectedLine}"][data-tps-gcm-context="kanban-task"]`,
-          `[data-task-path="${escapedPath}"][data-task-line="${expectedLine}"]`,
-        ].join(', ');
-        const fallbackTarget = this.containerEl.querySelector<HTMLElement>(selector);
-        if (fallbackTarget) {
-          contextTargetService.recordContextTarget(fallbackTarget);
-        }
-      }
-    }
-
-    return taskLineContextMenuService.handleContextMenu(evt);
+  private openTaskLineContextMenu(evt: MouseEvent): boolean {
+    if (!evt) return false;
+    const taskLines = getGcmTaskLinesApi(this.app);
+    return taskLines ? taskLines.handleContextMenu(evt) : false;
   }
 
   private openTaskQuickEditor(event: Event, taskEl: HTMLElement, sourceEl: HTMLElement | null = taskEl): boolean {
-    const plugin = this.getGcmPlugin();
-    const service = plugin?.taskLineContextMenuService || this.getGcmApi()?.taskLineContextMenuService;
-    if (typeof service?.openQuickEditorForElement !== 'function') return false;
+    const taskLines = getGcmTaskLinesApi(this.app);
+    if (!taskLines) return false;
     event.preventDefault();
     event.stopPropagation();
     if ('stopImmediatePropagation' in event && typeof event.stopImmediatePropagation === 'function') {
       event.stopImmediatePropagation();
     }
-    void service.openQuickEditorForElement(taskEl, sourceEl);
+    void taskLines.openQuickEditorForElement(taskEl, sourceEl);
     return true;
-  }
-
-  private getGcmSettings(): any {
-    const plugin = this.getGcmPlugin();
-    return plugin?.settings || this.getGcmApi()?.settings || null;
-  }
-
-  private recordGcmContextTarget(target: EventTarget | null): void {
-    const targetEl = target instanceof HTMLElement ? target : null;
-    if (!targetEl) return;
-    const plugin = this.getGcmPlugin();
-    const service = plugin?.contextTargetService || this.getGcmApi()?.contextTargetService;
-    if (typeof service?.recordContextTarget === 'function') {
-      service.recordContextTarget(targetEl);
-    }
   }
 
   private getDefaultCheckboxMappings(): Array<{ checkboxState: string; statuses: string[]; toggleTargetStatus?: string; icon?: string; label?: string }> {
@@ -772,10 +792,9 @@ export class KanbanView extends BasesView {
   }
 
   private getGcmCheckboxMappings(): Array<{ checkboxState: string; statuses: string[]; toggleTargetStatus?: string; icon?: string; label?: string }> {
-    const configured = this.getGcmSettings()?.linkedSubitemCheckboxMappings;
-    const source = Array.isArray(configured) && configured.length > 0
-      ? configured
-      : this.getDefaultCheckboxMappings();
+    const taskCheckboxes = getGcmTaskCheckboxesApi(this.app);
+    const configured = taskCheckboxes?.getMappings();
+    const source = Array.isArray(configured) && configured.length > 0 ? configured : this.getDefaultCheckboxMappings();
     return source
       .map((entry: any) => ({
         checkboxState: this.normalizeCheckboxState(String(entry?.checkboxState || '[ ]')),
@@ -833,11 +852,6 @@ export class KanbanView extends BasesView {
     const directFile = this.getRuntimeBaseFile();
     if (directFile) return directFile.path;
 
-    const activeFile = this.app.workspace.getActiveFile?.();
-    if (this.isEmbeddedKanbanContext() && activeFile instanceof TFile && activeFile.extension === 'md') {
-      return activeFile.path;
-    }
-
     const embeddedMarkdownContext = this.getWorkspaceLeafMarkdownContextPath();
     if (embeddedMarkdownContext) return embeddedMarkdownContext;
 
@@ -851,7 +865,6 @@ export class KanbanView extends BasesView {
       queryController?.currentFile?.path,
       (this as any)?.file?.path,
       this.getWorkspaceLeafBasePath(),
-      this.getActiveWorkspaceBasePath(),
     ].find((value) => typeof value === 'string' && value.length > 0);
     return sourcePath ?? null;
   }
@@ -976,8 +989,6 @@ export class KanbanView extends BasesView {
         (leaf.view as any)?.getState?.()?.file,
         state?.state?.file,
         state?.file,
-        this.resolveBasePathFromName((leaf as any)?.getDisplayText?.()),
-        this.resolveBasePathFromName((leaf.view as any)?.getDisplayText?.()),
       ].find((value) => typeof value === 'string' && value.endsWith('.base'));
       if (path) found = path;
     });
@@ -1010,51 +1021,6 @@ export class KanbanView extends BasesView {
     return found;
   }
 
-  private getActiveWorkspaceBasePath(): string | null {
-    const activeFile = this.app.workspace.getActiveFile?.();
-    if (activeFile instanceof TFile && (activeFile.extension === 'base' || activeFile.path.endsWith('.base'))) return activeFile.path;
-    const activeLeaf: any = this.app.workspace.activeLeaf || this.app.workspace.getMostRecentLeaf?.();
-    const candidates = [
-      activeLeaf?.view?.file?.path,
-      activeLeaf?.getViewState?.()?.state?.file,
-      activeLeaf?.getViewState?.()?.file,
-      this.resolveBasePathFromName(activeLeaf?.getDisplayText?.()),
-      this.resolveBasePathFromName(activeLeaf?.view?.getDisplayText?.()),
-      this.resolveBasePathFromDomTitle(),
-      this.resolveBasePathFromDocumentTitle(),
-    ];
-    return candidates.find((value) => typeof value === 'string' && value.endsWith('.base')) ?? null;
-  }
-
-  private resolveBasePathFromDomTitle(): string | null {
-    const leafEl = this.containerEl?.closest('.workspace-leaf') as HTMLElement | null;
-    if (!leafEl) return null;
-    const selectors = [
-      '.view-header-title',
-      '.workspace-tab-header.is-active .workspace-tab-header-inner-title',
-      '.workspace-tab-header-inner-title',
-      '[data-path$=".base"]',
-      'input',
-      '[contenteditable="true"]',
-    ];
-    for (const selector of selectors) {
-      for (const el of Array.from(leafEl.querySelectorAll<HTMLElement>(selector))) {
-        const text = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement
-          ? el.value
-          : el.getAttribute('data-path') || el.textContent || '';
-        const path = this.resolveBasePathFromName(text);
-        if (path) return path;
-      }
-    }
-    return null;
-  }
-
-  private resolveBasePathFromDocumentTitle(): string | null {
-    const title = String(this.containerEl?.ownerDocument?.title || '').trim();
-    if (!title) return null;
-    return this.resolveBasePathFromName(title.split(' - ')[0]);
-  }
-
   private resolveBasePathFromName(rawName: unknown): string | null {
     const name = String(rawName ?? '').trim();
     if (!name) return null;
@@ -1076,13 +1042,17 @@ export class KanbanView extends BasesView {
     if (
       this.baseFileFilterCache?.path === file.path
       && this.baseFileFilterCache.mtime === mtime
+      && !this.baseFileFilterCache.errorAt
       && (!viewName || this.baseFileFilterCache.viewName === viewName)
     ) {
       return this.baseFileFilterCache.filters;
     }
 
     void this.loadBaseFileFilters(file, mtime, viewName);
-    return this.baseFileFilterCache?.path === file.path && (!viewName || this.baseFileFilterCache.viewName === viewName)
+    return this.baseFileFilterCache?.path === file.path
+      && this.baseFileFilterCache.mtime === mtime
+      && !this.baseFileFilterCache.errorAt
+      && (!viewName || this.baseFileFilterCache.viewName === viewName)
       ? this.baseFileFilterCache.filters
       : null;
   }
@@ -1090,11 +1060,14 @@ export class KanbanView extends BasesView {
   private async loadBaseFileFilters(file: TFile, mtime = Number(file.stat?.mtime || 0), viewName = this.getCurrentBaseViewName()): Promise<void> {
     const loadingKey = `${file.path}:${mtime}:${viewName}`;
     if (this.baseFileFiltersLoadingKey === loadingKey) return;
+    if (this.shouldDeferBaseFilterRead('direct', loadingKey)) return;
     this.baseFileFiltersLoadingKey = loadingKey;
     try {
       const content = await this.app.vault.cachedRead(file);
+      if (this.baseFileFiltersLoadingKey !== loadingKey) return;
       const parsed = parseYaml(content) as Record<string, unknown> | null | undefined;
       const extracted = this.extractBaseFileFilterRoots(parsed, viewName);
+      const formulas = this.extractBaseFormulaDefinitions(parsed);
       const previous = this.baseFileFilterCache;
       this.baseFileFilterCache = {
         path: file.path,
@@ -1102,19 +1075,31 @@ export class KanbanView extends BasesView {
         viewName: extracted.viewName,
         viewNames: extracted.viewNames,
         filters: extracted.filters,
+        formulas,
       };
-      if (previous?.path !== file.path || previous?.mtime !== mtime || previous?.viewName !== extracted.viewName || previous?.filters !== extracted.filters) {
+      this.clearBaseFileFilterRetryTimer();
+      if (
+        previous?.path !== file.path
+        || previous?.mtime !== mtime
+        || previous?.viewName !== extracted.viewName
+        || previous?.filters !== extracted.filters
+        || !!previous?.errorAt
+        || this.getFormulaDefinitionsSignature(previous?.formulas ?? {}) !== this.getFormulaDefinitionsSignature(formulas)
+      ) {
         flow('BaseFilters', 'loaded', {
           path: file.path,
           viewName: extracted.viewName,
           viewCount: extracted.viewNames.length,
           filterRoots: extracted.filters?.length || 0,
+          formulas: Object.keys(this.baseFileFilterCache.formulas).length,
         });
         this.refreshDebounced();
       }
     } catch (error) {
+      if (this.baseFileFiltersLoadingKey !== loadingKey) return;
       flowError('BaseFilters', 'read-failed', error, { path: file.path, viewName });
-      this.baseFileFilterCache = { path: file.path, mtime, viewName, viewNames: [], filters: null };
+      this.baseFileFilterCache = { path: file.path, mtime, viewName, viewNames: [], filters: null, formulas: {}, errorAt: Date.now() };
+      this.recordBaseFilterReadFailure('direct', file, mtime, viewName);
     } finally {
       if (this.baseFileFiltersLoadingKey === loadingKey) this.baseFileFiltersLoadingKey = null;
     }
@@ -1125,6 +1110,30 @@ export class KanbanView extends BasesView {
     fallbackViewName = this.getCurrentBaseViewName(),
   ): { viewName: string; viewNames: string[]; filters: unknown[] | null } {
     return extractPersistedFilterRoots(parsed, fallbackViewName, new Set([KANBAN_VIEW_TYPE, 'tps-kanban']));
+  }
+
+  private extractBaseFormulaDefinitions(parsed: Record<string, unknown> | null | undefined): FormulaDefinitions {
+    if (!parsed?.formulas || typeof parsed.formulas !== 'object' || Array.isArray(parsed.formulas)) return {};
+    const formulas: FormulaDefinitions = {};
+    for (const [name, expression] of Object.entries(parsed.formulas as Record<string, unknown>)) {
+      const normalizedName = String(name || '').trim();
+      if (!normalizedName || typeof expression !== 'string') continue;
+      Object.defineProperty(formulas, normalizedName, {
+        value: expression.trim(),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return formulas;
+  }
+
+  private getFormulaDefinitionsSignature(definitions: FormulaDefinitions): string {
+    return JSON.stringify(
+      Object.keys(definitions)
+        .sort()
+        .map((name) => [name, definitions[name]]),
+    );
   }
 
   private getCurrentBaseViewName(knownViewNames?: Set<string>): string {
@@ -1187,9 +1196,11 @@ export class KanbanView extends BasesView {
 
     this.registerEvent(this.app.vault.on('modify', (file) => {
       if (!(file instanceof TFile)) return;
+      this.invalidateEntityIndexLineSources();
       if (file.path === this.getBaseSourcePath()) {
         this.baseFileFilterCache = null;
         this.embeddedBaseFilterCache = null;
+        this.clearBaseFilterRetryTimers();
         this.refreshDebounced();
         return;
       }
@@ -1205,6 +1216,7 @@ export class KanbanView extends BasesView {
 
     this.registerEvent(this.app.vault.on('create', (file) => {
       if (!(file instanceof TFile)) return;
+      this.invalidateEntityIndexLineSources();
       this.clearTaskCachesForPath(file.path);
       this.refreshDebounced();
       this.queuePostCreateRefresh();
@@ -1212,6 +1224,7 @@ export class KanbanView extends BasesView {
 
     // Keep board stable through file lifecycle changes while this view is open.
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+      this.invalidateEntityIndexLineSources();
       if (file instanceof TFile) {
         this.clearTaskCachesForPath(oldPath);
         this.clearTaskCachesForPath(file.path);
@@ -1221,6 +1234,7 @@ export class KanbanView extends BasesView {
       this.refreshDebounced();
     }));
     this.registerEvent(this.app.vault.on('delete', (file) => {
+      this.invalidateEntityIndexLineSources();
       if (!(file instanceof TFile)) {
         this.clearAllTaskCaches();
         this.refreshDebounced();
@@ -1252,6 +1266,12 @@ export class KanbanView extends BasesView {
       this.activeNotePath = nextPath;
       this.syncSelectionClasses();
     }));
+    this.registerEvent((this.app.workspace as any).on(
+      TPS_GCM_API_CHANGED_EVENT,
+      (event: GcmApiChangedEvent) => this.handleGcmApiChanged(event),
+    ));
+    requestGcmApi(this.app);
+    this.register(() => this.unbindEntityIndexChangeListener());
     this.baseFilterSignature = this.getBaseFilterSignature();
     this.baseFilterPollInterval = window.setInterval(() => {
       const nextSignature = this.getBaseFilterSignature();
@@ -1318,11 +1338,41 @@ export class KanbanView extends BasesView {
       window.clearInterval(this.baseFilterPollInterval);
       this.baseFilterPollInterval = null;
     }
+    this.clearBaseFilterRetryTimers();
+    this.clearEntityIndexRetry();
+    this.unbindEntityIndexChangeListener();
     // Do not clear the root scroll element; Bases controls this container's lifecycle.
     // Clearing it here can leave the view blank when switching away and back.
     this.containerEl?.empty();
   }
   onResize(): void {}
+
+  private acceptGcmApiEvent(event: GcmApiChangedEvent): boolean {
+    return acceptGcmApiChanged(this.app, event);
+  }
+
+  private handleGcmApiChanged(event: GcmApiChangedEvent): void {
+    if (!this.acceptGcmApiEvent(event)) return;
+    this.formulaCompileCache = null;
+    this.taskFormulaSessions = new WeakMap();
+    this.formulaFileContexts.clear();
+    this.formulaThisValueCache = undefined;
+    this.formulaLaneLabels.clear();
+    this.formulaDiagnostics.clear();
+    this.formulaNow = undefined;
+    this.invalidateEntityIndexLineSources();
+    this.bindEntityIndexChangeListener();
+    this.clearAllTaskCaches();
+    flow('GcmApi', 'changed', {
+      available: event.available,
+      formulasVersion: event.formulasVersion,
+      lineMetadataVersion: event.lineMetadataVersion,
+      entityIndexVersion: event.entityIndexVersion,
+      taskLinesVersion: event.taskLinesVersion ?? null,
+      taskCheckboxesVersion: event.taskCheckboxesVersion ?? null,
+    });
+    this.refreshDebounced();
+  }
 
   private setMobileUiHiddenClass(className: string, hidden: boolean): void {
     if (!Platform.isMobile) return;
@@ -1882,6 +1932,7 @@ export class KanbanView extends BasesView {
   }
 
   private clearTaskCachesForPath(path: string): void {
+    this.taskReadFailures ??= new Map<string, TaskReadFailure>();
     this.openTasksByPath.delete(path);
     this.allTasksByPath.delete(path);
     this.allTasksByPath.delete(`${path}:bullets`);
@@ -1889,13 +1940,27 @@ export class KanbanView extends BasesView {
     for (const [key, owner] of this.taskReadsInFlight) {
       if (owner.path === path) this.taskReadsInFlight.delete(key);
     }
+    this.taskReadQueue = (this.taskReadQueue ?? []).filter((queued) => queued.owner.path !== path);
+    for (const [key, failure] of this.taskReadFailures) {
+      if (failure.path === path) this.taskReadFailures.delete(key);
+    }
+    this.taskReadExhaustionNotified = Array.from(this.taskReadFailures.values()).some((failure) => failure.exhausted);
+    this.rescheduleTaskReadRetry();
   }
 
   private clearAllTaskCaches(): void {
+    this.taskReadFailures ??= new Map<string, TaskReadFailure>();
     this.openTasksByPath.clear();
     this.allTasksByPath.clear();
     this.openTaskOverflowByPath.clear();
     this.taskReadsInFlight.clear();
+    this.taskReadQueue = [];
+    this.taskReadFailures.clear();
+    this.taskReadExhaustionNotified = false;
+    if (this.taskReadRetryTimer) {
+      globalThis.clearTimeout(this.taskReadRetryTimer);
+      this.taskReadRetryTimer = null;
+    }
   }
 
   private getTaskReadKey(kind: TaskReadKind, path: string): string {
@@ -1904,9 +1969,21 @@ export class KanbanView extends BasesView {
 
   private claimTaskRead(kind: TaskReadKind, file: TFile, path: string): TaskReadOwner | null {
     if (!this.isViewLoaded) return null;
+    this.taskReadFailures ??= new Map<string, TaskReadFailure>();
     const key = this.getTaskReadKey(kind, path);
     const existing = this.taskReadsInFlight.get(key);
     if (existing?.file === file && existing.path === path) return null;
+    const failure = this.taskReadFailures.get(key);
+    if (failure) {
+      if (failure.file !== file || failure.path !== path) {
+        this.taskReadFailures.delete(key);
+      } else if (failure.exhausted) {
+        return null;
+      } else if (Date.now() - failure.errorAt < this.getTaskReadRetryDelayMs(failure.attempts)) {
+        this.scheduleTaskReadRetry();
+        return null;
+      }
+    }
     const owner = { key, kind, path, file };
     this.taskReadsInFlight.set(key, owner);
     return owner;
@@ -1926,78 +2003,158 @@ export class KanbanView extends BasesView {
     return true;
   }
 
-  private hasTaskReadsInFlight(kind: TaskReadKind): boolean {
-    for (const owner of this.taskReadsInFlight.values()) {
-      if (owner.kind === kind) return true;
+  private getTaskReadConcurrencyLimit(): number {
+    return 8;
+  }
+
+  private enqueueTaskRead(owner: TaskReadOwner, run: () => Promise<void>): void {
+    this.taskReadQueue ??= [];
+    this.taskReadQueue.push({ owner, run });
+    this.drainTaskReadQueue();
+  }
+
+  private drainTaskReadQueue(): void {
+    this.taskReadQueue ??= [];
+    this.activeTaskReadCount ??= 0;
+    while (this.activeTaskReadCount < this.getTaskReadConcurrencyLimit() && this.taskReadQueue.length) {
+      const queued = this.taskReadQueue.shift();
+      if (!queued || !this.ownsTaskRead(queued.owner)) continue;
+      this.activeTaskReadCount += 1;
+      void queued.run()
+        .catch((error) => {
+          if (this.ownsTaskRead(queued.owner)) this.markTaskReadFailure(queued.owner, error);
+        })
+        .finally(() => {
+          this.activeTaskReadCount = Math.max(0, this.activeTaskReadCount - 1);
+          const released = this.releaseTaskRead(queued.owner);
+          this.drainTaskReadQueue();
+          if (released && !this.taskReadsInFlight.size) this.refreshDebounced();
+        });
     }
-    return false;
+  }
+
+  private getTaskReadRetryDelayMs(attempts = 1): number {
+    return Math.min(3_000, 750 * (2 ** Math.max(0, attempts - 1)));
+  }
+
+  private getTaskReadMaxAttempts(): number {
+    return 3;
+  }
+
+  private markTaskReadFailure(owner: TaskReadOwner, error: unknown): void {
+    this.taskReadFailures ??= new Map<string, TaskReadFailure>();
+    const previous = this.taskReadFailures.get(owner.key);
+    const attempts = previous?.file === owner.file ? previous.attempts + 1 : 1;
+    const exhausted = attempts >= this.getTaskReadMaxAttempts();
+    this.taskReadFailures.set(owner.key, { ...owner, errorAt: Date.now(), attempts, exhausted });
+    flowError('TaskCache', 'line-read:failed', error, {
+      path: owner.path,
+      attempts,
+      exhausted,
+    });
+    if (exhausted && !this.taskReadExhaustionNotified) {
+      this.taskReadExhaustionNotified = true;
+      new Notice(`TPS Kanban stopped retrying an unreadable line source after ${attempts} attempts: ${owner.path}`);
+    }
+    this.rescheduleTaskReadRetry();
+  }
+
+  private clearTaskReadFailure(key: string): void {
+    this.taskReadFailures ??= new Map<string, TaskReadFailure>();
+    if (!this.taskReadFailures.delete(key)) return;
+    this.taskReadExhaustionNotified = Array.from(this.taskReadFailures.values()).some((failure) => failure.exhausted);
+    if (!this.taskReadFailures.size && this.taskReadRetryTimer) {
+      globalThis.clearTimeout(this.taskReadRetryTimer);
+      this.taskReadRetryTimer = null;
+    }
+  }
+
+  private scheduleTaskReadRetry(): void {
+    this.taskReadFailures ??= new Map<string, TaskReadFailure>();
+    if (!this.isViewLoaded || this.taskReadRetryTimer || !this.taskReadFailures.size) return;
+    const now = Date.now();
+    let waitMs = Number.POSITIVE_INFINITY;
+    for (const failure of this.taskReadFailures.values()) {
+      if (failure.exhausted) continue;
+      waitMs = Math.min(waitMs, Math.max(0, failure.errorAt + this.getTaskReadRetryDelayMs(failure.attempts) - now));
+    }
+    if (!Number.isFinite(waitMs)) return;
+    this.taskReadRetryTimer = globalThis.setTimeout(() => {
+      this.taskReadRetryTimer = null;
+      if (!this.isViewLoaded) return;
+      this.refreshDebounced();
+    }, Math.max(1, Math.ceil(waitMs)));
+  }
+
+  private rescheduleTaskReadRetry(): void {
+    if (this.taskReadRetryTimer) {
+      globalThis.clearTimeout(this.taskReadRetryTimer);
+      this.taskReadRetryTimer = null;
+    }
+    this.scheduleTaskReadRetry();
   }
 
   private loadOpenTasksForFile(file: TFile): void {
     const path = file.path;
-    const owner = this.claimTaskRead('tasks', file, path);
+    const owner = this.claimTaskRead('lines', file, path);
     if (!owner) return;
     const generation = this.renderGeneration;
-    void this.app.vault.cachedRead(file)
-      .then((content) => {
-        if (!this.ownsTaskRead(owner)) return;
-        const taskFilter = this.getTaskRootFilterFromBaseFilters();
-        if (generation !== this.renderGeneration && !this.isVisibleFile(path) && !this.isTaskSourceFile(file, taskFilter)) return;
-        const contentApi = this.getGcmServices()?.cardContent || this.getGcmApi()?.cardContent;
-        const limit = this.getOpenTaskPreviewLimit();
-        const allTasks = this.parseOpenTasks(content, path, Number.MAX_SAFE_INTEGER, true).openTasks;
-        const localPreview = this.selectOpenTaskPreview(allTasks, limit);
-        const parsed = typeof contentApi?.extractOpenTasksFromMarkdown === 'function'
-          ? contentApi.extractOpenTasksFromMarkdown(path, content, { openTaskLimit: limit })
-          : localPreview;
-        const gcmTasksByLine = new Map<number, OpenTaskSubitem>(
-          (Array.isArray(parsed?.openTasks) ? parsed.openTasks : [])
-            .filter((task: OpenTaskSubitem) => Number.isFinite(Number(task.line)))
-            .map((task: OpenTaskSubitem) => [Number(task.line), task])
-        );
-        const openTasks = localPreview.openTasks.map((task: OpenTaskSubitem) => {
-          const enriched = gcmTasksByLine.get(task.line);
-          const merged = {
-            ...task,
-            checkboxState: task.checkboxState || enriched?.checkboxState || '[ ]',
-            inlineFields: task.inlineFields?.length ? task.inlineFields : enriched?.inlineFields,
-          };
-          return {
-            ...merged,
-            displayText: this.getTaskVisibleTitle(merged),
-          };
-        });
-        const openByLine = new Map<number, OpenTaskSubitem>(openTasks.map((task: OpenTaskSubitem) => [task.line, task]));
-        const enrichedAllTasks = allTasks.map((task: OpenTaskSubitem) => {
-          const openTask = openByLine.get(task.line);
-          const merged = {
-            ...task,
-            ...(openTask ?? {}),
-            checkboxState: task.checkboxState || openTask?.checkboxState || '[ ]',
-            inlineFields: task.inlineFields?.length ? task.inlineFields : openTask?.inlineFields,
-          };
-          return {
-            ...merged,
-            displayText: this.getTaskVisibleTitle(merged),
-          };
-        });
-        const overflowCount = Number(parsed?.overflowCount ?? localPreview.overflowCount);
-        if (!this.ownsTaskRead(owner)) return;
-        this.openTasksByPath.set(path, openTasks);
-        this.allTasksByPath.set(path, enrichedAllTasks);
-        this.openTaskOverflowByPath.set(path, Number.isFinite(overflowCount) ? Math.max(0, overflowCount) : localPreview.overflowCount);
-      })
-      .catch(() => {
-        if (!this.ownsTaskRead(owner)) return;
-        this.openTasksByPath.set(path, []);
-        this.allTasksByPath.set(path, []);
-        this.openTaskOverflowByPath.set(path, 0);
-      })
-      .finally(() => {
-        // Vault-wide task views can read hundreds of source files at once.
-        // Repaint once when the batch settles instead of once per file.
-        if (this.releaseTaskRead(owner) && !this.hasTaskReadsInFlight('tasks')) this.refreshDebounced();
+    this.enqueueTaskRead(owner, async () => {
+      const content = await this.app.vault.cachedRead(file);
+      if (!this.ownsTaskRead(owner)) return;
+      const taskFilter = this.getTaskRootFilterFromBaseFilters();
+      if (generation !== this.renderGeneration && !this.isVisibleFile(path) && !this.isTaskSourceFile(file, taskFilter)) return;
+      const contentApi = this.getGcmServices()?.cardContent || this.getGcmApi()?.cardContent;
+      const limit = this.getOpenTaskPreviewLimit();
+      const allLineItems = this.parseOpenTasks(content, path, Number.MAX_SAFE_INTEGER, true, true).openTasks;
+      const allTasks = allLineItems.filter((item) => item.itemKind !== 'bullet');
+      const localPreview = this.selectOpenTaskPreview(allTasks, limit);
+      const parsed = typeof contentApi?.extractOpenTasksFromMarkdown === 'function'
+        ? contentApi.extractOpenTasksFromMarkdown(path, content, { openTaskLimit: limit })
+        : localPreview;
+      const gcmTasksByLine = new Map<number, OpenTaskSubitem>(
+        (Array.isArray(parsed?.openTasks) ? parsed.openTasks : [])
+          .filter((task: OpenTaskSubitem) => Number.isFinite(Number(task.line)))
+          .map((task: OpenTaskSubitem) => [Number(task.line), task])
+      );
+      const openTasks = localPreview.openTasks.map((task: OpenTaskSubitem) => {
+        const enriched = gcmTasksByLine.get(task.line);
+        const merged = {
+          ...task,
+          checkboxState: task.checkboxState || enriched?.checkboxState || '[ ]',
+          inlineFields: task.inlineFields?.length ? task.inlineFields : enriched?.inlineFields,
+        };
+        return {
+          ...merged,
+          displayText: this.getTaskVisibleTitle(merged),
+        };
       });
+      const openByLine = new Map<number, OpenTaskSubitem>(openTasks.map((task: OpenTaskSubitem) => [task.line, task]));
+      const enrichedAllTasks = allTasks.map((task: OpenTaskSubitem) => {
+        const openTask = openByLine.get(task.line);
+        const merged = {
+          ...task,
+          ...(openTask ?? {}),
+          checkboxState: task.checkboxState || openTask?.checkboxState || '[ ]',
+          inlineFields: task.inlineFields?.length ? task.inlineFields : openTask?.inlineFields,
+        };
+        return {
+          ...merged,
+          displayText: this.getTaskVisibleTitle(merged),
+        };
+      });
+      const tasksByLine = new Map(enrichedAllTasks.map((task) => [task.line, task]));
+      const enrichedAllLineItems = allLineItems.map((item) => item.itemKind === 'bullet'
+        ? { ...item, displayText: this.getTaskVisibleTitle(item) }
+        : tasksByLine.get(item.line) ?? item);
+      const overflowCount = Number(parsed?.overflowCount ?? localPreview.overflowCount);
+      if (!this.ownsTaskRead(owner)) return;
+      this.clearTaskReadFailure(owner.key);
+      this.openTasksByPath.set(path, openTasks);
+      this.allTasksByPath.set(path, enrichedAllTasks);
+      this.allTasksByPath.set(`${path}:bullets`, enrichedAllLineItems);
+      this.openTaskOverflowByPath.set(path, Number.isFinite(overflowCount) ? Math.max(0, overflowCount) : localPreview.overflowCount);
+    });
   }
 
   private selectOpenTaskPreview(
@@ -2028,6 +2185,7 @@ export class KanbanView extends BasesView {
   ): { openTasks: OpenTaskSubitem[]; overflowCount: number } {
     const tasks: OpenTaskSubitem[] = [];
     const lines = content.split(/\r?\n/);
+    const lineMetadata = getGcmLineMetadataApi(this.app);
     const doneStatuses = includeDone ? null : this.getDoneStatuses();
     const hierarchyStack: Array<{ line: number; indent: number }> = [];
     lines.forEach((line, index) => {
@@ -2048,9 +2206,19 @@ export class KanbanView extends BasesView {
         parsed.itemKind === 'task'
         && doneStatuses?.has(this.getStatusForCheckboxState(checkboxState || '[ ]'))
       ) return;
+      let parsedLineMetadata: GcmParsedLineMetadata | null = null;
+      if (lineMetadata) {
+        try {
+          parsedLineMetadata = this.parseGcmLineMetadata(lineMetadata, line);
+        } catch {
+          parsedLineMetadata = null;
+        }
+      }
+      const inlineFields = parsedLineMetadata
+        ? this.appendCanonicalTaskTagFields(parsedLineMetadata.fields, parsedLineMetadata.tags)
+        : this.extractTaskInlineFields(parsed.text);
       const text = this.cleanTaskText(parsed.text);
       if (!text) return;
-      const inlineFields = this.extractTaskInlineFields(text);
       tasks.push({
         itemKind: parsed.itemKind,
         internalId: `${filePath}:${lineNumber}`,
@@ -2059,7 +2227,10 @@ export class KanbanView extends BasesView {
         parentLine,
         checkboxState,
         text,
-        displayText: this.cleanTaskDisplayText(this.stripTaskInlineFields(text)),
+        sourceText: parsed.text,
+        rawLine: line,
+        lineMetadata: parsedLineMetadata ?? undefined,
+        displayText: parsedLineMetadata?.displayTitle || this.cleanTaskDisplayText(this.stripTaskInlineFields(text)),
         inlineFields,
       });
     });
@@ -2110,16 +2281,84 @@ export class KanbanView extends BasesView {
   }
 
   private extractTaskInlineFields(text: string): Array<{ key: string; value: string }> {
+    const lineMetadata = getGcmLineMetadataApi(this.app);
+    if (lineMetadata) {
+      try {
+        const parsed = this.parseGcmLineMetadata(lineMetadata, String(text || ''));
+        if (!parsed) throw new Error('TPS Global Context Menu returned invalid parsed line metadata.');
+        return this.appendCanonicalTaskTagFields(parsed.fields, parsed.tags);
+      } catch (error) {
+        flowWarn('LineMetadata', 'read-failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     const fields: Array<{ key: string; value: string }> = [];
     for (const field of this.getTaskInlineFieldRanges(text)) {
       if (field.key && field.value) fields.push({ key: field.key, value: field.value });
     }
+    return this.appendVisibleTaskTagFields(text, fields);
+  }
+
+  private normalizeGcmLineMetadataFields(value: unknown): Array<{ key: string; value: string }> | null {
+    if (!Array.isArray(value)) return null;
+    const fields: Array<{ key: string; value: string }> = [];
+    for (const item of value) {
+      if (!item || typeof item !== 'object') return null;
+      const key = String((item as { key?: unknown }).key ?? '').trim();
+      const fieldValue = String((item as { value?: unknown }).value ?? '').trim();
+      if (!key) continue;
+      fields.push({ key, value: fieldValue });
+    }
+    return fields;
+  }
+
+  private parseGcmLineMetadata(api: GcmLineMetadataApi, line: string): GcmParsedLineMetadata | null {
+    const parsed = api.parseLine(String(line || ''));
+    if (!parsed || typeof parsed !== 'object') return null;
+    const fields = this.normalizeGcmLineMetadataFields(parsed.fields);
+    if (!fields || !Array.isArray(parsed.tags) || parsed.tags.some((tag) => typeof tag !== 'string')) return null;
+    if (typeof parsed.displayTitle !== 'string') return null;
+    return {
+      fields,
+      tags: parsed.tags.map((tag) => String(tag || '').trim()).filter(Boolean),
+      displayTitle: parsed.displayTitle.trim(),
+    };
+  }
+
+  private appendVisibleTaskTagFields(
+    text: string,
+    fields: Array<{ key: string; value: string }>,
+  ): Array<{ key: string; value: string }> {
+    const output = [...fields];
+    const knownTags = new Set(output
+      .filter((field) => /^(?:tag|tags)$/i.test(field.key))
+      .map((field) => this.normalizeTaskTag(field.value)));
     const tagMatches = text.match(/(^|\s)#[\p{L}\p{N}/_-]+/gu) || [];
     for (const rawTag of tagMatches) {
       const value = rawTag.trim();
-      if (value) fields.push({ key: 'tag', value });
+      const normalized = this.normalizeTaskTag(value);
+      if (!value || knownTags.has(normalized)) continue;
+      output.push({ key: 'tag', value });
+      knownTags.add(normalized);
     }
-    return fields.slice(0, 6);
+    return output;
+  }
+
+  private appendCanonicalTaskTagFields(
+    fields: Array<{ key: string; value: string }>,
+    tags: string[],
+  ): Array<{ key: string; value: string }> {
+    const output = fields.filter((field) => !/^(?:tag|tags)$/i.test(field.key));
+    const knownTags = new Set<string>();
+    for (const tag of tags) {
+      const normalized = this.normalizeTaskTag(tag);
+      if (!normalized || knownTags.has(normalized)) continue;
+      output.push({ key: 'tag', value: normalized });
+      knownTags.add(normalized);
+    }
+    return output;
   }
 
   private stripTaskInlineFields(text: string): string {
@@ -2211,9 +2450,9 @@ export class KanbanView extends BasesView {
   }
 
   private getGroupByPropId(propName: string | null): string | null {
-    if (!propName) return null;
-
     const raw = (this.config as any)?.groupBy?.property as string | undefined;
+    if (!propName) return raw?.toLowerCase().startsWith('formula.') ? raw : null;
+
     if (raw) {
       if (raw.includes('.')) return raw;
       return `note.${raw}`;
@@ -2242,7 +2481,7 @@ export class KanbanView extends BasesView {
 
     const entries: BasesEntry[] = this.data?.data ?? [];
     for (const entry of entries) {
-      const values = this.extractGroupValues(entry.getValue(propId as any));
+      const values = this.getEntryGroupValues(entry, propId);
       if (values.length > 1) return true;
     }
     return false;
@@ -2257,26 +2496,13 @@ export class KanbanView extends BasesView {
     const nativeGroups: BasesEntryGroup[] = (listGrouping && propId)
       ? this.buildMultiValueGroups(propId)
       : (this.data?.groupedData ?? []);
-
-    const groupedEntries = nativeGroups.flatMap((group) => group.entries ?? []);
-    const nativeEntries: BasesEntry[] = groupedEntries.length ? groupedEntries : (this.data?.data ?? []);
-    const fallbackEntries = this.getFallbackNoteEntriesFromBaseFilters();
-    if (!fallbackEntries.length && this.groupsContainEntries(nativeGroups)) return nativeGroups;
-
-    const entriesByPath = new Map<string, BasesEntry>();
-    for (const entry of nativeEntries) {
-      if (entry?.file?.path) entriesByPath.set(entry.file.path, entry);
-    }
-    for (const entry of fallbackEntries) {
-      if (entry?.file?.path && !entriesByPath.has(entry.file.path)) entriesByPath.set(entry.file.path, entry);
-    }
-    if (entriesByPath.size) {
-      return this.includeNativeEmptyGroups(
-        this.groupEntriesByProperty(Array.from(entriesByPath.values()), propId),
-        nativeGroups,
-      );
-    }
-    return nativeGroups;
+    if (this.groupsContainEntries(nativeGroups)) return nativeGroups;
+    const nativeEntries: BasesEntry[] = this.data?.data ?? [];
+    if (!nativeEntries.length) return nativeGroups;
+    return this.includeNativeEmptyGroups(
+      this.groupEntriesByProperty(nativeEntries, propId),
+      nativeGroups,
+    );
   }
 
   private groupsContainEntries(groups: BasesEntryGroup[]): boolean {
@@ -2302,216 +2528,150 @@ export class KanbanView extends BasesView {
     return this.groupsContainEntries(groups);
   }
 
-  private getFallbackNoteEntriesFromBaseFilters(): BasesEntry[] {
-    const searchQuery = this.getActiveBasesSearchQuery();
-    const entries: BasesEntry[] = [];
-    for (const file of this.app.vault.getMarkdownFiles()) {
-      if (!this.noteMatchesStructuredBaseFilters(file)) continue;
-      if (!this.noteMatchesSearchQuery(file, searchQuery)) continue;
-      entries.push(this.createFallbackBasesEntry(file));
-    }
-    return this.sortEntriesForView(entries);
+  private normalizeEntityKindValue(value: unknown): string {
+    const normalized = String(value ?? '').trim().toLocaleLowerCase();
+    if (normalized === 'tasks') return 'task';
+    if (normalized === 'bullets') return 'bullet';
+    if (normalized === 'notes') return 'note';
+    return normalized;
   }
 
-  private createFallbackBasesEntry(file: TFile): BasesEntry {
-    return {
+  private additiveEntityKindsMatch(kinds: Iterable<unknown>, expectedValues: Iterable<unknown>): boolean {
+    const normalizedKinds = new Set(Array.from(kinds, (value) => this.normalizeEntityKindValue(value)).filter(Boolean));
+    return Array.from(expectedValues).some((value) => {
+      const expected = this.normalizeEntityKindValue(value);
+      return expected === 'all' || expected === 'mixed' || normalizedKinds.has(expected);
+    });
+  }
+
+  private isAdditiveKindProperty(value: unknown): boolean {
+    return /^(?:(?:tps|kanban)\.)?kind$/i.test(String(value ?? '').trim());
+  }
+
+  private canonicalizeAdditiveKinds(structuralKind: string, explicitKinds: Iterable<unknown>): string[] {
+    return Array.from(new Set(
+      [structuralKind, ...Array.from(explicitKinds)]
+        .map((value) => this.normalizeEntityKindValue(value))
+        .filter(Boolean),
+    ));
+  }
+
+  private getNoteAdditiveKinds(file: TFile): string[] {
+    const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter as Record<string, unknown> | undefined;
+    if (!frontmatter) return ['note'];
+    const kindKey = Object.keys(frontmatter).find((key) => this.normalizeInlinePropertyKey(key) === 'kind');
+    const explicitKinds = kindKey
+      ? this.asArray(frontmatter[kindKey]).flatMap((value) => String(value ?? '').split(',')).map((value) => value.trim()).filter(Boolean)
+      : [];
+    return this.canonicalizeAdditiveKinds('note', explicitKinds);
+  }
+
+  private getTaskAdditiveKinds(task: OpenTaskSubitem, file: TFile | null = null): string[] | null {
+    const structuralKind = task.itemKind === 'bullet' ? 'bullet' : 'task';
+    const lineMetadata = getGcmLineMetadataApi(this.app);
+    if (!lineMetadata) {
+      const apiStatus = getGcmApiStatus(this.app);
+      const advertisedVersion = apiStatus?.available ? apiStatus.lineMetadataVersion : null;
+      this.reportFormulaDiagnostic(
+        advertisedVersion != null ? 'incompatible-line-metadata-api' : 'missing-line-metadata-api',
+        advertisedVersion != null
+          ? `TPS Global Context Menu line metadata API version ${TPS_LINE_METADATA_API_VERSION} with the complete read contract is required (found ${advertisedVersion}).`
+          : 'TPS Global Context Menu line metadata API is required for additive kind matching.',
+        file ?? undefined,
+        task,
+        'kind',
+        'line metadata',
+      );
+      return null;
+    }
+    try {
+      const sourceLine = task.rawLine || task.sourceText || task.text;
+      const parsed = task.lineMetadata ?? this.parseGcmLineMetadata(lineMetadata, sourceLine);
+      if (!parsed) throw new Error('TPS Global Context Menu returned invalid parsed line metadata.');
+      task.lineMetadata ??= parsed;
+      const explicitKinds = parsed.fields
+        .filter((field) => this.normalizeInlinePropertyKey(field.key) === 'kind')
+        .map((field) => field.value)
+        .flatMap((value) => lineMetadata.parseStringList(value));
+      if (explicitKinds.some((value) => typeof value !== 'string')) {
+        throw new Error('TPS Global Context Menu returned invalid additive kind values.');
+      }
+      return this.canonicalizeAdditiveKinds(structuralKind, explicitKinds);
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'line-metadata-read-failed',
+        error instanceof Error ? error.message : String(error),
+        file ?? undefined,
+        task,
+        'kind',
+        'line metadata',
+      );
+      return null;
+    }
+  }
+
+  private parseAdditiveKindExpression(expression: string): { expected: string; negated: boolean } | null {
+    const match = String(expression || '').trim().match(
+      /^(?:(?:tps|kanban)\.)?kind\s*(===|!==|==|!=|=|is|equals?)\s*(?:"([^"]+)"|'([^']+)'|(.+))$/i,
+    );
+    if (!match) return null;
+    const expected = String(match[2] ?? match[3] ?? match[4] ?? '').trim();
+    if (!expected) return null;
+    return { expected, negated: String(match[1] || '').startsWith('!') };
+  }
+
+  private evaluateAdditiveKindExpression(expression: string, kinds: Iterable<unknown> | null): boolean | null {
+    const parsed = this.parseAdditiveKindExpression(expression);
+    if (!parsed) return null;
+    // When the canonical line parser is unavailable, even a negative kind
+    // comparison must fail closed rather than pass from incomplete data.
+    if (!kinds) return false;
+    const { expected, negated } = parsed;
+    const matched = this.additiveEntityKindsMatch(kinds, [expected]);
+    return negated ? !matched : matched;
+  }
+
+  private evaluateAdditiveKindObjectFilter(
+    kinds: Iterable<unknown> | null,
+    operator: string,
+    values: string[],
+    file?: TFile,
+    task?: OpenTaskSubitem,
+  ): boolean | null {
+    if (!kinds) return false;
+    const op = String(operator || '').trim().toLocaleLowerCase().replace(/\s+/gu, '');
+    const positiveEquality = ['', '=', '==', '===', 'is', 'equals', 'equal', 'eq'];
+    const negativeEquality = ['!=', '!==', '!is', 'isnot', 'not', 'notequal', 'notequals', 'doesnotequal'];
+    const positiveContains = ['contains', 'containsany', 'has'];
+    const negativeContains = ['!contains', 'notcontains', 'doesnotcontain', 'doesnotcontainany'];
+
+    if (['empty', 'isempty'].includes(op) || (!values.length && positiveEquality.includes(op))) return false;
+    if (['exists', 'isnotempty'].includes(op) || (!values.length && negativeEquality.includes(op))) return true;
+    if (['!exists', 'notexists', 'doesnotexist'].includes(op)) return false;
+    if (!values.length) {
+      this.reportFormulaDiagnostic(
+        'unsupported-kind-filter-operator',
+        `Additive kind filter operator ${JSON.stringify(operator)} is not supported.`,
+        file,
+        task,
+        'kind',
+        'entity filter',
+      );
+      return false;
+    }
+
+    const matched = this.additiveEntityKindsMatch(kinds, values);
+    if (positiveEquality.includes(op) || positiveContains.includes(op)) return matched;
+    if (negativeEquality.includes(op) || negativeContains.includes(op)) return !matched;
+    this.reportFormulaDiagnostic(
+      'unsupported-kind-filter-operator',
+      `Additive kind filter operator ${JSON.stringify(operator)} is not supported.`,
       file,
-      getValue: (propId: string) => this.getFallbackNoteValue(file, propId),
-    } as unknown as BasesEntry;
-  }
-
-  private getFallbackNoteValue(file: TFile, propId: string): unknown {
-    const raw = String(propId || '').trim();
-    const lower = raw.toLowerCase();
-    if (lower === 'file.name' || lower === 'name') return file.name;
-    if (lower === 'file.basename' || lower === 'basename' || lower === 'title') return file.basename;
-    if (lower === 'file.path' || lower === 'path' || this.normalizeInlinePropertyKey(raw) === 'filepath') return file.path;
-    if (lower === 'file.extension' || lower === 'file.ext' || lower === 'extension' || lower === 'ext') return file.extension;
-    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as Record<string, unknown> | undefined;
-    if (!fm) return undefined;
-    const frontmatterKey = raw.startsWith('note.') ? raw.slice(5) : raw;
-    return this.getFrontmatterValueCaseInsensitive(fm, frontmatterKey);
-  }
-
-  private noteMatchesSearchQuery(file: TFile, query: string): boolean {
-    const normalizedQuery = String(query || '').trim().toLowerCase();
-    if (!normalizedQuery) return true;
-    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as Record<string, unknown> | undefined;
-    const haystack = [
-      file.basename,
-      file.name,
-      file.path,
-      ...(fm ? Object.entries(fm).flatMap(([key, value]) => [key, Array.isArray(value) ? value.join(' ') : String(value ?? '')]) : []),
-    ].join('\n').toLowerCase();
-    return normalizedQuery
-      .split(/\s+/g)
-      .filter(Boolean)
-      .every((part) => haystack.includes(part));
-  }
-
-  private noteMatchesStructuredBaseFilters(file: TFile): boolean {
-    let hasKnownFilter = false;
-    for (const root of this.getBaseFilterRoots()) {
-      const result = this.evaluateNoteFilterNode(root, file);
-      if (result == null) continue;
-      hasKnownFilter = true;
-      if (!result) return false;
-    }
-    return hasKnownFilter;
-  }
-
-  private evaluateNoteFilterNode(node: unknown, file: TFile): boolean | null {
-    if (!node) return null;
-    if (typeof node === 'string') return this.evaluateNoteFilterString(node, file);
-    if (Array.isArray(node)) return this.combineTaskFilterResults(node.map((child) => this.evaluateNoteFilterNode(child, file)), 'and');
-    if (typeof node !== 'object') return null;
-    const record = node as Record<string, unknown>;
-    if (Object.prototype.hasOwnProperty.call(record, 'and') || Object.prototype.hasOwnProperty.call(record, 'all')) {
-      const children = Object.prototype.hasOwnProperty.call(record, 'and') ? record.and : record.all;
-      return this.combineTaskFilterResults(this.asArray(children).map((child) => this.evaluateNoteFilterNode(child, file)), 'and');
-    }
-    if (Object.prototype.hasOwnProperty.call(record, 'or') || Object.prototype.hasOwnProperty.call(record, 'any')) {
-      const children = Object.prototype.hasOwnProperty.call(record, 'or') ? record.or : record.any;
-      return this.combineTaskFilterResults(this.asArray(children).map((child) => this.evaluateNoteFilterNode(child, file)), 'or');
-    }
-    if (Object.prototype.hasOwnProperty.call(record, 'not')) {
-      const result = this.evaluateNoteFilterNode(record.not, file);
-      return result == null ? null : !result;
-    }
-    return this.evaluateNoteFilterObject(record, file);
-  }
-
-  private evaluateNoteFilterString(rawExpr: string, file: TFile): boolean | null {
-    const raw = String(rawExpr || '').trim();
-    const isNegated = raw.startsWith('!');
-    const expr = (isNegated ? raw.slice(1) : raw).trim();
-    let result: boolean | null = null;
-    const kindMatch = expr.match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=|is|equals?)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
-    if (kindMatch?.[1]) {
-      const value = kindMatch[1].toLowerCase();
-      result = value.startsWith('task') || value.startsWith('bullet') ? false : value.startsWith('note') || value === 'all' || value === 'mixed';
-    } else {
-      result = this.evaluateNoteValueFilterExpression(expr, file);
-    }
-    return result == null ? null : isNegated ? !result : result;
-  }
-
-  private evaluateNoteFilterObject(node: Record<string, unknown>, file: TFile): boolean | null {
-    const propRaw = this.readFilterObjectProperty(node);
-    if (!propRaw) return null;
-    const normalizedProp = this.normalizeInlinePropertyKey(propRaw.replace(/^note\./i, ''));
-    const operator = this.readFilterObjectOperator(node);
-    const values = this.readFilterObjectValues(node);
-    const isNegated = this.isNegatedFilterOperator(operator);
-    let result: boolean | null = null;
-
-    if (isBareSemanticKindFilter(propRaw, values)) {
-      const currentValues = this.getNoteComparableValues(file, propRaw);
-      result = values.some((value) => currentValues.includes(value.toLowerCase()));
-    } else if (['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) {
-      result = values.some((value) => {
-        const normalized = value.toLowerCase();
-        return normalized.startsWith('note') || normalized === 'all' || normalized === 'mixed';
-      });
-    } else if (propRaw.toLowerCase().startsWith('task.')) {
-      result = false;
-    } else if (['extension', 'ext', 'fileextension', 'fileext'].includes(normalizedProp) || propRaw.toLowerCase() === 'file.extension' || propRaw.toLowerCase() === 'file.ext') {
-      result = values.some((value) => value.toLowerCase().replace(/^\./, '') === file.extension.toLowerCase());
-    } else if (['path', 'file', 'filepath'].includes(normalizedProp) || propRaw.toLowerCase() === 'file.path') {
-      if (!this.isPathComparisonOperator(operator)) return null;
-      result = this.isStartsWithFilterOperator(operator)
-        ? values.some((value) => this.taskFilePathStartsWith(file, value))
-        : values.some((value) => this.taskFilePathMatches(file, value));
-    } else {
-      const currentValues = this.getNoteComparableValues(file, propRaw);
-      if (this.isImplicitEmptyValueFilter(operator, values)) {
-        result = currentValues.length === 0;
-      } else if (this.isImplicitNotEmptyValueFilter(operator, values)) {
-        result = currentValues.length > 0;
-      } else if (this.isEmptyFilterOperator(operator)) {
-        result = currentValues.length === 0;
-      } else if (this.isExistsFilterOperator(operator)) {
-        result = currentValues.length > 0;
-      } else if (this.isContainsFilterOperator(operator)) {
-        result = values.some((value) => currentValues.some((current) => current.includes(value.toLowerCase()) || current === this.normalizeTaskTag(value)));
-      } else {
-        result = values.some((value) => currentValues.includes(value.toLowerCase()));
-      }
-    }
-
-    return result == null ? null : isNegated ? !result : result;
-  }
-
-  private evaluateNoteValueFilterExpression(expr: string, file: TFile): boolean | null {
-    const callMatch = expr.match(/^([\w.\s-]+)\.(contains|containsAny|equals)\((.*)\)$/i);
-    if (callMatch?.[1]) {
-      const prop = callMatch[1].trim();
-      if (prop.toLowerCase().startsWith('task.')) return false;
-      const values = this.getNoteComparableValues(file, prop);
-      const tokens = this.extractFilterTokens(callMatch[3] || '').map((value) => (this.resolveBaseContextToken(value) || value).toLowerCase());
-      if (callMatch[2].toLowerCase().includes('contains')) {
-        return tokens.some((token) => values.some((value) => value.includes(token)));
-      }
-      return tokens.some((token) => values.includes(token));
-    }
-    const emptyMatch = expr.match(/^([\w.\s-]+)\.(isEmpty|empty|exists|isNotEmpty)\(\)$/i);
-    if (emptyMatch?.[1]) {
-      const values = this.getNoteComparableValues(file, emptyMatch[1].trim());
-      const op = emptyMatch[2].toLowerCase();
-      return op.includes('empty') && !op.includes('not') ? values.length === 0 : values.length > 0;
-    }
-    const wordOperatorMatch = expr.match(/^([\w.\s-]+)\s+(contains|has|is not empty|is empty|isNotEmpty|exists|empty|is|equals?)\s*(.*)$/i);
-    if (wordOperatorMatch?.[1]) {
-      const prop = wordOperatorMatch[1].trim();
-      if (prop.toLowerCase().startsWith('task.')) return false;
-      const op = wordOperatorMatch[2].trim().toLowerCase().replace(/\s+/g, '');
-      const values = this.getNoteComparableValues(file, prop);
-      if (op === 'isempty' || op === 'empty') return values.length === 0;
-      if (op === 'isnotempty' || op === 'exists') return values.length > 0;
-      const tokens = this.extractFilterTokens(wordOperatorMatch[3] || '').map((token) => (this.resolveBaseContextToken(token) || token).toLowerCase());
-      if (op === 'contains' || op === 'has') return tokens.some((token) => values.some((value) => value.includes(token) || value === this.normalizeTaskTag(token)));
-      return tokens.some((token) => values.includes(token));
-    }
-    const comparisonMatch = expr.match(/^([\w.\s-]+)\s*(==|=|!=|!==|is|equals?)\s*["']?([^"']+)["']?$/i);
-    if (comparisonMatch?.[1]) {
-      const prop = comparisonMatch[1].trim();
-      if (prop.toLowerCase().startsWith('task.')) return false;
-      const matched = this.getNoteComparableValues(file, prop).includes(comparisonMatch[3].trim().toLowerCase());
-      const op = String(comparisonMatch[2] || '').toLowerCase();
-      return op.startsWith('!') ? !matched : matched;
-    }
-    return null;
-  }
-
-  private getNoteComparableValues(file: TFile, propRaw: string): string[] {
-    const raw = String(propRaw || '').trim();
-    const normalized = this.normalizeInlinePropertyKey(raw.replace(/^note\./i, ''));
-    if (['path', 'file', 'filepath'].includes(normalized) || raw.toLowerCase() === 'file.path') {
-      return [file.path, file.basename, file.name, file.path.replace(/\.md$/i, '')].map((value) => value.toLowerCase());
-    }
-    if (['extension', 'ext', 'fileextension', 'fileext'].includes(normalized) || raw.toLowerCase() === 'file.extension' || raw.toLowerCase() === 'file.ext') {
-      return [file.extension.toLowerCase()];
-    }
-    if (['tag', 'tags', 'filetags'].includes(normalized) || raw.toLowerCase() === 'file.tags') {
-      const cache = this.app.metadataCache.getFileCache(file);
-      const fm = cache?.frontmatter as Record<string, unknown> | undefined;
-      const rawTags = [
-        ...this.asArray(fm?.tags),
-        ...(cache?.tags ?? []).map((tag) => tag.tag),
-      ];
-      const tags = new Set<string>();
-      for (const rawTag of rawTags) {
-        const normalizedTag = this.normalizeTaskTag(String(rawTag || ''));
-        if (normalizedTag) {
-          tags.add(normalizedTag);
-          tags.add(normalizedTag.replace(/^#/, ''));
-        }
-      }
-      return Array.from(tags);
-    }
-    const value = this.getFallbackNoteValue(file, raw);
-    const values = Array.isArray(value) ? value : value == null || value === '' ? [] : [value];
-    return values.map((item) => String(item ?? '').trim().toLowerCase()).filter(Boolean);
+      task,
+      'kind',
+      'entity filter',
+    );
+    return false;
   }
 
   private groupEntriesByProperty(entries: BasesEntry[], propId: string | null): BasesEntryGroup[] {
@@ -2528,7 +2688,7 @@ export class KanbanView extends BasesView {
     const ungrouped: BasesEntry[] = [];
 
     for (const entry of entries) {
-      const values = this.extractGroupValues(entry.getValue(propId as any));
+      const values = this.getEntryGroupValues(entry, propId);
       if (!values.length) {
         ungrouped.push(entry);
         continue;
@@ -2571,9 +2731,8 @@ export class KanbanView extends BasesView {
   }
 
   private getSortDescriptors(): TpsSortDescriptor[] {
-    const rawSort = (this.config as any)?.sort
-      ?? (this.config as any)?.getSort?.()
-      ?? this.getConfigValue('sortBy')
+    const rawSort = (this.config as any)?.getSort?.()
+      ?? this.config?.get?.('sort')
       ?? [];
     const values = Array.isArray(rawSort) ? rawSort : rawSort ? [rawSort] : [];
     return values
@@ -2590,8 +2749,11 @@ export class KanbanView extends BasesView {
   }
 
   private getCardPropertyIds(groupPropName: string | null): string[] {
-    const rawOrder = (this.config as any)?.order ?? [];
+    const rawOrder = (this.config as any)?.getOrder?.()
+      ?? this.config?.get?.('order')
+      ?? [];
     const values = Array.isArray(rawOrder) ? rawOrder : rawOrder ? [rawOrder] : [];
+    const configuredGroupProp = String((this.config as any)?.groupBy?.property || groupPropName || '').trim();
     const excluded = new Set([
       'file.name',
       'file.basename',
@@ -2599,6 +2761,8 @@ export class KanbanView extends BasesView {
       'name',
       'title',
       this.normalizeInlinePropertyKey(groupPropName || ''),
+      configuredGroupProp.toLowerCase(),
+      this.normalizeInlinePropertyKey(configuredGroupProp),
       this.normalizeInlinePropertyKey(this.plugin.settings?.iconKey || 'icon'),
       this.normalizeInlinePropertyKey(this.plugin.settings?.colorKey || 'color'),
       'icon',
@@ -2649,6 +2813,53 @@ export class KanbanView extends BasesView {
 
   private extractGroupValues(raw: unknown): string[] {
     return extractKanbanGroupValues(raw);
+  }
+
+  private getEntryGroupValues(entry: BasesEntry, propId: string): string[] {
+    let raw: unknown;
+    try {
+      raw = entry.getValue(propId as any);
+    } catch (error) {
+      if (this.isFormulaProperty(propId)) {
+        this.reportFormulaDiagnostic(
+          'native-formula-read-failed',
+          error instanceof Error ? error.message : String(error),
+          entry.file,
+          undefined,
+          this.getFormulaName(propId),
+        );
+      }
+      return [];
+    }
+    if (!this.isFormulaProperty(propId)) return this.extractGroupValues(raw);
+
+    const api = getGcmFormulaApi(this.app);
+    if (!api) {
+      this.reportFormulaDiagnostic(
+        'missing-formula-api',
+        `TPS Global Context Menu formula API version ${TPS_FORMULA_API_VERSION} is required for native formula grouping.`,
+        entry.file,
+        undefined,
+        this.getFormulaName(propId),
+      );
+      return [];
+    }
+    try {
+      const values = api.groupValues(raw);
+      if (!Array.isArray(values) || values.some((value) => typeof value !== 'string')) {
+        throw new Error('TPS Global Context Menu returned invalid native formula group values.');
+      }
+      return values.map((value) => value.trim()).filter(Boolean);
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-group-values-failed',
+        error instanceof Error ? error.message : String(error),
+        entry.file,
+        undefined,
+        this.getFormulaName(propId),
+      );
+      return [];
+    }
   }
 
   private keyLabel(group: BasesEntryGroup): string {
@@ -2823,11 +3034,7 @@ export class KanbanView extends BasesView {
     if (!normalized) return false;
     if (normalized === 'status' || normalized === 'checkboxstatus') return true;
     const configuredKey = this.getGcmServices()?.status?.getStatusPropertyKey?.()
-      ?? this.getGcmSettings()?.properties?.find?.((property: any) => {
-        const id = String(property?.id || '').trim().toLowerCase();
-        const key = String(property?.key || '').trim().toLowerCase();
-        return id === 'status' || key === 'status';
-      })?.key;
+      ?? '';
     return normalized === this.normalizeInlinePropertyKey(String(configuredKey || ''));
   }
 
@@ -3059,7 +3266,7 @@ export class KanbanView extends BasesView {
       if (!sourceFiles.has(file.path)) sourceFiles.set(file.path, file);
     }
     if (taskFilter.mode === 'tasks' || taskFilter.mode === 'bullets' || this.shouldScanVaultForTaskFilters(taskFilter)) {
-      for (const file of this.app.vault.getMarkdownFiles()) {
+      for (const file of this.getIndexedLineSourceFiles() ?? []) {
         if (!sourceFiles.has(file.path)) sourceFiles.set(file.path, file);
       }
     }
@@ -3074,7 +3281,7 @@ export class KanbanView extends BasesView {
       for (const task of this.getAllLineItemsForFile(file, taskFilter)) {
         if (!this.taskMatchesRootFilter(task, taskFilter, file)) continue;
         if (!this.taskMatchesSearchQuery(file, task, searchQuery)) continue;
-        for (const laneId of this.getTaskLaneIds(task, propName)) {
+        for (const laneId of this.getTaskLaneIds(file, task, propName)) {
           const laneTasks = tasksByLane.get(laneId) ?? [];
           laneTasks.push({ file, task, laneId });
           tasksByLane.set(laneId, laneTasks);
@@ -3082,7 +3289,152 @@ export class KanbanView extends BasesView {
       }
     }
 
+    for (const [laneId, items] of tasksByLane) {
+      tasksByLane.set(laneId, this.sortTaskRenderItems(items));
+    }
+
     return tasksByLane;
+  }
+
+  private invalidateEntityIndexLineSources(): void {
+    this.entityIndexLineSourceGeneration = (this.entityIndexLineSourceGeneration ?? 0) + 1;
+    this.entityIndexLineSourceCache = null;
+    this.clearEntityIndexRetry();
+    if (this.entityIndexLineSourceLoad) this.entityIndexReloadPending = true;
+  }
+
+  private clearEntityIndexRetry(): void {
+    this.entityIndexRetryAttempts = 0;
+    if (!this.entityIndexRetryTimer) return;
+    globalThis.clearTimeout(this.entityIndexRetryTimer);
+    this.entityIndexRetryTimer = null;
+  }
+
+  private getEntityIndexRetryDelayMs(attempts = 1): number {
+    return Math.min(3_000, 750 * (2 ** Math.max(0, attempts - 1)));
+  }
+
+  private getEntityIndexRetryMaxAttempts(): number {
+    return 3;
+  }
+
+  private scheduleEntityIndexRetry(): void {
+    if (
+      !this.isViewLoaded
+      || this.entityIndexRetryTimer
+      || this.entityIndexRetryAttempts >= this.getEntityIndexRetryMaxAttempts()
+    ) return;
+    const delayMs = this.getEntityIndexRetryDelayMs(this.entityIndexRetryAttempts);
+    this.entityIndexRetryTimer = globalThis.setTimeout(() => {
+      this.entityIndexRetryTimer = null;
+      if (!this.isViewLoaded) return;
+      this.entityIndexLineSourceGeneration = (this.entityIndexLineSourceGeneration ?? 0) + 1;
+      this.entityIndexLineSourceCache = null;
+      const api = getGcmEntityIndexApi(this.app);
+      if (api) this.scheduleEntityIndexLineSourceLoad(api);
+    }, delayMs);
+  }
+
+  private unbindEntityIndexChangeListener(): void {
+    try {
+      this.entityIndexUnsubscribe?.();
+    } finally {
+      this.entityIndexUnsubscribe = null;
+    }
+  }
+
+  private bindEntityIndexChangeListener(): void {
+    this.unbindEntityIndexChangeListener();
+    const api = getGcmEntityIndexApi(this.app);
+    if (!api) return;
+    this.entityIndexUnsubscribe = api.onChanged(() => {
+      this.invalidateEntityIndexLineSources();
+      if (this.isViewLoaded) this.refreshDebounced();
+    });
+  }
+
+  private getIndexedLineSourceFiles(): TFile[] | null {
+    const apiStatus = getGcmApiStatus(this.app);
+    const advertisedVersion = apiStatus?.available ? apiStatus.entityIndexVersion : null;
+    const api = getGcmEntityIndexApi(this.app);
+    if (!api) {
+      this.reportFormulaDiagnostic(
+        advertisedVersion != null ? 'incompatible-entity-index-api' : 'missing-entity-index-api',
+        advertisedVersion != null
+          ? `TPS Global Context Menu entity index API version ${TPS_ENTITY_INDEX_API_VERSION} with complete structural line queries is required (found ${advertisedVersion}).`
+          : `TPS Global Context Menu entity index API version ${TPS_ENTITY_INDEX_API_VERSION} is required for global task and bullet discovery.`,
+        undefined,
+        undefined,
+        '',
+        'entity index',
+      );
+      return null;
+    }
+
+    const revision = Number(api.getRevision());
+    const cache = this.entityIndexLineSourceCache;
+    if (cache?.api === api && cache.revision === revision) {
+      return Array.from(cache.paths)
+        .map((path) => this.app.vault.getFileByPath(path))
+        .filter((file): file is TFile => file instanceof TFile);
+    }
+    this.scheduleEntityIndexLineSourceLoad(api);
+    return null;
+  }
+
+  private scheduleEntityIndexLineSourceLoad(api: GcmEntityIndexApi): void {
+    if (this.entityIndexLineSourceLoad) return;
+    const generation = this.entityIndexLineSourceGeneration ?? 0;
+    const load = (async () => {
+      try {
+        const records = await api.queryAsync({
+          entityTypes: ['block'],
+          lineKinds: ['task', 'bullet'],
+        });
+        if (generation !== this.entityIndexLineSourceGeneration || getGcmEntityIndexApi(this.app) !== api) return;
+        const paths = new Set<string>();
+        for (const record of records) {
+          if (record?.entityType !== 'block' || !['task', 'bullet'].includes(String(record.lineKind || ''))) continue;
+          const path = String(record.sourcePath || '').trim();
+          if (path) paths.add(path);
+        }
+        this.entityIndexLineSourceCache = {
+          api,
+          revision: Number(api.getRevision()),
+          paths,
+        };
+        this.clearEntityIndexRetry();
+        this.refreshDebounced();
+      } catch (error) {
+        if (generation !== this.entityIndexLineSourceGeneration) return;
+        this.entityIndexRetryAttempts = (this.entityIndexRetryAttempts ?? 0) + 1;
+        if (this.entityIndexRetryAttempts >= this.getEntityIndexRetryMaxAttempts()) {
+          this.reportFormulaDiagnostic(
+            'entity-index-retry-exhausted',
+            `Global line discovery stopped after ${this.entityIndexRetryAttempts} failed attempts: ${error instanceof Error ? error.message : String(error)}`,
+            undefined,
+            undefined,
+            '',
+            'entity index',
+          );
+        } else {
+          flowWarn('EntityIndex', 'retry-scheduled', {
+            attempts: this.entityIndexRetryAttempts,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          this.scheduleEntityIndexRetry();
+        }
+      }
+    })();
+    this.entityIndexLineSourceLoad = load;
+    void load.finally(() => {
+      if (this.entityIndexLineSourceLoad !== load) return;
+      this.entityIndexLineSourceLoad = null;
+      if (!this.entityIndexReloadPending) return;
+      this.entityIndexReloadPending = false;
+      const nextApi = this.isViewLoaded ? getGcmEntityIndexApi(this.app) : null;
+      if (nextApi) this.scheduleEntityIndexLineSourceLoad(nextApi);
+    });
   }
 
   private getExplicitTaskSourceFiles(taskFilter = this.getTaskRootFilterFromBaseFilters()): TFile[] {
@@ -3118,7 +3470,8 @@ export class KanbanView extends BasesView {
     if (Array.isArray(node)) return node.some((child) => this.hasGlobalTaskMatchFilter(child));
     if (typeof node === 'string') {
       const expr = node.trim().replace(/^!+\s*/u, '');
-      if (parseBareSemanticKindExpression(expr)) return false;
+      if (this.parseAdditiveKindExpression(expr)) return true;
+      if (this.filterExpressionReferencesFormula(expr)) return true;
       return /^(?:task\.)?(?:tags?|status|open|isopen|done|isdone|completed|complete)\b/i.test(expr)
         || /^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=|is|equals?)\s*["']?(?:task|tasks)["']?$/i.test(expr)
         || this.isSharedTaskValueFilterExpression(expr);
@@ -3126,7 +3479,7 @@ export class KanbanView extends BasesView {
     if (typeof node !== 'object') return false;
     const record = node as Record<string, unknown>;
     const propRaw = this.readFilterObjectProperty(record).toLowerCase();
-    if (isBareSemanticKindFilter(propRaw, this.readFilterObjectValues(record))) return false;
+    if (this.isAdditiveKindProperty(propRaw)) return true;
     const normalizedProp = this.normalizeInlinePropertyKey(propRaw.replace(/^(?:task|tps|kanban)\./i, ''));
     if (propRaw.startsWith('task.') && !['path', 'file', 'filepath', 'fileextension', 'fileext'].includes(normalizedProp)) return true;
     if (['itemtype', 'itemkind', 'kind', 'tags', 'tag', 'status', 'open', 'isopen', 'done', 'isdone', 'completed', 'complete'].includes(normalizedProp)) return true;
@@ -3139,7 +3492,7 @@ export class KanbanView extends BasesView {
     if (!prop) return false;
     const lower = prop.toLowerCase();
     if (lower.startsWith('note.') || lower.startsWith('file.')) return false;
-    if (parseBareSemanticKindExpression(expr)) return false;
+    if (this.isAdditiveKindProperty(lower)) return true;
     const normalized = this.normalizeInlinePropertyKey(lower.replace(/^(?:task|tps|kanban)\./i, ''));
     return !['path', 'file', 'filepath', 'fileextension', 'fileext', 'extension', 'ext'].includes(normalized);
   }
@@ -3198,7 +3551,8 @@ export class KanbanView extends BasesView {
   private taskMatchesSearchQuery(file: TFile, task: OpenTaskSubitem, query: string): boolean {
     const normalizedQuery = String(query || '').trim().toLowerCase();
     if (!normalizedQuery) return true;
-    const haystack = [
+    const parts = normalizedQuery.split(/\s+/g).filter(Boolean);
+    const baseHaystack = [
       file.basename,
       file.name,
       file.path,
@@ -3209,10 +3563,19 @@ export class KanbanView extends BasesView {
     ]
       .map((value) => String(value ?? '').toLowerCase())
       .join('\n');
-    return normalizedQuery
-      .split(/\s+/g)
-      .filter(Boolean)
-      .every((part) => haystack.includes(part));
+    if (parts.every((part) => baseHaystack.includes(part))) return true;
+    if (!this.hasActiveFormulaDefinitions()) return false;
+
+    const formulaValues: string[] = [];
+    const formulaResults = this.getAllTaskFormulaResults(file, task);
+    if (!formulaResults) return false;
+    for (const result of Object.values(formulaResults)) {
+      if (result.status === 'error' || result.status === 'unsupported') continue;
+      const formatted = this.formatFormulaValue(result.value, file, task, result.formula);
+      if (formatted) formulaValues.push(formatted);
+    }
+    const formulaHaystack = formulaValues.join('\n').toLowerCase();
+    return parts.every((part) => baseHaystack.includes(part) || formulaHaystack.includes(part));
   }
 
   private getVisibleNotePaths(groups: BasesEntryGroup[]): Set<string> {
@@ -3224,29 +3587,12 @@ export class KanbanView extends BasesView {
   }
 
   private getAllLineItemsForFile(file: TFile, filter: KanbanTaskRootFilter): OpenTaskSubitem[] {
-    if (filter.mode !== 'bullets') return this.getAllTasksForFile(file);
+    if (filter.mode !== 'bullets' && !filter.hasFormulaFilter && !filter.mayMatchBullets) return this.getAllTasksForFile(file);
     const path = file.path;
     const cacheKey = `${path}:bullets`;
     const cached = this.allTasksByPath.get(cacheKey);
     if (cached) return cached;
-    const owner = this.claimTaskRead('bullets', file, path);
-    if (!owner) return [];
-    let committed = false;
-    void this.app.vault.cachedRead(file)
-      .then((content) => {
-        if (!this.ownsTaskRead(owner)) return;
-        const items = this.parseOpenTasks(content, path, Number.MAX_SAFE_INTEGER, true, true).openTasks;
-        if (!this.ownsTaskRead(owner)) return;
-        this.allTasksByPath.set(cacheKey, items);
-        committed = true;
-      })
-      .catch((error) => {
-        if (!this.ownsTaskRead(owner)) return;
-        flowError('TaskCache', 'bullet-read:failed', error, { path });
-      })
-      .finally(() => {
-        if (this.releaseTaskRead(owner) && committed) this.refreshDebounced();
-      });
+    this.loadOpenTasksForFile(file);
     return [];
   }
 
@@ -3385,35 +3731,169 @@ export class KanbanView extends BasesView {
   private taskMatchesStructuredBaseFilters(task: OpenTaskSubitem, file: TFile | null = null): boolean | null {
     let hasStructuredTaskFilter = false;
     for (const root of this.getBaseFilterRoots()) {
-      const result = this.evaluateTaskFilterNode(root, task, file);
-      if (result == null) continue;
+      const state: TaskFilterEvaluationState = { formulaFailure: false, unsupportedFailure: false };
+      const result = this.evaluateTaskFilterNode(root, task, file, state);
+      if (state.formulaFailure || state.unsupportedFailure) return false;
+      if (result == null) {
+        continue;
+      }
       hasStructuredTaskFilter = true;
       if (!result) return false;
     }
     return hasStructuredTaskFilter ? true : null;
   }
 
-  private evaluateTaskFilterNode(node: unknown, task: OpenTaskSubitem, file: TFile | null = null): boolean | null {
+  private evaluateTaskFilterNode(
+    node: unknown,
+    task: OpenTaskSubitem,
+    file: TFile | null = null,
+    state: TaskFilterEvaluationState = { formulaFailure: false, unsupportedFailure: false },
+  ): boolean | null {
     if (!node) return null;
-    if (typeof node === 'string') return this.evaluateTaskFilterString(node, task, file);
-    if (Array.isArray(node)) return this.combineTaskFilterResults(node.map((child) => this.evaluateTaskFilterNode(child, task, file)), 'and');
+    if (typeof node === 'string') {
+      return this.evaluateTaskFilterString(node, task, file, state);
+    }
+    if (Array.isArray(node)) {
+      return this.evaluateTaskFilterChildren(node, 'and', task, file, state);
+    }
     if (typeof node !== 'object') return null;
 
     const record = node as Record<string, unknown>;
     if (Object.prototype.hasOwnProperty.call(record, 'and') || Object.prototype.hasOwnProperty.call(record, 'all')) {
       const children = Object.prototype.hasOwnProperty.call(record, 'and') ? record.and : record.all;
-      return this.combineTaskFilterResults(this.asArray(children).map((child) => this.evaluateTaskFilterNode(child, task, file)), 'and');
+      const childNodes = this.asArray(children);
+      return this.evaluateTaskFilterChildren(childNodes, 'and', task, file, state);
     }
     if (Object.prototype.hasOwnProperty.call(record, 'or') || Object.prototype.hasOwnProperty.call(record, 'any')) {
       const children = Object.prototype.hasOwnProperty.call(record, 'or') ? record.or : record.any;
-      return this.combineTaskFilterResults(this.asArray(children).map((child) => this.evaluateTaskFilterNode(child, task, file)), 'or');
+      const childNodes = this.asArray(children);
+      return this.evaluateTaskFilterChildren(childNodes, 'or', task, file, state);
     }
     if (Object.prototype.hasOwnProperty.call(record, 'not')) {
-      const result = this.evaluateTaskFilterNode(record.not, task, file);
+      const result = this.evaluateTaskFilterNode(record.not, task, file, state);
       return result == null ? null : !result;
     }
 
-    return this.evaluateTaskFilterObject(record, task, file);
+    const result = this.evaluateTaskFilterObject(record, task, file, state);
+    if (result == null && this.isFormulaProperty(this.readFilterObjectProperty(record))) state.formulaFailure = true;
+    return result;
+  }
+
+  private evaluateTaskFilterChildren(
+    children: unknown[],
+    mode: 'and' | 'or',
+    task: OpenTaskSubitem,
+    file: TFile | null,
+    state: TaskFilterEvaluationState,
+  ): boolean | null {
+    if (!children.length) return null;
+    if (children.some((child) => this.detectFilterNodeFormulaReference(child) === 'unavailable')) {
+      state.formulaFailure = true;
+      return null;
+    }
+    let unresolved = false;
+    for (const child of children) {
+      const result = this.evaluateTaskFilterNode(child, task, file, state);
+      if (state.formulaFailure || state.unsupportedFailure) return null;
+      if (mode === 'and' && result === false) return false;
+      if (mode === 'or' && result === true) return true;
+      if (result == null) unresolved = true;
+    }
+    if (unresolved) return null;
+    return mode === 'and';
+  }
+
+  private detectFilterNodeFormulaReference(
+    node: unknown,
+    seen = new WeakSet<object>(),
+  ): FormulaReferenceDetection {
+    if (typeof node === 'string') return this.detectFilterExpressionFormulaReference(node);
+    if (!node || typeof node !== 'object' || seen.has(node)) return 'no';
+    seen.add(node);
+    const merge = (states: FormulaReferenceDetection[]): FormulaReferenceDetection => {
+      if (states.includes('unavailable')) return 'unavailable';
+      return states.includes('yes') ? 'yes' : 'no';
+    };
+    if (Array.isArray(node)) {
+      return merge(node.map((child) => this.detectFilterNodeFormulaReference(child, seen)));
+    }
+    const record = node as Record<string, unknown>;
+    const property = this.readFilterObjectProperty(record);
+    if (property) {
+      if (!this.isFormulaProperty(property)) return 'no';
+      if (getGcmFormulaApi(this.app)) return 'yes';
+      this.reportFormulaReferenceApiUnavailable();
+      return 'unavailable';
+    }
+    return merge(['and', 'all', 'or', 'any', 'not']
+      .filter((key) => Object.prototype.hasOwnProperty.call(record, key))
+      .map((key) => this.detectFilterNodeFormulaReference(record[key], seen)));
+  }
+
+  private filterNodeReferencesFormula(node: unknown, seen = new WeakSet<object>()): boolean {
+    return this.detectFilterNodeFormulaReference(node, seen) !== 'no';
+  }
+
+  private filterNodeReferencesAdditiveKind(node: unknown, seen = new WeakSet<object>()): boolean {
+    if (typeof node === 'string') {
+      const expression = node.trim().replace(/^!+\s*/u, '');
+      return this.isAdditiveKindFilterExpression(expression);
+    }
+    if (!node || typeof node !== 'object' || seen.has(node)) return false;
+    seen.add(node);
+    if (Array.isArray(node)) return node.some((child) => this.filterNodeReferencesAdditiveKind(child, seen));
+    const record = node as Record<string, unknown>;
+    const property = this.readFilterObjectProperty(record);
+    if (property) return this.isAdditiveKindProperty(property);
+    return ['and', 'all', 'or', 'any', 'not']
+      .filter((key) => Object.prototype.hasOwnProperty.call(record, key))
+      .some((key) => this.filterNodeReferencesAdditiveKind(record[key], seen));
+  }
+
+  private isAdditiveKindFilterExpression(expression: string): boolean {
+    if (this.parseAdditiveKindExpression(expression)) return true;
+    return this.isAdditiveKindProperty(this.readFilterExpressionProperty(expression));
+  }
+
+  private detectFilterExpressionFormulaReference(expression: unknown): FormulaReferenceDetection {
+    const source = String(expression ?? '');
+    const api = getGcmFormulaApi(this.app);
+    if (!api) {
+      const property = this.readFilterExpressionProperty(source);
+      if (property && !this.isFormulaProperty(property) && !/&&|\|\|/u.test(source)) return 'no';
+      if ((property && this.isFormulaProperty(property)) || this.hasActiveFormulaDefinitions() || /&&|\|\|/u.test(source)) {
+        this.reportFormulaReferenceApiUnavailable();
+        return 'unavailable';
+      }
+      return 'no';
+    }
+    try {
+      const result = api.hasReference(source);
+      if (typeof result !== 'boolean') {
+        throw new Error('TPS Global Context Menu returned an invalid formula-reference result.');
+      }
+      return result ? 'yes' : 'no';
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-reference-detection-failed',
+        `Formula reference detection failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return 'unavailable';
+    }
+  }
+
+  private reportFormulaReferenceApiUnavailable(): void {
+    const apiStatus = getGcmApiStatus(this.app);
+    const advertisedVersion = apiStatus?.available ? apiStatus.formulasVersion : null;
+    const code = advertisedVersion != null ? 'incompatible-formula-api' : 'missing-formula-api';
+    const message = advertisedVersion == null
+      ? 'TPS Global Context Menu formula API is required to classify synthesized Kanban filters.'
+      : `TPS Global Context Menu formula API version ${TPS_FORMULA_API_VERSION} is required; the complete formula contract was not available (found ${advertisedVersion}).`;
+    this.reportFormulaDiagnostic(code, message);
+  }
+
+  private filterExpressionReferencesFormula(expression: unknown): boolean {
+    return this.detectFilterExpressionFormulaReference(expression) !== 'no';
   }
 
   private combineTaskFilterResults(results: Array<boolean | null>, mode: 'and' | 'or'): boolean | null {
@@ -3424,9 +3904,25 @@ export class KanbanView extends BasesView {
       : known.some(Boolean);
   }
 
-  private evaluateTaskFilterString(rawExpr: string, task: OpenTaskSubitem, file: TFile | null = null): boolean | null {
+  private evaluateTaskFilterString(
+    rawExpr: string,
+    task: OpenTaskSubitem,
+    file: TFile | null = null,
+    state?: TaskFilterEvaluationState,
+  ): boolean | null {
     const raw = String(rawExpr || '').trim();
-    if (parseBareSemanticKindExpression(raw)) return false;
+    const formulaReference = this.detectFilterExpressionFormulaReference(raw);
+    if (formulaReference === 'unavailable') {
+      if (state) state.formulaFailure = true;
+      return null;
+    }
+    if (formulaReference === 'yes') {
+      const result = file instanceof TFile
+        ? this.evaluateTaskFormulaFilterExpression(file, task, raw)
+        : null;
+      if (result == null && state) state.formulaFailure = true;
+      return result;
+    }
     const isNegated = raw.startsWith('!');
     const expr = (isNegated ? raw.slice(1) : raw).trim();
     const result = this.evaluatePositiveTaskFilterString(expr, task, file);
@@ -3434,8 +3930,10 @@ export class KanbanView extends BasesView {
   }
 
   private evaluatePositiveTaskFilterString(expr: string, task: OpenTaskSubitem, file: TFile | null = null): boolean | null {
-    if (parseBareSemanticKindExpression(expr)) return false;
-    const kindMatch = expr.match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=|is|equals?)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
+    if (this.parseAdditiveKindExpression(expr)) {
+      return this.evaluateAdditiveKindExpression(expr, this.getTaskAdditiveKinds(task, file));
+    }
+    const kindMatch = expr.match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind)\s*(?:==|=|is|equals?)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
     if (kindMatch?.[1]) {
       const value = kindMatch[1].toLowerCase();
       if (value.startsWith('bullet')) return task.itemKind === 'bullet';
@@ -3542,7 +4040,11 @@ export class KanbanView extends BasesView {
     if (!raw || lower.startsWith('note.') || lower.startsWith('file.')) return null;
     const prop = raw.replace(/^(?:task|tps|kanban)\./i, '');
     const normalized = this.normalizeInlinePropertyKey(prop);
-    if (['itemtype', 'itemkind', 'kind', 'open', 'isopen', 'done', 'isdone', 'completed', 'complete'].includes(normalized)) return null;
+    if (normalized === 'kind') {
+      return this.getTaskAdditiveKinds(task)?.map((value) => value.toLocaleLowerCase()) ?? null;
+    }
+    if (['itemtype', 'itemkind'].includes(normalized)) return [task.itemKind === 'bullet' ? 'bullet' : 'task'];
+    if (['open', 'isopen', 'done', 'isdone', 'completed', 'complete'].includes(normalized)) return null;
     if (['status', 'checkboxstatus'].includes(normalized)) {
       return [this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo'];
     }
@@ -3631,13 +4133,48 @@ export class KanbanView extends BasesView {
   }
 
   private isPathComparisonOperator(operator: string): boolean {
-    const op = String(operator || '').trim().toLowerCase().replace(/\s+/g, '');
-    return !op || op === '=' || op === '==' || op === '!=' || op === '!==' || op === 'is' || op === 'equals' || op === 'equal' || op.includes('contains') || op.includes('startswith') || op === 'starts';
+    return this.isSupportedTaskFilterOperator(operator, { contains: true, startsWith: true, presence: true });
   }
 
   private isStartsWithFilterOperator(operator: string): boolean {
-    const op = String(operator || '').trim().toLowerCase().replace(/\s+/g, '');
-    return op.includes('startswith') || op === 'starts' || op === '!starts';
+    const op = this.normalizeFilterOperator(operator);
+    return ['startswith', 'starts', '!startswith', '!starts', 'notstartswith', 'doesnotstartwith'].includes(op);
+  }
+
+  private normalizeFilterOperator(operator: string): string {
+    return String(operator || '').trim().toLocaleLowerCase().replace(/\s+/gu, '');
+  }
+
+  private isSupportedTaskFilterOperator(
+    operator: string,
+    capabilities: { contains?: boolean; startsWith?: boolean; presence?: boolean } = {},
+  ): boolean {
+    const op = this.normalizeFilterOperator(operator);
+    const equality = ['', '=', '==', '===', 'is', 'equal', 'equals', 'eq', '!=', '!==', '!is', 'isnot', 'not', 'notequal', 'notequals', 'doesnotequal'];
+    if (equality.includes(op)) return true;
+    if (capabilities.presence && ['empty', 'isempty', 'exists', 'isnotempty', 'notempty', '!exists', 'notexists', 'doesnotexist'].includes(op)) return true;
+    if (capabilities.contains && ['contains', 'containsany', 'has', '!contains', 'notcontains', 'doesnotcontain', 'doesnotcontainany'].includes(op)) return true;
+    if (capabilities.startsWith && ['startswith', 'starts', '!startswith', '!starts', 'notstartswith', 'doesnotstartwith'].includes(op)) return true;
+    return false;
+  }
+
+  private rejectUnsupportedTaskFilterOperator(
+    propRaw: string,
+    operator: string,
+    file: TFile | null,
+    task: OpenTaskSubitem,
+    state?: TaskFilterEvaluationState,
+  ): false {
+    if (state) state.unsupportedFailure = true;
+    this.reportFormulaDiagnostic(
+      'unsupported-line-filter-operator',
+      `Line filter operator ${JSON.stringify(operator)} is not supported for ${JSON.stringify(propRaw)}.`,
+      file ?? undefined,
+      task,
+      propRaw,
+      'entity filter',
+    );
+    return false;
   }
 
   private readFilterObjectProperty(node: Record<string, unknown>): string {
@@ -3674,14 +4211,33 @@ export class KanbanView extends BasesView {
       .filter(Boolean);
   }
 
+  private readFilterObjectRawValues(node: Record<string, unknown>): unknown[] {
+    const value =
+      node.values ??
+      node.value ??
+      node.pattern ??
+      node.match ??
+      node.right ??
+      node.rhs ??
+      node.target ??
+      node.expected ??
+      [];
+    return this.asArray(value).map((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+      const record = item as Record<string, unknown>;
+      const keys = Object.keys(record);
+      return keys.length === 1 && keys[0] === 'value' ? record.value : item;
+    });
+  }
+
   private isNegatedFilterOperator(operator: string): boolean {
-    const op = String(operator || '').trim().toLowerCase();
-    return op.startsWith('!') || op.includes('not') || op === '!=' || op === '!==';
+    const op = this.normalizeFilterOperator(operator);
+    return ['!=', '!==', '!is', 'isnot', 'not', 'notequal', 'notequals', 'doesnotequal', '!contains', 'notcontains', 'doesnotcontain', 'doesnotcontainany', '!startswith', '!starts', 'notstartswith', 'doesnotstartwith', '!exists', 'notexists', 'doesnotexist'].includes(op);
   }
 
   private isContainsFilterOperator(operator: string): boolean {
-    const op = String(operator || '').trim().toLowerCase().replace(/\s+/g, '');
-    return op.includes('contains') || op === 'has';
+    const op = this.normalizeFilterOperator(operator);
+    return ['contains', 'containsany', 'has', '!contains', 'notcontains', 'doesnotcontain', 'doesnotcontainany'].includes(op);
   }
 
   private isEmptyFilterOperator(operator: string): boolean {
@@ -3690,8 +4246,8 @@ export class KanbanView extends BasesView {
   }
 
   private isExistsFilterOperator(operator: string): boolean {
-    const op = String(operator || '').trim().toLowerCase().replace(/\s+/g, '');
-    return op === 'exists' || op === 'isnotempty' || op.includes('exist');
+    const op = this.normalizeFilterOperator(operator);
+    return ['exists', 'isnotempty', 'notempty', '!exists', 'notexists', 'doesnotexist'].includes(op);
   }
 
   private isImplicitEmptyValueFilter(operator: string, values: string[]): boolean {
@@ -3706,29 +4262,72 @@ export class KanbanView extends BasesView {
     return op === '!=' || op === '!==' || op === 'isnot' || op === 'not' || op === 'isnotempty';
   }
 
-  private evaluateTaskFilterObject(node: Record<string, unknown>, task: OpenTaskSubitem, file: TFile | null = null): boolean | null {
+  private evaluateTaskFilterObject(
+    node: Record<string, unknown>,
+    task: OpenTaskSubitem,
+    file: TFile | null = null,
+    state?: TaskFilterEvaluationState,
+  ): boolean | null {
     const propRaw = this.readFilterObjectProperty(node);
     if (!propRaw) return null;
     const normalizedProp = this.normalizeInlinePropertyKey(propRaw.replace(/^task\./i, '').replace(/^tps\./i, ''));
     const operator = this.readFilterObjectOperator(node);
+    const rawValues = this.readFilterObjectRawValues(node).map((value) => {
+      if (typeof value !== 'string') return value;
+      return this.resolveBaseContextToken(value) || value;
+    });
     const values = this.readFilterObjectValues(node).map((value) => this.resolveBaseContextToken(value) || value);
     const isNegated = this.isNegatedFilterOperator(operator);
     let result: boolean | null = null;
 
-    if (isBareSemanticKindFilter(propRaw, values)) return false;
-    if (['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) {
-      result = values.some((value) => {
-        const normalized = value.toLowerCase();
-        if (normalized.startsWith('bullet')) return task.itemKind === 'bullet';
-        if (normalized.startsWith('task')) return task.itemKind !== 'bullet';
-        if (normalized.startsWith('note')) return false;
-        return normalized === 'all' || normalized === 'mixed';
-      });
+    if (this.isFormulaProperty(propRaw)) {
+      return file instanceof TFile
+        ? this.evaluateTaskFormulaObjectFilter(file, task, propRaw, operator, rawValues)
+        : null;
+    } else if (this.isAdditiveKindProperty(propRaw)) {
+      if (!this.isSupportedTaskFilterOperator(operator, { contains: true, presence: true })) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
+      }
+      return this.evaluateAdditiveKindObjectFilter(this.getTaskAdditiveKinds(task, file), operator, values, file ?? undefined, task);
+    } else if (['itemtype', 'itemkind'].includes(normalizedProp)) {
+      if (!this.isSupportedTaskFilterOperator(operator, { presence: true })) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
+      }
+      if (this.isImplicitEmptyValueFilter(operator, values) || this.isEmptyFilterOperator(operator)) {
+        result = false;
+      } else if (this.isImplicitNotEmptyValueFilter(operator, values) || this.isExistsFilterOperator(operator)) {
+        result = true;
+      } else {
+        result = values.some((value) => {
+          const normalized = value.toLowerCase();
+          if (normalized.startsWith('bullet')) return task.itemKind === 'bullet';
+          if (normalized.startsWith('task')) return task.itemKind !== 'bullet';
+          if (normalized.startsWith('note')) return false;
+          return normalized === 'all' || normalized === 'mixed';
+        });
+      }
     } else if (['open', 'isopen'].includes(normalizedProp)) {
+      if (!this.isSupportedTaskFilterOperator(operator, { presence: true })) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
+      }
       const status = this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
       const isOpen = !this.getDoneStatuses().has(status);
-      result = values.some((value) => value.toLowerCase() === 'true' || value === '1') ? isOpen : null;
+      if (this.isImplicitEmptyValueFilter(operator, values) || this.isEmptyFilterOperator(operator)) {
+        result = false;
+      } else if (this.isImplicitNotEmptyValueFilter(operator, values) || this.isExistsFilterOperator(operator)) {
+        result = true;
+      } else {
+        result = values.some((value) => {
+          const normalized = value.toLowerCase();
+          if (normalized === 'true' || normalized === '1') return isOpen;
+          if (normalized === 'false' || normalized === '0') return !isOpen;
+          return false;
+        });
+      }
     } else if ((propRaw.toLowerCase().startsWith('task.') || normalizedProp === 'status' || normalizedProp === 'checkboxstatus') && ['status', 'checkboxstatus'].includes(normalizedProp)) {
+      if (!this.isSupportedTaskFilterOperator(operator, { presence: true })) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
+      }
       const status = this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
       if (this.isImplicitEmptyValueFilter(operator, values)) {
         result = false;
@@ -3738,6 +4337,9 @@ export class KanbanView extends BasesView {
         result = values.some((value) => value.toLowerCase() === status);
       }
     } else if (!propRaw.toLowerCase().startsWith('note.') && ['tag', 'tags'].includes(normalizedProp)) {
+      if (!this.isSupportedTaskFilterOperator(operator, { contains: true, presence: true })) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
+      }
       const tags = new Set(this.getTaskInlineValues(task, 'tags').map((tag) => this.normalizeTaskTag(tag)));
       if (this.isImplicitEmptyValueFilter(operator, values)) {
         result = tags.size === 0;
@@ -3749,12 +4351,30 @@ export class KanbanView extends BasesView {
         result = values.some((value) => tags.has(this.normalizeTaskTag(value)));
       }
     } else if (propRaw.toLowerCase() === 'task.file.extension' || propRaw.toLowerCase() === 'task.file.ext') {
-      result = values.some((value) => !!file && value.toLowerCase().replace(/^\./, '') === file.extension.toLowerCase());
+      if (!this.isSupportedTaskFilterOperator(operator, { presence: true })) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
+      }
+      if (this.isImplicitEmptyValueFilter(operator, values) || this.isEmptyFilterOperator(operator)) {
+        result = !file;
+      } else if (this.isImplicitNotEmptyValueFilter(operator, values) || this.isExistsFilterOperator(operator)) {
+        result = !!file;
+      } else {
+        result = values.some((value) => !!file && value.toLowerCase().replace(/^\./, '') === file.extension.toLowerCase());
+      }
     } else if (['extension', 'ext', 'fileextension', 'fileext'].includes(normalizedProp) || propRaw.toLowerCase() === 'file.extension' || propRaw.toLowerCase() === 'file.ext') {
+      if (!this.isSupportedTaskFilterOperator(operator, { presence: true })) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
+      }
       result = false;
     } else if (['path', 'file', 'filepath'].includes(normalizedProp) || propRaw.toLowerCase() === 'file.path' || propRaw.toLowerCase() === 'task.file.path') {
-      if (!this.isPathComparisonOperator(operator)) return null;
-      if (this.isStartsWithFilterOperator(operator)) {
+      if (!this.isPathComparisonOperator(operator)) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
+      }
+      if (this.isImplicitEmptyValueFilter(operator, values) || this.isEmptyFilterOperator(operator)) {
+        result = !file;
+      } else if (this.isImplicitNotEmptyValueFilter(operator, values) || this.isExistsFilterOperator(operator)) {
+        result = !!file;
+      } else if (this.isStartsWithFilterOperator(operator)) {
         result = values.some((value) => this.taskFilePathStartsWith(file, value));
       } else if (this.isContainsFilterOperator(operator)) {
         result = values.some((value) => {
@@ -3765,6 +4385,9 @@ export class KanbanView extends BasesView {
         result = values.some((value) => this.taskFilePathMatches(file, value));
       }
     } else if (propRaw.toLowerCase().startsWith('file.') || ['folder', 'folderpath', 'name', 'basename'].includes(normalizedProp)) {
+      if (!this.isSupportedTaskFilterOperator(operator, { contains: true, presence: true })) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
+      }
       const currentValues = this.getTaskFileComparableValues(file, propRaw);
       if (this.isImplicitEmptyValueFilter(operator, values) || this.isEmptyFilterOperator(operator)) {
         result = currentValues.length === 0;
@@ -3784,6 +4407,8 @@ export class KanbanView extends BasesView {
       const currentValues = this.getGenericTaskComparableValues(task, propRaw);
       if (currentValues == null) {
         result = null;
+      } else if (!this.isSupportedTaskFilterOperator(operator, { contains: true, presence: true })) {
+        return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
       } else if (this.isImplicitEmptyValueFilter(operator, values)) {
         result = currentValues.length === 0;
       } else if (this.isImplicitNotEmptyValueFilter(operator, values)) {
@@ -3799,7 +4424,11 @@ export class KanbanView extends BasesView {
       }
     }
 
-    return result == null ? null : isNegated ? !result : result;
+    if (result == null) return null;
+    const normalizedOperator = this.normalizeFilterOperator(operator);
+    const presenceResultIsFinal = this.isImplicitNotEmptyValueFilter(operator, values)
+      || ['empty', 'isempty', 'exists', 'isnotempty', 'notempty'].includes(normalizedOperator);
+    return presenceResultIsFinal ? result : isNegated ? !result : result;
   }
 
   private getTaskFileComparableValues(file: TFile | null, propRaw: string): string[] {
@@ -3829,16 +4458,178 @@ export class KanbanView extends BasesView {
     return actual === expected || (includeDescendants && actual.startsWith(`${expected}/`));
   }
 
-  private getTaskLaneIds(task: OpenTaskSubitem, propName: string | null): string[] {
+  private getTaskLaneIds(file: TFile, task: OpenTaskSubitem, propName: string | null): string[] {
+    if (this.isFormulaProperty(propName)) {
+      const values = this.getTaskFormulaGroupValues(file, task, propName || '');
+      if (!values) return ['ungrouped'];
+      if (!values.length) return ['ungrouped'];
+      const formulaLaneLabels = this.formulaLaneLabels ??= new Map<string, string>();
+      const laneIds = values.map((value) => {
+        const laneId = `key:${value.toLowerCase()}`;
+        if (!formulaLaneLabels.has(laneId)) formulaLaneLabels.set(laneId, value);
+        return laneId;
+      });
+      return Array.from(new Set(laneIds));
+    }
     const normalized = this.normalizeInlinePropertyKey(this.getTaskInlinePropertyName(propName));
     if (this.isStatusPropertyName(propName)) {
       if (task.itemKind === 'bullet') return ['ungrouped'];
       return [this.getLaneIdForStatus(this.getStatusForCheckboxState(task.checkboxState || '[ ]'))];
     }
-    const values = this.getTaskInlineValues(task, normalized)
+    const additiveKinds = normalized === 'kind' ? this.getTaskAdditiveKinds(task, file) : null;
+    if (normalized === 'kind' && !additiveKinds) return ['ungrouped'];
+    const values = (normalized === 'kind'
+      ? additiveKinds ?? []
+      : ['itemkind', 'itemtype'].includes(normalized)
+        ? [task.itemKind === 'bullet' ? 'bullet' : 'task']
+        : this.getTaskInlineValues(task, normalized))
       .map((value) => normalized === 'scheduled' ? this.normalizeScheduledLaneValue(value) : value);
     if (!values.length) return ['ungrouped'];
-    return Array.from(new Set(values.map((value) => `key:${value}`)));
+    return Array.from(new Set(values.map((value) => `key:${value.toLocaleLowerCase()}`)));
+  }
+
+  private sortTaskRenderItems(items: TaskRenderItem[]): TaskRenderItem[] {
+    const sortDescriptors = this.getSortDescriptors();
+    if (!sortDescriptors.length || items.length < 2) return items;
+    const keyed = items.map((item) => ({
+      item,
+      keys: sortDescriptors.map(({ prop }) => this.getTaskSortableKey(item.file, item.task, prop)),
+    }));
+    keyed.sort((left, right) => {
+      for (let index = 0; index < sortDescriptors.length; index += 1) {
+        const { direction } = sortDescriptors[index];
+        const leftKey = left.keys[index];
+        const rightKey = right.keys[index];
+        if (leftKey.available !== rightKey.available) return leftKey.available ? -1 : 1;
+        if (!leftKey.available) continue;
+        if (leftKey.key < rightKey.key) return direction === 'desc' ? 1 : -1;
+        if (leftKey.key > rightKey.key) return direction === 'desc' ? -1 : 1;
+      }
+      const pathOrder = left.item.file.path.localeCompare(right.item.file.path);
+      return pathOrder || left.item.task.line - right.item.task.line;
+    });
+    return keyed.map(({ item }) => item);
+  }
+
+  private getTaskRenderItemIdentity(item: TaskRenderItem): string {
+    return item.task.internalId || `${item.file.path}:${item.task.line}`;
+  }
+
+  private dedupeTaskRenderItems(items: TaskRenderItem[]): TaskRenderItem[] {
+    const identities = new Set<string>();
+    return items.filter((item) => {
+      const identity = this.getTaskRenderItemIdentity(item);
+      if (identities.has(identity)) return false;
+      identities.add(identity);
+      return true;
+    });
+  }
+
+  private countUniqueTaskRenderItems(taskRenderItemsByLane: Map<string, TaskRenderItem[]>): number {
+    return new Set(
+      Array.from(taskRenderItemsByLane.values())
+        .flat()
+        .map((item) => this.getTaskRenderItemIdentity(item)),
+    ).size;
+  }
+
+  private sortMixedLaneRenderItems(
+    noteItems: LaneRenderItem[],
+    lineItems: TaskRenderItem[],
+  ): MixedLaneRenderItem[] {
+    const combined: MixedLaneRenderItem[] = [
+      ...noteItems.map((item): MixedLaneRenderItem => ({ kind: 'note', item })),
+      ...lineItems.map((item): MixedLaneRenderItem => ({ kind: 'line', item })),
+    ];
+    const sortDescriptors = this.getSortDescriptors();
+    if (!sortDescriptors.length || combined.length < 2) return combined;
+
+    const keyed = combined.map((item, originalIndex) => ({
+      item,
+      originalIndex,
+      keys: sortDescriptors.map(({ prop }) => this.getMixedLaneSortKey(item, prop)),
+    }));
+    keyed.sort((left, right) => {
+      for (let index = 0; index < sortDescriptors.length; index += 1) {
+        const { direction } = sortDescriptors[index];
+        const leftKey = left.keys[index];
+        const rightKey = right.keys[index];
+        if (leftKey.available !== rightKey.available) return leftKey.available ? -1 : 1;
+        if (!leftKey.available) continue;
+        if (leftKey.key < rightKey.key) return direction === 'desc' ? 1 : -1;
+        if (leftKey.key > rightKey.key) return direction === 'desc' ? -1 : 1;
+      }
+      return left.originalIndex - right.originalIndex;
+    });
+    return keyed.map(({ item }) => item);
+  }
+
+  private getMixedLaneSortKey(
+    item: MixedLaneRenderItem,
+    propId: string,
+  ): { available: boolean; key: string } {
+    if (item.kind === 'line') {
+      return this.getTaskSortableKey(item.item.file, item.item.task, propId);
+    }
+
+    if (!this.isFormulaProperty(propId)) {
+      try {
+        return { available: true, key: this.sortValue(item.item.entry, propId) };
+      } catch {
+        return { available: false, key: '' };
+      }
+    }
+    const api = this.getCompiledFormulaSet()?.api;
+    if (!api) return { available: false, key: '' };
+    try {
+      const value = item.item.entry.getValue(propId as any);
+      if (this.isNativeBasesErrorValue(value)) return { available: false, key: '' };
+      return { available: true, key: String(api.sortKey(value) ?? '') };
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-sort-key-failed',
+        error instanceof Error ? error.message : String(error),
+        item.item.entry.file,
+        undefined,
+        this.getFormulaName(propId),
+      );
+      return { available: false, key: '' };
+    }
+  }
+
+  private getTaskSortableKey(
+    file: TFile,
+    task: OpenTaskSubitem,
+    propId: string,
+  ): { available: boolean; key: string } {
+    if (!this.isFormulaProperty(propId)) {
+      return { available: true, key: this.getTaskSortKey(file, task, propId) };
+    }
+    const result = this.getTaskFormulaResult(file, task, propId);
+    if (!result || result.status === 'error' || result.status === 'unsupported') return { available: false, key: '' };
+    const api = this.getCompiledFormulaSet()?.api;
+    if (!api) return { available: false, key: '' };
+    try {
+      return { available: true, key: String(api.sortKey(result.value) ?? '') };
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-sort-key-failed',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+        this.getFormulaName(propId),
+      );
+      return { available: false, key: '' };
+    }
+  }
+
+  private getTaskSortKey(file: TFile, task: OpenTaskSubitem, propId: string): string {
+    const lower = String(propId || '').trim().toLowerCase();
+    if (lower === 'file.name' || lower === 'file.basename') return file.basename.toLowerCase();
+    if (lower === 'file.path') return file.path.toLowerCase();
+    if (lower === 'title' || lower === 'task.title') return this.getTaskVisibleTitle(task).toLowerCase();
+    const values = this.getGenericTaskComparableValues(task, propId);
+    return values?.join('\u0000') || '';
   }
 
   private normalizeScheduledLaneValue(value: string): string {
@@ -3882,7 +4673,12 @@ export class KanbanView extends BasesView {
     for (const field of task.inlineFields ?? []) {
       const key = this.normalizeInlinePropertyKey(field.key);
       if (normalized === 'tags') {
-        if (key === 'tag' || key === 'tags') values.push(this.normalizeTaskTag(field.value));
+        if (key === 'tag' || key === 'tags') {
+          values.push(...String(field.value || '')
+            .split(/[,\s]+/gu)
+            .map((value) => this.normalizeTaskTag(value))
+            .filter(Boolean));
+        }
       } else if (key === normalized) {
         values.push(String(field.value || '').trim());
       }
@@ -4564,6 +5360,11 @@ export class KanbanView extends BasesView {
   }
 
   private getChildLinkKeys(): string[] {
+    const gcmKeys = this.getGcmServices()?.parents?.getChildKeys?.();
+    if (Array.isArray(gcmKeys) && gcmKeys.length > 0) {
+      return gcmKeys.map((key: unknown) => String(key || '').trim()).filter(Boolean);
+    }
+
     const keys = new Set<string>();
     for (const settings of this.getRelationshipSettingsSources()) {
       const configured = String(
@@ -4580,25 +5381,8 @@ export class KanbanView extends BasesView {
   }
 
   private getRelationshipSettingsSources(): Array<Record<string, any>> {
-    const out: Array<Record<string, any>> = [];
-    const pushIfObject = (candidate: unknown) => {
-      if (candidate && typeof candidate === 'object') out.push(candidate as Record<string, any>);
-    };
-
-    // Local plugin settings (if present in this build variant).
-    pushIfObject((this.plugin as any)?.settings);
-
-    const plugins = (this.app as any)?.plugins?.plugins;
-    if (plugins && typeof plugins === 'object') {
-      // Dedicated GCM plugin variants.
-      pushIfObject(plugins['tps-global-context-menu']?.settings);
-      pushIfObject(plugins['TPS-Global-Context-Menu (Dev)']?.settings);
-      // Consolidated TPS plugin variants.
-      pushIfObject(plugins['tps']?.settings);
-      pushIfObject(plugins['TPS (Dev)']?.settings);
-    }
-
-    return out;
+    const settings = (this.plugin as any)?.settings;
+    return settings && typeof settings === 'object' ? [settings] : [];
   }
 
   private findFrontmatterKeyCaseInsensitive(frontmatter: Record<string, unknown>, target: string): string | null {
@@ -4694,21 +5478,34 @@ export class KanbanView extends BasesView {
   private evaluateStyleCondition(data: Record<string, unknown>, condition: KanbanStyleCondition): boolean {
     const field = String(condition.field || '').trim();
     const rawValue = field ? data[field] ?? data[field.toLowerCase()] : '';
-    const value = String(rawValue ?? '').toLowerCase();
+    const values = this.getStyleConditionValues(rawValue);
     const target = String(condition.value ?? '').toLowerCase();
     switch (condition.operator) {
-      case 'is': return value === target;
-      case '!is': return value !== target;
-      case 'contains': return value.includes(target);
-      case '!contains': return !value.includes(target);
-      case 'starts': return value.startsWith(target);
-      case '!starts': return !value.startsWith(target);
-      case 'ends': return value.endsWith(target);
-      case '!ends': return !value.endsWith(target);
-      case 'exists': return value.length > 0;
-      case '!exists': return value.length === 0;
+      case 'is': return values.some((value) => value === target);
+      case '!is': return values.every((value) => value !== target);
+      case 'contains': return values.some((value) => value.includes(target));
+      case '!contains': return values.every((value) => !value.includes(target));
+      case 'starts': return values.some((value) => value.startsWith(target));
+      case '!starts': return values.every((value) => !value.startsWith(target));
+      case 'ends': return values.some((value) => value.endsWith(target));
+      case '!ends': return values.every((value) => !value.endsWith(target));
+      case 'exists': return values.some((value) => value.length > 0);
+      case '!exists': return values.every((value) => value.length === 0);
       default: return false;
     }
+  }
+
+  private getStyleConditionValues(rawValue: unknown): string[] {
+    if (Array.isArray(rawValue)) return rawValue.flatMap((value) => this.getStyleConditionValues(value));
+    if (rawValue instanceof Set) return Array.from(rawValue, (value) => String(value ?? '').toLocaleLowerCase());
+    return [String(rawValue ?? '').toLocaleLowerCase()];
+  }
+
+  private isNativeBasesErrorValue(value: unknown): boolean {
+    if (!value || typeof value !== 'object') return false;
+    return String((value as { constructor?: { type?: unknown } }).constructor?.type || '')
+      .trim()
+      .toLocaleLowerCase() === 'error';
   }
 
   private resolveCardStyleRule(
@@ -4724,9 +5521,37 @@ export class KanbanView extends BasesView {
       data[key] = value;
       data[String(key).trim().toLowerCase()] = value;
     }
-    if (groupPropName) {
-      const groupValue = this.getEntryStringValue(entry, groupPropName)
-        || String(this.getFrontmatterValueCaseInsensitive(frontmatter || {}, groupPropName) ?? '').trim();
+    data.kind = this.getNoteAdditiveKinds(entry.file);
+    data.itemtype = 'note';
+    data.itemkind = 'note';
+    const formulaValues = new Map<string, { available: boolean; value?: unknown }>();
+    const resolveFormula = (propId: string): boolean => {
+      const cached = formulaValues.get(propId);
+      if (cached) return cached.available;
+      try {
+        const value = entry.getValue(propId as any);
+        if (this.isNativeBasesErrorValue(value)) {
+          formulaValues.set(propId, { available: false });
+          return false;
+        }
+        const api = getGcmFormulaApi(this.app);
+        if (!api) {
+          formulaValues.set(propId, { available: false });
+          return false;
+        }
+        const formatted = api.format(value);
+        data[propId] = formatted;
+        data[propId.toLowerCase()] = formatted;
+        formulaValues.set(propId, { available: true, value: formatted });
+        return true;
+      } catch {
+        formulaValues.set(propId, { available: false });
+        return false;
+      }
+    };
+    if (groupPropName && !this.isFormulaProperty(groupPropName)) {
+      const entryGroupValue = this.getEntryStringValue(entry, groupPropName);
+      const groupValue = entryGroupValue || String(this.getFrontmatterValueCaseInsensitive(frontmatter || {}, groupPropName) ?? '').trim();
       data[groupPropName] = groupValue;
       data[groupPropName.toLowerCase()] = groupValue;
     }
@@ -4735,7 +5560,11 @@ export class KanbanView extends BasesView {
       if (rule.active === false) continue;
       const conditions = Array.isArray(rule.conditions) ? rule.conditions : [];
       if (!conditions.length) continue;
-      const evaluateCondition = (condition: KanbanStyleCondition) => this.evaluateStyleCondition(data, condition);
+      const evaluateCondition = (condition: KanbanStyleCondition) => {
+        const field = String(condition.field || '').trim();
+        if (this.isFormulaProperty(field) && !resolveFormula(field)) return false;
+        return this.evaluateStyleCondition(data, condition);
+      };
       const matches = rule.match === 'any'
         ? conditions.some(evaluateCondition)
         : conditions.every(evaluateCondition);
@@ -4761,12 +5590,31 @@ export class KanbanView extends BasesView {
     const taskStatus = task.itemKind === 'bullet' ? 'bullet' : this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
     data.status = taskStatus;
     data['task.status'] = taskStatus;
-    data.kind = task.itemKind === 'bullet' ? 'bullet' : 'task';
-    data.itemtype = data.kind;
-    data.itemkind = data.kind;
-    if (groupPropName) {
-      const normalizedGroup = this.normalizeInlinePropertyKey(groupPropName);
-      const groupValue = this.getTaskInlineValues(task, normalizedGroup).join(', ');
+    const structuralKind = task.itemKind === 'bullet' ? 'bullet' : 'task';
+    data.kind = this.getTaskAdditiveKinds(task, file) ?? [];
+    data.itemtype = structuralKind;
+    data.itemkind = structuralKind;
+    const formulaValues = new Map<string, { available: boolean; value?: string }>();
+    const resolveFormula = (propId: string): boolean => {
+      const cached = formulaValues.get(propId);
+      if (cached) return cached.available;
+      const result = this.getTaskFormulaResult(file, task, propId);
+      if (!result || result.status === 'error' || result.status === 'unsupported') {
+        formulaValues.set(propId, { available: false });
+        return false;
+      }
+      const formatted = this.formatFormulaValue(result.value, file, task, this.getFormulaName(propId));
+      if (formatted == null) {
+        formulaValues.set(propId, { available: false });
+        return false;
+      }
+      data[propId] = formatted;
+      data[propId.toLowerCase()] = formatted;
+      formulaValues.set(propId, { available: true, value: formatted });
+      return true;
+    };
+    if (groupPropName && !this.isFormulaProperty(groupPropName)) {
+      const groupValue = this.getTaskInlineValues(task, this.normalizeInlinePropertyKey(groupPropName)).join(', ');
       data[groupPropName] = groupValue;
       data[groupPropName.toLowerCase()] = groupValue;
     }
@@ -4775,7 +5623,11 @@ export class KanbanView extends BasesView {
       if (rule.active === false) continue;
       const conditions = Array.isArray(rule.conditions) ? rule.conditions : [];
       if (!conditions.length) continue;
-      const evaluateCondition = (condition: KanbanStyleCondition) => this.evaluateStyleCondition(data, condition);
+      const evaluateCondition = (condition: KanbanStyleCondition) => {
+        const field = String(condition.field || '').trim();
+        if (this.isFormulaProperty(field) && !resolveFormula(field)) return false;
+        return this.evaluateStyleCondition(data, condition);
+      };
       const matches = rule.match === 'any'
         ? conditions.some(evaluateCondition)
         : conditions.every(evaluateCondition);
@@ -4811,9 +5663,35 @@ export class KanbanView extends BasesView {
       const label = this.formatCardPropertyValue(value);
       if (!label) continue;
       const chip = wrap.createDiv({ cls: 'tps-kanban-card-property' });
-      chip.createSpan({ cls: 'tps-kanban-card-property-text', text: label });
+      const booleanValue = this.getBooleanPropertyValue(value);
+      if (booleanValue == null) {
+        chip.createSpan({ cls: 'tps-kanban-card-property-text', text: label });
+      } else {
+        const checkbox = chip.createEl('input', {
+          cls: 'tps-kanban-card-property-checkbox',
+          attr: {
+            type: 'checkbox',
+            disabled: 'true',
+            'aria-label': `${propId}: ${booleanValue ? 'true' : 'false'}`,
+            title: `${propId}: ${booleanValue ? 'true' : 'false'}`,
+          },
+        });
+        checkbox.checked = booleanValue;
+      }
     }
     if (!wrap.children.length) wrap.remove();
+  }
+
+  private getBooleanPropertyValue(value: unknown): boolean | null {
+    if (typeof value === 'boolean') return value;
+    const api = getGcmFormulaApi(this.app);
+    if (!api) return null;
+    try {
+      const comparable = api.comparableValues(value);
+      return comparable.length === 1 && typeof comparable[0] === 'boolean' ? comparable[0] : null;
+    } catch {
+      return null;
+    }
   }
 
   private getCardSummary(
@@ -5164,7 +6042,7 @@ export class KanbanView extends BasesView {
 
   private createSyntheticGroupFromLaneId(laneId: string): BasesEntryGroup | null {
     if (laneId === 'ungrouped') return this.createSyntheticGroup(null);
-    if (laneId.startsWith('key:')) return this.createSyntheticGroup(laneId.slice(4));
+    if (laneId.startsWith('key:')) return this.createSyntheticGroup(this.formulaLaneLabels?.get(laneId) ?? laneId.slice(4));
     return null;
   }
 
@@ -5255,13 +6133,17 @@ export class KanbanView extends BasesView {
     if (
       this.embeddedBaseFilterCache?.path === file.path
       && this.embeddedBaseFilterCache.mtime === mtime
+      && !this.embeddedBaseFilterCache.errorAt
       && (!viewName || this.embeddedBaseFilterCache.viewName === viewName)
     ) {
       return this.embeddedBaseFilterCache.filters;
     }
 
     void this.loadEmbeddedBaseFilters(file, mtime, viewName);
-    return this.embeddedBaseFilterCache?.path === file.path && (!viewName || this.embeddedBaseFilterCache.viewName === viewName)
+    return this.embeddedBaseFilterCache?.path === file.path
+      && this.embeddedBaseFilterCache.mtime === mtime
+      && !this.embeddedBaseFilterCache.errorAt
+      && (!viewName || this.embeddedBaseFilterCache.viewName === viewName)
       ? this.embeddedBaseFilterCache.filters
       : null;
   }
@@ -5269,11 +6151,15 @@ export class KanbanView extends BasesView {
   private async loadEmbeddedBaseFilters(file: TFile, mtime = Number(file.stat?.mtime || 0), viewName = this.getConfiguredBaseViewName()): Promise<void> {
     const loadingKey = `${file.path}:${mtime}:${viewName}`;
     if (this.embeddedBaseFiltersLoadingKey === loadingKey) return;
+    if (this.shouldDeferBaseFilterRead('embedded', loadingKey)) return;
     this.embeddedBaseFiltersLoadingKey = loadingKey;
     try {
       const content = await this.app.vault.cachedRead(file);
+      if (this.embeddedBaseFiltersLoadingKey !== loadingKey) return;
       const exactRoots: unknown[] = [];
       const fallbackRoots: unknown[] = [];
+      const exactFormulaSets: FormulaDefinitions[] = [];
+      const fallbackFormulaSets: FormulaDefinitions[] = [];
       const viewNames: string[] = [];
       const blockPattern = /```base\s*\n([\s\S]*?)```/gi;
       let match: RegExpExecArray | null = null;
@@ -5284,6 +6170,8 @@ export class KanbanView extends BasesView {
           if (!blockMatch) continue;
           const extracted = this.extractBaseFileFilterRoots(parsed, viewName);
           viewNames.push(...extracted.viewNames);
+          const formulas = this.extractBaseFormulaDefinitions(parsed);
+          (blockMatch === 'exact' ? exactFormulaSets : fallbackFormulaSets).push(formulas);
           if (extracted.filters?.length) {
             const target = blockMatch === 'exact' ? exactRoots : fallbackRoots;
             target.push(...extracted.filters);
@@ -5292,23 +6180,47 @@ export class KanbanView extends BasesView {
           flowError('EmbeddedBaseFilters', 'parse-block-failed', error, { path: file.path, viewName });
         }
       }
-      const roots = exactRoots.length ? exactRoots : fallbackRoots;
+      const roots = exactFormulaSets.length ? exactRoots : fallbackRoots;
+      const formulaSets = exactFormulaSets.length ? exactFormulaSets : fallbackFormulaSets;
+      const ambiguous = formulaSets.length > 1;
+      const formulas = ambiguous ? {} : formulaSets[0] ?? {};
+      if (ambiguous) {
+        this.reportFormulaDiagnostic(
+          'ambiguous-embedded-base',
+          'Multiple embedded Base definitions match this Kanban view; filters and formula evaluation are disabled until the view is unambiguous.',
+        );
+      }
       const currentViewName = viewName || viewNames[0] || '';
       const previous = this.embeddedBaseFilterCache;
       this.embeddedBaseFilterCache = {
         path: file.path,
         mtime,
         viewName: currentViewName,
-        filters: roots.length ? roots : null,
+        filters: !ambiguous && roots.length ? roots : null,
+        formulas,
       };
-      if (previous?.path !== file.path || previous?.mtime !== mtime || previous?.viewName !== currentViewName || previous?.filters !== this.embeddedBaseFilterCache.filters) {
+      this.clearEmbeddedBaseFilterRetryTimer();
+      if (
+        previous?.path !== file.path
+        || previous?.mtime !== mtime
+        || previous?.viewName !== currentViewName
+        || previous?.filters !== this.embeddedBaseFilterCache.filters
+        || !!previous?.errorAt
+        || this.getFormulaDefinitionsSignature(previous?.formulas ?? {}) !== this.getFormulaDefinitionsSignature(formulas)
+      ) {
         flow('EmbeddedBaseFilters', 'loaded', {
           path: file.path,
           viewName: currentViewName,
-          filterRoots: roots.length,
+          filterRoots: ambiguous ? 0 : roots.length,
+          formulas: Object.keys(formulas).length,
         });
         this.refreshDebounced();
       }
+    } catch (error) {
+      if (this.embeddedBaseFiltersLoadingKey !== loadingKey) return;
+      flowError('EmbeddedBaseFilters', 'read-failed', error, { path: file.path, viewName });
+      this.embeddedBaseFilterCache = { path: file.path, mtime, viewName, filters: null, formulas: {}, errorAt: Date.now() };
+      this.recordBaseFilterReadFailure('embedded', file, mtime, viewName);
     } finally {
       if (this.embeddedBaseFiltersLoadingKey === loadingKey) this.embeddedBaseFiltersLoadingKey = null;
     }
@@ -5331,24 +6243,833 @@ export class KanbanView extends BasesView {
     return kanbanViews.length === 1 ? 'fallback' : null;
   }
 
+  private getActiveFormulaDefinitions(): FormulaDefinitions {
+    const baseFile = this.getBaseFile();
+    const viewName = this.getConfiguredBaseViewName();
+    if (baseFile) {
+      const cache = this.baseFileFilterCache;
+      if (
+        cache?.path === baseFile.path
+        && cache.mtime === Number(baseFile.stat?.mtime || 0)
+        && !cache.errorAt
+        && (!viewName || cache.viewName === viewName)
+      ) return cache.formulas;
+      this.scheduleBaseFileFilterLoad();
+      return {};
+    }
+
+    const contextFile = this.getBaseContextFile();
+    const cache = this.embeddedBaseFilterCache;
+    if (
+      contextFile
+      && cache?.path === contextFile.path
+      && cache.mtime === Number(contextFile.stat?.mtime || 0)
+      && !cache.errorAt
+      && (!viewName || cache.viewName === viewName)
+    ) return cache.formulas;
+    return {};
+  }
+
+  private hasActiveFormulaDefinitions(): boolean {
+    try {
+      return Object.keys(this.getActiveFormulaDefinitions()).length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private getCompiledFormulaSet(): FormulaCompileCache | null {
+    const definitions = this.getActiveFormulaDefinitions();
+    const cached = this.formulaCompileCache;
+    if (cached?.definitions === definitions) {
+      const cachedApi = getGcmFormulaApi(this.app);
+      const cachedSourceId = `${this.getBaseSourcePath() || 'embedded-base'}::${this.getConfiguredBaseViewName() || 'kanban'}`;
+      if (cached.api === cachedApi && cached.sourceId === cachedSourceId) return cached;
+    }
+
+    const names = Object.keys(definitions);
+    if (!names.length) return null;
+    names.sort();
+
+    const apiStatus = getGcmApiStatus(this.app);
+    const advertisedVersion = apiStatus?.available ? apiStatus.formulasVersion : null;
+    const api = getGcmFormulaApi(this.app);
+    if (!api) {
+      const code = advertisedVersion != null ? 'incompatible-formula-api' : 'missing-formula-api';
+      const message = advertisedVersion == null
+        ? 'TPS Global Context Menu formula API is required for synthesized Kanban task and bullet rows.'
+        : `TPS Global Context Menu formula API version ${TPS_FORMULA_API_VERSION} is required; the complete formula contract was not available (found ${advertisedVersion}).`;
+      this.reportFormulaDiagnostic(code, message);
+      return null;
+    }
+
+    const sourceId = `${this.getBaseSourcePath() || 'embedded-base'}::${this.getConfiguredBaseViewName() || 'kanban'}`;
+    const signature = JSON.stringify(names.map((name) => [name, definitions[name]]));
+    try {
+      const compiled = api.compile(Object.fromEntries(names.map((name) => [name, definitions[name]])), sourceId);
+      const revision = String((compiled as any)?.revision || signature);
+      this.formulaCompileCache = { api, definitions, signature, sourceId, compiled, revision };
+      this.taskFormulaSessions = new WeakMap();
+      return this.formulaCompileCache;
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-compile-failed',
+        error instanceof Error ? error.message : String(error),
+      );
+      return null;
+    }
+  }
+
+  private isFormulaProperty(propId: unknown): boolean {
+    return /^formula\..+$/i.test(String(propId ?? '').trim());
+  }
+
+  private getFormulaName(propId: unknown): string {
+    return String(propId ?? '').trim().replace(/^formula\./i, '');
+  }
+
+  private getTaskFormulaSession(file: TFile, task: OpenTaskSubitem): GcmFormulaSession | null {
+    const formulaSet = this.getCompiledFormulaSet();
+    if (!formulaSet) return null;
+    const cached = this.taskFormulaSessions.get(task);
+    if (cached?.revision === formulaSet.revision) return cached.session;
+    this.formulaNow ??= new Date();
+    try {
+      const context = this.createTaskFormulaContext(file, task);
+      if (!context) return null;
+      const session = formulaSet.api.createSession(
+        formulaSet.compiled,
+        context,
+      );
+      if (
+        !session
+        || typeof session.get !== 'function'
+        || typeof session.getAll !== 'function'
+        || typeof session.evaluateExpression !== 'function'
+      ) throw new Error('TPS Global Context Menu returned an incompatible formula session.');
+      this.taskFormulaSessions.set(task, { revision: formulaSet.revision, session });
+      return session;
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-session-failed',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+      );
+      return null;
+    }
+  }
+
+  private getTaskFormulaResult(file: TFile, task: OpenTaskSubitem, propId: string): GcmFormulaResult | null {
+    const formula = this.getFormulaName(propId);
+    if (!formula) return null;
+    if (!this.hasActiveFormulaDefinitions()) {
+      this.reportFormulaDiagnostic(
+        'formula-definitions-missing',
+        'The active Base does not expose formula definitions for this computed operation.',
+        file,
+        task,
+        formula,
+      );
+      return null;
+    }
+    const session = this.getTaskFormulaSession(file, task);
+    if (!session) return null;
+    try {
+      const result = session.get(formula);
+      if (!this.isGcmFormulaResult(result)) {
+        this.reportFormulaDiagnostic('invalid-formula-result', 'TPS Global Context Menu returned an invalid formula result.', file, task, formula);
+        return null;
+      }
+      if (result.status === 'error' || result.status === 'unsupported') {
+        this.reportFormulaResult(result, file, task);
+      }
+      return result;
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-evaluation-threw',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+      );
+      return null;
+    }
+  }
+
+  private getAllTaskFormulaResults(file: TFile, task: OpenTaskSubitem): Record<string, GcmFormulaResult> | null {
+    const session = this.getTaskFormulaSession(file, task);
+    if (!session) return null;
+    try {
+      const results = session.getAll();
+      if (!results || typeof results !== 'object' || Array.isArray(results)) {
+        throw new Error('TPS Global Context Menu returned an invalid formula result set.');
+      }
+      const unavailable: GcmFormulaResult[] = [];
+      for (const [name, result] of Object.entries(results)) {
+        if (!this.isGcmFormulaResult(result)) {
+          this.reportFormulaDiagnostic('invalid-formula-result', 'TPS Global Context Menu returned an invalid formula result.', file, task, name);
+          return null;
+        }
+        if (result.status === 'error' || result.status === 'unsupported') unavailable.push(result);
+      }
+      if (unavailable.length) {
+        const first = unavailable[0];
+        this.reportFormulaDiagnostic(
+          'formula-search-results-unavailable',
+          `${unavailable.length} formula${unavailable.length === 1 ? '' : 's'} could not be included in search${first?.message ? `; first error: ${first.message}` : ''}.`,
+          file,
+          task,
+          '$search',
+        );
+      }
+      return results;
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-evaluation-threw',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+        '$all',
+      );
+      return null;
+    }
+  }
+
+  private isGcmFormulaResult(result: unknown): result is GcmFormulaResult {
+    if (!result || typeof result !== 'object') return false;
+    const status = (result as GcmFormulaResult).status;
+    return status === 'value' || status === 'empty' || status === 'unsupported' || status === 'error';
+  }
+
+  private formatFormulaValue(value: unknown, file: TFile, task: OpenTaskSubitem, formula: string): string | null {
+    const api = this.getCompiledFormulaSet()?.api;
+    if (!api) return null;
+    try {
+      return String(api.format(value) ?? '');
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-format-failed',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+        formula,
+      );
+      return null;
+    }
+  }
+
+  private getTaskFormulaGroupValues(file: TFile, task: OpenTaskSubitem, propId: string): string[] | null {
+    const result = this.getTaskFormulaResult(file, task, propId);
+    if (!result || result.status === 'error' || result.status === 'unsupported') return null;
+    const api = this.getCompiledFormulaSet()?.api;
+    if (!api) return null;
+    try {
+      const values = api.groupValues(result.value);
+      if (!Array.isArray(values) || values.some((value) => typeof value !== 'string')) {
+        throw new Error('TPS Global Context Menu returned invalid formula group values.');
+      }
+      return values.map((value) => value.trim()).filter(Boolean);
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-group-values-failed',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+        this.getFormulaName(propId),
+      );
+      return null;
+    }
+  }
+
+  private evaluateTaskFormulaFilterExpression(file: TFile, task: OpenTaskSubitem, expression: string): boolean | null {
+    if (!this.hasActiveFormulaDefinitions()) {
+      this.reportFormulaDiagnostic(
+        'formula-definitions-missing',
+        'The active Base does not expose formula definitions for this computed filter.',
+        file,
+        task,
+        '$filter',
+      );
+      return null;
+    }
+    const session = this.getTaskFormulaSession(file, task);
+    const api = this.getCompiledFormulaSet()?.api;
+    if (!session || !api) return null;
+    try {
+      const result = session.evaluateExpression(expression, '$filter');
+      if (!this.isGcmFormulaResult(result)) {
+        this.reportFormulaDiagnostic('invalid-formula-result', 'TPS Global Context Menu returned an invalid formula filter result.', file, task, '$filter');
+        return null;
+      }
+      if (result.status === 'error' || result.status === 'unsupported') {
+        this.reportFormulaResult(result, file, task);
+        return null;
+      }
+      return api.isTruthy(result.value);
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-filter-threw',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+        '$filter',
+      );
+      return null;
+    }
+  }
+
+  private evaluateTaskFormulaObjectFilter(
+    file: TFile,
+    task: OpenTaskSubitem,
+    propId: string,
+    rawOperator: string,
+    values: unknown[],
+  ): boolean | null {
+    const operator = String(rawOperator || '').trim().toLowerCase().replace(/\s+/g, '');
+    const positiveEquality = ['', '=', '==', '===', 'is', 'equal', 'equals', 'eq'];
+    const negativeEquality = ['!=', '!==', '!is', 'isnot', 'not', 'notequal', 'notequals', 'doesnotequal'];
+    const emptyOperators = ['empty', 'isempty', '!exists', 'notexists', 'doesnotexist'];
+    const notEmptyOperators = ['exists', 'isnotempty', 'notempty'];
+    const result = this.getTaskFormulaResult(file, task, propId);
+    if (!result || result.status === 'error' || result.status === 'unsupported') return null;
+    const api = this.getCompiledFormulaSet()?.api;
+    if (!api) return null;
+
+    let comparableValues: unknown[];
+    try {
+      comparableValues = api.comparableValues(result.value);
+      if (!Array.isArray(comparableValues)) throw new Error('TPS Global Context Menu returned invalid comparable formula values.');
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-filter-comparison-failed',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+        this.getFormulaName(propId),
+      );
+      return null;
+    }
+
+    if (emptyOperators.includes(operator) || (!values.length && positiveEquality.includes(operator))) return comparableValues.length === 0;
+    if (notEmptyOperators.includes(operator) || (!values.length && negativeEquality.includes(operator))) return comparableValues.length > 0;
+    if (!values.length) {
+      this.reportFormulaDiagnostic(
+        'unsupported-formula-filter-operator',
+        `Formula filter operator ${JSON.stringify(rawOperator)} requires a comparison value.`,
+        file,
+        task,
+        this.getFormulaName(propId),
+      );
+      return null;
+    }
+
+    const positiveContains = ['contains', 'has', 'containsany'];
+    const negativeContains = ['!contains', 'notcontains', 'doesnotcontain', 'doesnotcontainany'];
+    const positiveStarts = ['startswith', 'starts'];
+    const negativeStarts = ['!startswith', 'notstartswith', 'doesnotstartwith'];
+    const positiveEnds = ['endswith', 'ends'];
+    const negativeEnds = ['!endswith', 'notendswith', 'doesnotendwith'];
+    if (
+      !positiveEquality.includes(operator)
+      && !negativeEquality.includes(operator)
+      && !['>', '>=', '<', '<='].includes(operator)
+      && !positiveContains.includes(operator)
+      && operator !== 'containsall'
+      && !negativeContains.includes(operator)
+      && !positiveStarts.includes(operator)
+      && !negativeStarts.includes(operator)
+      && !positiveEnds.includes(operator)
+      && !negativeEnds.includes(operator)
+    ) {
+      this.reportFormulaDiagnostic(
+        'unsupported-formula-filter-operator',
+        `Formula filter operator ${JSON.stringify(rawOperator)} is not supported.`,
+        file,
+        task,
+        this.getFormulaName(propId),
+      );
+      return null;
+    }
+
+    try {
+      const isCollection = Array.isArray(result.value) || result.value instanceof Set;
+      const contains = (target: unknown): boolean => {
+        if (isCollection) return comparableValues.some((current) => api.compare(current, target) === 0);
+        const currentText = api.format(result.value).toLocaleLowerCase();
+        const targetText = api.format(target).toLocaleLowerCase();
+        return currentText.includes(targetText);
+      };
+      const startsWith = (target: unknown): boolean => api.format(result.value)
+        .toLocaleLowerCase()
+        .startsWith(api.format(target).toLocaleLowerCase());
+      const endsWith = (target: unknown): boolean => api.format(result.value)
+        .toLocaleLowerCase()
+        .endsWith(api.format(target).toLocaleLowerCase());
+      const comparisons = (target: unknown): number[] => comparableValues
+        .map((current) => api.compare(current, target));
+
+      if (positiveContains.includes(operator)) return values.some(contains);
+      if (operator === 'containsall') return values.every(contains);
+      if (negativeContains.includes(operator)) return values.every((value) => !contains(value));
+      if (positiveStarts.includes(operator)) return values.some(startsWith);
+      if (negativeStarts.includes(operator)) return values.every((value) => !startsWith(value));
+      if (positiveEnds.includes(operator)) return values.some(endsWith);
+      if (negativeEnds.includes(operator)) return values.every((value) => !endsWith(value));
+      if (positiveEquality.includes(operator)) return values.some((value) => comparisons(value).some((comparison) => comparison === 0));
+      if (negativeEquality.includes(operator)) return values.every((value) => comparisons(value).every((comparison) => comparison !== 0));
+      if (operator === '>') return values.some((value) => comparisons(value).some((comparison) => comparison > 0));
+      if (operator === '>=') return values.some((value) => comparisons(value).some((comparison) => comparison >= 0));
+      if (operator === '<') return values.some((value) => comparisons(value).some((comparison) => comparison < 0));
+      if (operator === '<=') return values.some((value) => comparisons(value).some((comparison) => comparison <= 0));
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'formula-filter-comparison-failed',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+        this.getFormulaName(propId),
+      );
+    }
+    return null;
+  }
+
+  private createTaskFormulaContext(file: TFile, task: OpenTaskSubitem): Record<string, unknown> | null {
+    const sourceLine = task.rawLine || task.sourceText || task.text;
+    const lineMetadata = getGcmLineMetadataApi(this.app);
+    if (!lineMetadata) {
+      const apiStatus = getGcmApiStatus(this.app);
+      const advertisedVersion = apiStatus?.available ? apiStatus.lineMetadataVersion : null;
+      this.reportFormulaDiagnostic(
+        advertisedVersion != null ? 'incompatible-line-metadata-api' : 'missing-line-metadata-api',
+        advertisedVersion != null
+          ? `TPS Global Context Menu line metadata API version ${TPS_LINE_METADATA_API_VERSION} with the complete read contract is required (found ${advertisedVersion}).`
+          : 'TPS Global Context Menu line metadata API is required for synthesized formula rows.',
+        file,
+        task,
+      );
+      return null;
+    }
+    const fileContext = this.createFormulaFileContext(file);
+    const note = fileContext.properties as Record<string, unknown>;
+    const inline: Record<string, unknown> = Object.create(null);
+    let inlineFields: Array<{ key: string; value: string }>;
+    let canonicalTags: string[];
+    let canonicalTitle: string;
+    try {
+      const parsed = task.lineMetadata ?? this.parseGcmLineMetadata(lineMetadata, sourceLine);
+      if (!parsed) throw new Error('TPS Global Context Menu returned invalid parsed line metadata.');
+      task.lineMetadata ??= parsed;
+      canonicalTags = parsed.tags;
+      canonicalTitle = parsed.displayTitle;
+      inlineFields = this.appendCanonicalTaskTagFields(parsed.fields, parsed.tags);
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'line-metadata-read-failed',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+      );
+      return null;
+    }
+    const reservedRowAliases = new Set([
+      'file',
+      'path',
+      'kind',
+      'kinds',
+      'explicitkind',
+      'itemkind',
+      'itemtype',
+      'title',
+      'text',
+      'line',
+      'linenumber',
+      'tags',
+      'checkboxstate',
+      'checkboxstatus',
+      'open',
+      'isopen',
+      'done',
+      'completed',
+    ]);
+    const inlineByNormalizedKey = new Map<string, { aliases: Set<string>; values: string[] }>();
+    for (const field of inlineFields) {
+      const key = String(field.key || '').trim();
+      const value = String(field.value || '').trim();
+      if (!key) continue;
+      const normalized = this.normalizeInlinePropertyKey(key);
+      if (!normalized || reservedRowAliases.has(normalized)) continue;
+      const group = inlineByNormalizedKey.get(normalized) ?? { aliases: new Set<string>(), values: [] };
+      group.aliases.add(key);
+      group.values.push(value);
+      inlineByNormalizedKey.set(normalized, group);
+    }
+    for (const [normalized, group] of inlineByNormalizedKey) {
+      const value: unknown = group.values.length > 1 ? group.values : group.values[0] ?? '';
+      inline[normalized] = value;
+      for (const alias of group.aliases) inline[alias] = value;
+    }
+
+    const itemKind = task.itemKind === 'bullet' ? 'bullet' : 'task';
+    const rawExplicitKindValues = inlineFields
+      .filter((field) => this.normalizeInlinePropertyKey(field.key) === 'kind')
+      .map((field) => String(field.value || '').trim())
+      .filter(Boolean);
+    let explicitKindValues: string[];
+    try {
+      explicitKindValues = Array.from(new Set(rawExplicitKindValues
+        .flatMap((value) => lineMetadata.parseStringList(value))
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)));
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'line-metadata-read-failed',
+        error instanceof Error ? error.message : String(error),
+        file,
+        task,
+      );
+      return null;
+    }
+    const explicitKind = explicitKindValues.length > 1
+      ? explicitKindValues
+      : explicitKindValues[0] ?? null;
+    const kinds = this.canonicalizeAdditiveKinds(itemKind, explicitKindValues);
+    const title = canonicalTitle || 'Untitled task';
+    const tags = Array.from(new Set(canonicalTags
+      .map((tag) => this.normalizeTaskTag(tag))
+      .filter(Boolean)
+      .map((tag) => tag.startsWith('#') ? tag : `#${tag}`)));
+    const status = task.itemKind !== 'bullet'
+      ? this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo'
+      : '';
+    const done = task.itemKind !== 'bullet' && this.getDoneStatuses().has(status);
+    const row: Record<string, unknown> = {
+      ...inline,
+      kind: itemKind,
+      kinds,
+      explicitKind,
+      explicitkind: explicitKind,
+      itemKind,
+      itemkind: itemKind,
+      itemType: itemKind,
+      itemtype: itemKind,
+      title,
+      text: title,
+      line: task.line,
+      lineNumber: task.line,
+      linenumber: task.line,
+      path: file.path,
+      tags,
+      ...(task.itemKind !== 'bullet' ? {
+        checkboxState: task.checkboxState || '[ ]',
+        checkboxstate: task.checkboxState || '[ ]',
+        checkboxStatus: status,
+        checkboxstatus: status,
+        open: !done,
+        isOpen: !done,
+        isopen: !done,
+        done,
+        completed: done,
+      } : {}),
+    };
+    const lineContext = {
+      ...row,
+      number: task.line,
+      raw: sourceLine,
+      file: fileContext,
+    };
+    return {
+      row,
+      note,
+      file: fileContext,
+      thisValue: this.createFormulaThisValue(),
+      line: lineContext,
+      task: task.itemKind !== 'bullet' ? {
+        ...row,
+        status,
+        checkboxState: task.checkboxState || '[ ]',
+        checkboxstate: task.checkboxState || '[ ]',
+        checkboxStatus: status,
+        checkboxstatus: status,
+        open: !done,
+        isOpen: !done,
+        isopen: !done,
+        done,
+        completed: done,
+        file: fileContext,
+      } : null,
+      heading: null,
+      external: null,
+      now: this.formulaNow,
+    };
+  }
+
+  private createFormulaFileContext(file: TFile): Record<string, unknown> {
+    const contextCache = this.formulaFileContexts ??= new Map<TFile, Record<string, unknown>>();
+    const existing = contextCache.get(file);
+    if (existing) return existing;
+    const cache = this.app.metadataCache.getFileCache(file) as any;
+    const properties = { ...((cache?.frontmatter || {}) as Record<string, unknown>) };
+    const lineMetadata = getGcmLineMetadataApi(this.app);
+    const tags = lineMetadata
+      ? lineMetadata.parseTags([
+        this.asArray(properties.tags),
+        this.asArray(cache?.tags).map((tag: any) => tag?.tag ?? tag),
+      ])
+      : [];
+    const context = {
+      path: file.path,
+      name: file.name,
+      basename: file.basename,
+      extension: file.extension,
+      ext: file.extension,
+      folder: file.parent?.path || '',
+      size: Number(file.stat?.size || 0),
+      ctime: Number(file.stat?.ctime || 0),
+      mtime: Number(file.stat?.mtime || 0),
+      tags,
+      links: this.asArray(cache?.links).map((link: any) => link?.link ?? link),
+      properties,
+    };
+    contextCache.set(file, context);
+    return context;
+  }
+
+  private createFormulaThisValue(): Record<string, unknown> | null {
+    if (this.formulaThisValueCache !== undefined) return this.formulaThisValueCache;
+    const contextFile = this.getBaseContextFile() ?? this.getBaseFile();
+    if (!(contextFile instanceof TFile)) {
+      this.formulaThisValueCache = null;
+      return null;
+    }
+    const frontmatter = (this.app.metadataCache.getFileCache(contextFile)?.frontmatter || {}) as Record<string, unknown>;
+    const scheduled = this.getBaseContextFrontmatterValue('scheduled');
+    this.formulaThisValueCache = {
+      ...frontmatter,
+      ...(scheduled ? { scheduled, date: scheduled } : {}),
+      file: this.createFormulaFileContext(contextFile),
+    };
+    return this.formulaThisValueCache;
+  }
+
+  private reportFormulaResult(result: GcmFormulaResult, file?: TFile, task?: OpenTaskSubitem): void {
+    this.reportFormulaDiagnostic(
+      result.code || result.status,
+      result.message || `Formula ${result.formula} could not be evaluated.`,
+      file,
+      task,
+      result.formula,
+    );
+  }
+
+  private reportFormulaDiagnostic(
+    code: string,
+    message: string,
+    file?: TFile,
+    task?: OpenTaskSubitem,
+    formula = '',
+    feature: 'formula' | 'line metadata' | 'entity filter' | 'entity index' = 'formula',
+  ): void {
+    let sourceFile: TFile | null = null;
+    let sourcePath = 'unknown';
+    let viewName = '';
+    try {
+      sourceFile = this.getBaseFile() ?? this.getBaseContextFile();
+      sourcePath = sourceFile?.path || this.getBaseSourcePath() || 'unknown';
+      viewName = this.getConfiguredBaseViewName();
+    } catch {
+      // Diagnostics must never turn an unavailable optional integration into a render failure.
+    }
+    const apiStatus = getGcmApiStatus(this.app);
+    const apiContract = getGcmFormulaApi(this.app)
+      ? `compatible:${TPS_FORMULA_API_VERSION}`
+      : apiStatus?.available && apiStatus.formulasVersion != null
+        ? `incompatible:${String(apiStatus.formulasVersion)}`
+        : 'missing';
+    const lineMetadataContract = getGcmLineMetadataApi(this.app)
+      ? `compatible:${TPS_LINE_METADATA_API_VERSION}`
+      : apiStatus?.available && apiStatus.lineMetadataVersion != null
+        ? `incompatible:${String(apiStatus.lineMetadataVersion)}`
+        : 'missing';
+    const sourceRevision = `${sourcePath}:${Number(sourceFile?.stat?.mtime || 0)}:${this.formulaCompileCache?.revision || 'uncompiled'}`;
+    const key = `${sourceRevision}:${viewName}:${apiContract}:${lineMetadataContract}:${feature}:${formula}:${code}`;
+    this.formulaDiagnostics ??= new Set<string>();
+    if (this.formulaDiagnostics.has(key)) return;
+    if (this.formulaDiagnostics.size >= 256) {
+      const oldest = this.formulaDiagnostics.values().next().value as string | undefined;
+      if (oldest) this.formulaDiagnostics.delete(oldest);
+    }
+    this.formulaDiagnostics.add(key);
+    flowWarn(
+      feature === 'formula'
+        ? 'Formula'
+        : feature === 'line metadata'
+          ? 'LineMetadata'
+          : feature === 'entity index'
+            ? 'EntityIndex'
+            : 'EntityFilter',
+      'unavailable', {
+      code,
+      formula,
+      message,
+      path: file?.path || '',
+      line: task?.line ?? null,
+      },
+    );
+    new Notice(`TPS Kanban ${feature} unavailable${formula ? ` (${formula})` : ''}: ${message}`);
+  }
+
+  private getBaseFilterRetryDelayMs(attempts = 1): number {
+    return Math.min(3_000, 750 * (2 ** Math.max(0, attempts - 1)));
+  }
+
+  private getBaseFilterRetryMaxAttempts(): number {
+    return 3;
+  }
+
+  private clearBaseFilterRetry(kind: 'direct' | 'embedded'): void {
+    const state = kind === 'direct' ? this.baseFileFilterRetry : this.embeddedBaseFilterRetry;
+    if (state?.timer) globalThis.clearTimeout(state.timer);
+    if (kind === 'direct') this.baseFileFilterRetry = null;
+    else this.embeddedBaseFilterRetry = null;
+  }
+
+  private clearBaseFileFilterRetryTimer(): void {
+    this.clearBaseFilterRetry('direct');
+  }
+
+  private clearEmbeddedBaseFilterRetryTimer(): void {
+    this.clearBaseFilterRetry('embedded');
+  }
+
+  private clearBaseFilterRetryTimers(): void {
+    this.clearBaseFilterRetry('direct');
+    this.clearBaseFilterRetry('embedded');
+  }
+
+  private getBaseFilterRetry(kind: 'direct' | 'embedded'): BaseFilterRetryState | null {
+    return kind === 'direct' ? this.baseFileFilterRetry : this.embeddedBaseFilterRetry;
+  }
+
+  private setBaseFilterRetry(kind: 'direct' | 'embedded', state: BaseFilterRetryState | null): void {
+    if (kind === 'direct') this.baseFileFilterRetry = state;
+    else this.embeddedBaseFilterRetry = state;
+  }
+
+  private shouldDeferBaseFilterRead(kind: 'direct' | 'embedded', key: string): boolean {
+    const state = this.getBaseFilterRetry(kind);
+    if (!state) return false;
+    if (state.key !== key) {
+      this.clearBaseFilterRetry(kind);
+      return false;
+    }
+    if (state.exhausted) return true;
+    if (Date.now() - state.errorAt >= this.getBaseFilterRetryDelayMs(state.attempts)) return false;
+    this.scheduleBaseFilterRetry(kind, state);
+    return true;
+  }
+
+  private recordBaseFilterReadFailure(
+    kind: 'direct' | 'embedded',
+    file: TFile,
+    mtime: number,
+    viewName: string,
+  ): void {
+    const key = `${file.path}:${mtime}:${viewName}`;
+    const previous = this.getBaseFilterRetry(kind);
+    if (previous?.timer) globalThis.clearTimeout(previous.timer);
+    const attempts = previous?.key === key ? previous.attempts + 1 : 1;
+    const state: BaseFilterRetryState = {
+      key,
+      file,
+      path: file.path,
+      mtime,
+      viewName,
+      errorAt: Date.now(),
+      attempts,
+      exhausted: attempts >= this.getBaseFilterRetryMaxAttempts(),
+      timer: null,
+    };
+    this.setBaseFilterRetry(kind, state);
+    if (state.exhausted) {
+      flowWarn(kind === 'direct' ? 'BaseFilters' : 'EmbeddedBaseFilters', 'retry-exhausted', {
+        path: file.path,
+        viewName,
+        attempts,
+      });
+      new Notice(`TPS Kanban stopped retrying ${kind === 'direct' ? 'Base' : 'embedded Base'} definitions after ${attempts} attempts: ${file.path}`);
+      return;
+    }
+    this.scheduleBaseFilterRetry(kind, state);
+  }
+
+  private scheduleBaseFilterRetry(kind: 'direct' | 'embedded', state: BaseFilterRetryState): void {
+    if (state.exhausted || state.timer || this.getBaseFilterRetry(kind) !== state) return;
+    const waitMs = Math.max(1, Math.ceil(state.errorAt + this.getBaseFilterRetryDelayMs(state.attempts) - Date.now()));
+    state.timer = globalThis.setTimeout(() => {
+      state.timer = null;
+      if (
+        this.isViewLoaded === false
+        || this.getBaseFilterRetry(kind) !== state
+        || state.exhausted
+        || this.app.vault.getFileByPath(state.path) !== state.file
+      ) return;
+      if (kind === 'direct') void this.loadBaseFileFilters(state.file, state.mtime, state.viewName);
+      else void this.loadEmbeddedBaseFilters(state.file, state.mtime, state.viewName);
+    }, waitMs);
+  }
+
+  private scheduleBaseFileFilterRetry(file: TFile, mtime: number, viewName: string): void {
+    const key = `${file.path}:${mtime}:${viewName}`;
+    const state = this.baseFileFilterRetry;
+    if (state?.key === key) this.scheduleBaseFilterRetry('direct', state);
+  }
+
+  private scheduleEmbeddedBaseFilterRetry(file: TFile, mtime: number, viewName: string): void {
+    const key = `${file.path}:${mtime}:${viewName}`;
+    const state = this.embeddedBaseFilterRetry;
+    if (state?.key === key) this.scheduleBaseFilterRetry('embedded', state);
+  }
+
   private scheduleBaseFileFilterLoad(): void {
     const file = this.getBaseFile();
-    if (!file) return;
-    const mtime = Number(file.stat?.mtime || 0);
     const viewName = this.getConfiguredBaseViewName();
-    if (this.baseFileFilterCache?.path === file.path
-      && this.baseFileFilterCache.mtime === mtime
-      && (!viewName || this.baseFileFilterCache.viewName === viewName)) return;
-    void this.loadBaseFileFilters(file, mtime, viewName);
+    if (file) {
+      const mtime = Number(file.stat?.mtime || 0);
+      if (this.baseFileFilterCache?.path === file.path
+        && this.baseFileFilterCache.mtime === mtime
+        && !this.baseFileFilterCache.errorAt
+        && (!viewName || this.baseFileFilterCache.viewName === viewName)) return;
+      void this.loadBaseFileFilters(file, mtime, viewName);
+      return;
+    }
+
+    const contextFile = this.getBaseContextFile();
+    if (!contextFile) return;
+    const mtime = Number(contextFile.stat?.mtime || 0);
+    if (this.embeddedBaseFilterCache?.path === contextFile.path
+      && this.embeddedBaseFilterCache.mtime === mtime
+      && !this.embeddedBaseFilterCache.errorAt
+      && (!viewName || this.embeddedBaseFilterCache.viewName === viewName)) return;
+    void this.loadEmbeddedBaseFilters(contextFile, mtime, viewName);
   }
 
   private isBaseFileFilterReady(): boolean {
     const file = this.getBaseFile();
-    if (!file) return true;
-    const cache = this.baseFileFilterCache;
     const viewName = this.getConfiguredBaseViewName();
-    return cache?.path === file.path
-      && cache.mtime === Number(file.stat?.mtime || 0)
+    if (file) {
+      const cache = this.baseFileFilterCache;
+      return cache?.path === file.path
+        && cache.mtime === Number(file.stat?.mtime || 0)
+        && !cache.errorAt
+        && (!viewName || cache.viewName === viewName);
+    }
+
+    const contextFile = this.getBaseContextFile();
+    if (!contextFile) return true;
+    const cache = this.embeddedBaseFilterCache;
+    return cache?.path === contextFile.path
+      && cache.mtime === Number(contextFile.stat?.mtime || 0)
+      && !cache.errorAt
       && (!viewName || cache.viewName === viewName);
   }
 
@@ -5473,6 +7194,7 @@ export class KanbanView extends BasesView {
         property.startsWith('task.') ||
         property.startsWith('line.') ||
         property.startsWith('block.') ||
+        property.startsWith('formula.') ||
         property.startsWith('tps.') ||
         property.startsWith('kanban.')
       ) {
@@ -5622,6 +7344,10 @@ export class KanbanView extends BasesView {
   private readFilterExpressionProperty(expr: string): string {
     const raw = String(expr || '').trim().replace(/^!+\s*/u, '');
     if (!raw) return '';
+    const bracketMatch = raw.match(/^([A-Za-z_$][\w$]*)\[\s*(["'])(.*?)\2\s*\]/u);
+    if (bracketMatch?.[1] && bracketMatch[3] !== undefined) {
+      return `${bracketMatch[1]}.${bracketMatch[3]}`;
+    }
     const callMatch = raw.match(/^([\w.\s-]+)\.(?:contains|containsAny|equals|isEmpty|empty|exists|isNotEmpty)\b/i);
     if (callMatch?.[1]) return callMatch[1].trim();
     const wordMatch = raw.match(/^([\w.\s-]+?)\s+(?:contains|has|is not empty|is empty|isNotEmpty|exists|empty|is|equals?)\b/i);
@@ -5674,6 +7400,8 @@ export class KanbanView extends BasesView {
     const filter: KanbanTaskRootFilter = {
       mode: 'mixed',
       hasTaskDirective: false,
+      hasFormulaFilter: false,
+      mayMatchBullets: false,
       includeDone: false,
       statuses: new Set<string>(),
       excludeStatuses: new Set<string>(),
@@ -5681,6 +7409,8 @@ export class KanbanView extends BasesView {
       excludeTags: new Set<string>(),
     };
     for (const root of this.getBaseFilterRoots()) {
+      if (this.filterNodeReferencesFormula(root)) filter.hasFormulaFilter = true;
+      if (this.filterNodeReferencesAdditiveKind(root)) filter.mayMatchBullets = true;
       if (this.hasTaskDirectiveInFilterNode(root)) filter.hasTaskDirective = true;
       this.collectTaskRootFilterNode(root, filter);
     }
@@ -5697,7 +7427,8 @@ export class KanbanView extends BasesView {
     if (Array.isArray(node)) return node.some((child) => this.hasTaskDirectiveInFilterNode(child));
     if (typeof node === 'string') {
       const expr = node.trim().replace(/^!+\s*/u, '');
-      if (parseBareSemanticKindExpression(expr)) return false;
+      if (this.parseAdditiveKindExpression(expr)) return true;
+      if (this.filterExpressionReferencesFormula(expr)) return true;
       return /^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\b/i.test(expr)
         || /^(?:task\.)?(?:status|tags?|open|isopen|done|isdone|completed|complete)\b/i.test(expr)
         || /^task\.(?:path|file|file\.path|file\.extension|file\.ext)\b/i.test(expr)
@@ -5708,7 +7439,7 @@ export class KanbanView extends BasesView {
     const propRaw = String(record.property ?? record.field ?? '').trim();
     const normalizedProp = this.normalizeInlinePropertyKey(propRaw.replace(/^(?:task|tps|kanban)\./i, ''));
     const propLower = propRaw.toLowerCase();
-    if (isBareSemanticKindFilter(propRaw, this.readFilterObjectValues(record))) return false;
+    if (this.isAdditiveKindProperty(propRaw)) return true;
     if (propLower.startsWith('task.')
       || ['itemtype', 'itemkind', 'kind', 'tag', 'tags', 'status', 'checkboxstatus', 'open', 'isopen', 'done', 'isdone', 'completed', 'complete'].includes(normalizedProp)
       || (propRaw && !propLower.startsWith('note.') && !propLower.startsWith('file.') && !['path', 'file', 'filepath', 'fileextension', 'fileext'].includes(normalizedProp))) return true;
@@ -5747,12 +7478,13 @@ export class KanbanView extends BasesView {
     if (!expr) return;
     const lower = expr.toLowerCase();
 
-    if (parseBareSemanticKindExpression(expr)) {
-      filter.mode = 'notes';
+    if (this.parseAdditiveKindExpression(expr)) {
+      filter.hasTaskDirective = true;
+      filter.mode = 'mixed';
       return;
     }
 
-    const kindMatch = lower.match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
+    const kindMatch = lower.match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind)\s*(?:==|=)\s*["']?(task|tasks|bullet|bullets|note|notes|all|mixed)["']?$/i);
     if (kindMatch?.[1]) {
       const value = kindMatch[1].toLowerCase();
       filter.hasTaskDirective = true;
@@ -5837,12 +7569,13 @@ export class KanbanView extends BasesView {
     const operator = String(node.operator ?? node.op ?? '').trim().toLowerCase();
     const isNegated = parentNegated || operator.startsWith('!') || operator.includes('not') || operator === '!=' || operator === '!==';
 
-    if (isBareSemanticKindFilter(propRaw, values)) {
-      filter.mode = 'notes';
+    if (this.isAdditiveKindProperty(propRaw) && values.length) {
+      filter.hasTaskDirective = true;
+      filter.mode = 'mixed';
       return;
     }
 
-    if (['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) {
+    if (['itemtype', 'itemkind'].includes(normalizedProp)) {
       for (const raw of values) {
         const value = String(raw || '').trim().toLowerCase();
         if (!value) continue;
@@ -6002,6 +7735,30 @@ export class KanbanView extends BasesView {
 
   private getLaneId(group: BasesEntryGroup): string {
     if (!group.hasKey() || group.key == null) return 'ungrouped';
+    const groupPropId = this.getGroupByPropId(this.getGroupByPropName());
+    if (this.isFormulaProperty(groupPropId)) {
+      const api = getGcmFormulaApi(this.app);
+      if (api) {
+        try {
+          const values = api.groupValues(group.key);
+          if (!Array.isArray(values) || values.some((value) => typeof value !== 'string')) {
+            throw new Error('TPS Global Context Menu returned invalid formula group values.');
+          }
+          const canonical = values.map((value) => value.trim()).find(Boolean);
+          if (!canonical) return 'ungrouped';
+          return `key:${canonical.toLocaleLowerCase()}`;
+        } catch (error) {
+          this.reportFormulaDiagnostic(
+            'formula-group-values-failed',
+            error instanceof Error ? error.message : String(error),
+            undefined,
+            undefined,
+            this.getFormulaName(groupPropId),
+          );
+          return 'ungrouped';
+        }
+      }
+    }
     const key = String(group.key).trim().toLowerCase();
     if (!key || key === 'null' || key === 'undefined') return 'ungrouped';
     return `key:${key}`;
@@ -6544,7 +8301,7 @@ export class KanbanView extends BasesView {
         taskEl.addEventListener('contextmenu', (e: MouseEvent) => {
           e.preventDefault();
           e.stopPropagation();
-          const handled = this.openTaskLineContextMenu(e, entry.file.path, task.line);
+          const handled = this.openTaskLineContextMenu(e);
           if (handled) return;
 
           const menu = new Menu();
@@ -6685,8 +8442,6 @@ export class KanbanView extends BasesView {
     cardEl.addEventListener('contextmenu', (e: MouseEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      this.recordGcmContextTarget(e.target);
-
       // Right-click without modifiers should target this card (standard file list behavior).
       if (!this.selectedPaths.has(entry.file.path) && !e.shiftKey && !(e.metaKey || e.ctrlKey)) {
         this.selectOnly(entry.file.path);
@@ -6844,7 +8599,12 @@ export class KanbanView extends BasesView {
     return width >= 700;
   }
 
-  private createTaskLaneCard(item: TaskRenderItem, propName: string | null, displayLane: DisplayLaneGroup): HTMLElement {
+  private createTaskLaneCard(
+    item: TaskRenderItem,
+    propName: string | null,
+    taskGroupPropId: string | null,
+    displayLane: DisplayLaneGroup,
+  ): HTMLElement {
     const { file, task } = item;
     const taskTitle = this.getTaskVisibleTitle(task);
     const cardEl = document.createElement('div');
@@ -6860,7 +8620,7 @@ export class KanbanView extends BasesView {
     cardEl.dataset.tpsKanbanLine = String(task.line);
     cardEl.dataset.tpsKanbanCheckboxState = task.itemKind === 'bullet' ? '' : task.checkboxState || '[ ]';
     cardEl.dataset.tpsKanbanTaskText = task.text;
-    const taskStyleRule = this.resolveTaskCardStyleRule(file, task, propName);
+    const taskStyleRule = this.resolveTaskCardStyleRule(file, task, taskGroupPropId);
     this.addTextStyleClasses(cardEl, taskStyleRule?.textStyle);
     const taskRuleColor = this.normalizeCssColorValue(taskStyleRule?.color || '');
     if (taskRuleColor) {
@@ -6903,7 +8663,7 @@ export class KanbanView extends BasesView {
     cardEl.addEventListener('contextmenu', (e: MouseEvent) => {
       e.preventDefault();
       e.stopPropagation();
-        const handled = this.openTaskLineContextMenu(e, file.path, task.line);
+        const handled = this.openTaskLineContextMenu(e);
         if (handled) return;
 
         if (!this.selectedPaths.has(file.path) && !e.shiftKey && !(e.metaKey || e.ctrlKey)) {
@@ -7008,12 +8768,24 @@ export class KanbanView extends BasesView {
     });
 
     const metaRow = inner.createDiv({ cls: 'tps-kanban-card-meta-row tps-kanban-task-card-meta' });
-    for (const property of this.getTaskCardMetaProperties(file, task, propName)) {
-      metaRow.createSpan({
+    for (const property of this.getTaskCardMetaProperties(file, task, taskGroupPropId)) {
+      const chip = metaRow.createSpan({
         cls: `tps-kanban-card-property${property.kind ? ` tps-kanban-card-property--${property.kind}` : ''}`,
-        text: property.text,
         attr: { title: property.title || property.text },
       });
+      if (property.booleanValue == null) {
+        chip.textContent = property.text;
+      } else {
+        const checkbox = chip.createEl('input', {
+          cls: 'tps-kanban-card-property-checkbox',
+          attr: {
+            type: 'checkbox',
+            disabled: 'true',
+            'aria-label': property.title || `${property.text}: ${property.booleanValue ? 'true' : 'false'}`,
+          },
+        });
+        checkbox.checked = property.booleanValue;
+      }
     }
 
     dragHandle.addEventListener('dragstart', handleRootTaskDragStart);
@@ -7081,6 +8853,35 @@ export class KanbanView extends BasesView {
   }
 
   private getTaskPropertyValue(file: TFile, task: OpenTaskSubitem, propId: string, hidden: Set<string>): TaskPropertyDisplay | null {
+    if (this.isFormulaProperty(propId)) {
+      const result = this.getTaskFormulaResult(file, task, propId);
+      if (!result || result.status === 'error' || result.status === 'unsupported') {
+        return {
+          text: '⚠ Formula',
+          title: result?.message || `Formula ${this.getFormulaName(propId)} is unavailable.`,
+          kind: 'formula-error',
+          editable: false,
+        };
+      }
+      const formatted = this.formatFormulaValue(result.value, file, task, this.getFormulaName(propId));
+      if (formatted == null) {
+        return {
+          text: '⚠ Formula',
+          title: `Formula ${this.getFormulaName(propId)} could not be formatted.`,
+          kind: 'formula-error',
+          editable: false,
+        };
+      }
+      const text = formatted.trim();
+      const booleanValue = this.getBooleanPropertyValue(result.value);
+      return text ? {
+        text,
+        title: `${propId}: ${text}`,
+        kind: booleanValue == null ? 'formula' : 'formula-boolean',
+        editable: false,
+        ...(booleanValue == null ? {} : { booleanValue }),
+      } : null;
+    }
     const normalized = this.normalizeTaskPropertyId(propId);
     if (!normalized || hidden.has(normalized)) return null;
 
@@ -7095,9 +8896,14 @@ export class KanbanView extends BasesView {
       } : null;
     }
 
-    if (normalized === 'kind' || normalized === 'itemkind' || normalized === 'itemtype') {
-      const kind = task.itemKind === 'bullet' ? 'bullet' : 'task';
-      return { text: kind, kind: 'kind', editable: false };
+    if (normalized === 'kind') {
+      const kinds = this.getTaskAdditiveKinds(task, file);
+      return { text: kinds?.join(', ') ?? '⚠ Entity', kind: 'kind', editable: false };
+    }
+
+    if (normalized === 'itemkind' || normalized === 'itemtype') {
+      const structuralKind = task.itemKind === 'bullet' ? 'bullet' : 'task';
+      return { text: structuralKind, kind: 'kind', editable: false };
     }
 
     if (normalized === 'path' || normalized === 'file' || normalized === 'source') {
@@ -7105,7 +8911,7 @@ export class KanbanView extends BasesView {
     }
 
     if (normalized === 'line') {
-      return { text: String(task.line + 1), title: `${file.path}:${task.line + 1}`, kind: 'line', editable: false };
+      return { text: String(task.line), title: `${file.path}:${task.line}`, kind: 'line', editable: false };
     }
 
     for (const field of task.inlineFields ?? []) {
@@ -7468,11 +9274,24 @@ export class KanbanView extends BasesView {
 
   private inferTaskCreationDefaultsFromString(rawExpr: string): TaskCreationDefaults | null {
     const raw = String(rawExpr || '').trim();
-    if (parseBareSemanticKindExpression(raw)) {
-      return { mode: 'notes', inlineFields: new Map(), tags: new Set(), excludedStatuses: new Set(), excludedTags: new Set() };
-    }
     const isNegated = raw.startsWith('!');
     const expr = (isNegated ? raw.slice(1) : raw).trim();
+    const additiveKind = this.parseAdditiveKindExpression(expr);
+    if (additiveKind) {
+      if (isNegated !== additiveKind.negated) return null;
+      const normalizedKind = this.normalizeEntityKindValue(additiveKind.expected);
+      const inlineFields = new Map<string, { key: string; value: string }>();
+      if (!['task', 'all', 'mixed'].includes(normalizedKind)) {
+        inlineFields.set('kind', { key: 'kind', value: additiveKind.expected });
+      }
+      return {
+        mode: 'mixed',
+        inlineFields,
+        tags: new Set(),
+        excludedStatuses: new Set(),
+        excludedTags: new Set(),
+      };
+    }
     const defaults = this.inferPositiveTaskCreationDefaultsFromString(expr);
     if (!defaults || !isNegated) return defaults;
     return {
@@ -7484,7 +9303,7 @@ export class KanbanView extends BasesView {
   }
 
   private inferPositiveTaskCreationDefaultsFromString(expr: string): TaskCreationDefaults | null {
-    const kindMatch = expr.match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind|kind)\s*(?:==|=)\s*["']?(task|tasks|note|notes|all|mixed)["']?$/i);
+    const kindMatch = expr.match(/^(?:(?:tps|kanban)\.)?(?:itemtype|itemkind)\s*(?:==|=)\s*["']?(task|tasks|note|notes|all|mixed)["']?$/i);
     if (kindMatch?.[1]) {
       const value = kindMatch[1].toLowerCase();
       return { mode: value.startsWith('task') ? 'tasks' : value.startsWith('note') ? 'notes' : 'mixed', inlineFields: new Map(), tags: new Set(), excludedStatuses: new Set(), excludedTags: new Set() };
@@ -7547,17 +9366,26 @@ export class KanbanView extends BasesView {
   private inferTaskCreationDefaultsFromObject(node: Record<string, unknown>): TaskCreationDefaults | null {
     const propRaw = String(node.property ?? node.field ?? '').trim();
     if (!propRaw) return null;
+    if (this.isFormulaProperty(propRaw)) return null;
     const normalizedProp = this.normalizeInlinePropertyKey(propRaw.replace(/^task\./i, '').replace(/^tps\./i, ''));
     const operator = String(node.operator ?? node.op ?? '').trim().toLowerCase();
     const values = this.asArray(node.values ?? node.value).map((value) => String(value || '').trim()).filter(Boolean);
     if (!values.length) return null;
     const excluded = operator.startsWith('!') || operator.includes('not') || operator === '!=' || operator === '!==';
 
-    if (isBareSemanticKindFilter(propRaw, values)) {
-      return { mode: 'notes', inlineFields: new Map(), tags: new Set(), excludedStatuses: new Set(), excludedTags: new Set() };
+    if (this.isAdditiveKindProperty(propRaw)) {
+      const positiveEquality = ['', '=', '==', '===', 'is', 'equals', 'equal'];
+      if (excluded || !positiveEquality.includes(operator.replace(/\s+/gu, ''))) return null;
+      const expected = values[0];
+      const normalizedKind = this.normalizeEntityKindValue(expected);
+      const inlineFields = new Map<string, { key: string; value: string }>();
+      if (!['task', 'all', 'mixed'].includes(normalizedKind)) {
+        inlineFields.set('kind', { key: 'kind', value: expected });
+      }
+      return { mode: 'mixed', inlineFields, tags: new Set(), excludedStatuses: new Set(), excludedTags: new Set() };
     }
 
-    if (['itemtype', 'itemkind', 'kind'].includes(normalizedProp)) {
+    if (['itemtype', 'itemkind'].includes(normalizedProp)) {
       const value = values[0].toLowerCase();
       return { mode: value.startsWith('task') ? 'tasks' : value.startsWith('note') ? 'notes' : 'mixed', inlineFields: new Map(), tags: new Set(), excludedStatuses: new Set(), excludedTags: new Set() };
     }
@@ -7689,6 +9517,11 @@ export class KanbanView extends BasesView {
     if (!this.isViewLoaded) return;
     this.renderGeneration += 1;
     if (!this.shouldRenderView()) return;
+    this.taskFormulaSessions = new WeakMap();
+    this.formulaFileContexts.clear();
+    this.formulaThisValueCache = undefined;
+    this.formulaLaneLabels.clear();
+    this.formulaNow = new Date();
     const scrollState = preserveScroll ? this.captureRenderScrollState() : null;
     this.applyLayoutSettings();
     this.ensureContainer();
@@ -7696,14 +9529,16 @@ export class KanbanView extends BasesView {
 
     const propName = this.getGroupByPropName();
     const propId = this.getGroupByPropId(propName);
+    const taskGroupPropId = propId ?? propName;
     const listGrouping = this.isLikelyListGroupingProperty(propName, propId);
     const sourceGroups = this.getSourceGroupsForRender(propId, listGrouping);
-    void this.renderAsync(sourceGroups, propName, scrollState);
+    void this.renderAsync(sourceGroups, propName, taskGroupPropId, scrollState);
   }
 
   private async renderAsync(
     sourceGroups: BasesEntryGroup[],
     propName: string | null,
+    taskGroupPropId: string | null,
     scrollState: KanbanRenderScrollState | null = null,
   ): Promise<void> {
     this.activeNotePath = this.getActiveMarkdownPath();
@@ -7740,7 +9575,7 @@ export class KanbanView extends BasesView {
     const taskFilter = this.getTaskRootFilterFromBaseFilters();
     const taskRenderItemsByLane = this.buildTaskRenderItemsByLane(
       groups,
-      propName,
+      taskGroupPropId,
       this.getVisibleNotePaths(groups),
       taskFilter,
     );
@@ -7757,11 +9592,12 @@ export class KanbanView extends BasesView {
         displayLane.id,
         this.getRenderItemsForDisplayLane(displayLane, laneRenderItemsByLane),
       );
-      const taskItems = displayLane.laneIds.flatMap((laneId) => taskRenderItemsByLane.get(laneId) ?? []);
+      const taskItems = this.dedupeTaskRenderItems(
+        displayLane.laneIds.flatMap((laneId) => taskRenderItemsByLane.get(laneId) ?? []),
+      );
       taskItemsByDisplayLane.set(displayLane.id, taskItems);
     }
-    this.renderedTaskItemCount = Array.from(taskItemsByDisplayLane.values())
-      .reduce((total, taskItems) => total + taskItems.length, 0);
+    this.renderedTaskItemCount = this.countUniqueTaskRenderItems(taskRenderItemsByLane);
 
     this.renderedFileOrder = this.getOrderedVisiblePaths(displayLanes, renderItemsByDisplayLane);
     this.renderedResultCount = this.renderedFileOrder.length + this.renderedTaskItemCount;
@@ -7844,7 +9680,14 @@ export class KanbanView extends BasesView {
       const createCommandOverride = this.getCreateCommandOverride();
       const laneAddMode = this.resolveCardAddMode(taskFilter);
       const laneAdd = resolveKanbanLaneAddPresentation(laneAddMode, displayLane.label);
+      const isReadOnlyFormulaLane = this.isFormulaProperty(taskGroupPropId);
+      const formulaLaneReadOnlyTitle = 'Computed formula lanes are read-only. Create the item from its source, then let the formula place it.';
       const handleLaneAdd = async () => {
+        if (isReadOnlyFormulaLane) {
+          flowWarn('LaneAdd', 'blocked', { reason: 'formula-lane-read-only', lane: displayLane.label, propId: taskGroupPropId || '' });
+          new Notice(formulaLaneReadOnlyTitle);
+          return;
+        }
         if (this.runCreateCommandOverride()) return;
         flow('LaneAdd', 'click', {
           lane: displayLane.label,
@@ -7996,11 +9839,12 @@ export class KanbanView extends BasesView {
           cls: 'tps-kanban-lane-header-add',
           attr: {
             type: 'button',
-            'aria-label': createCommandOverride ? `Run ${createCommandOverride.name}` : laneAdd.ariaLabel,
-            title: createCommandOverride ? `Run ${createCommandOverride.name}` : laneAdd.title,
+            'aria-label': isReadOnlyFormulaLane ? formulaLaneReadOnlyTitle : createCommandOverride ? `Run ${createCommandOverride.name}` : laneAdd.ariaLabel,
+            title: isReadOnlyFormulaLane ? formulaLaneReadOnlyTitle : createCommandOverride ? `Run ${createCommandOverride.name}` : laneAdd.title,
           },
         });
-        setIconWithFallback(headerAdd, 'plus');
+        headerAdd.disabled = isReadOnlyFormulaLane;
+        setIconWithFallback(headerAdd, isReadOnlyFormulaLane ? 'lock' : 'plus');
         headerAdd.addEventListener('pointerdown', (evt: PointerEvent) => {
           evt.preventDefault();
           evt.stopPropagation();
@@ -8168,19 +10012,26 @@ export class KanbanView extends BasesView {
         cardsWrap.addEventListener('drop', handleCardDrop);
       }
 
-      for (const item of renderItems) {
-        const card = this.createEntryCard(item.entry, groups, propName, item, displayLane);
-        cardsWrap.appendChild(card);
-      }
-      for (const taskItem of taskItems) {
-        const card = this.createTaskLaneCard(taskItem, propName, displayLane);
-        cardsWrap.appendChild(card);
+      for (const mixedItem of this.sortMixedLaneRenderItems(renderItems, taskItems)) {
+        if (mixedItem.kind === 'note') {
+          const item = mixedItem.item;
+          const card = this.createEntryCard(item.entry, groups, propName, item, displayLane);
+          cardsWrap.appendChild(card);
+        } else {
+          const card = this.createTaskLaneCard(mixedItem.item, propName, taskGroupPropId, displayLane);
+          cardsWrap.appendChild(card);
+        }
       }
 
-      laneEl.createEl('button', { text: createCommandOverride ? `+ ${createCommandOverride.name}` : laneAdd.buttonText, cls: 'tps-kanban-add-card' })
-        .addEventListener('click', async () => {
-          await handleLaneAdd();
-        });
+      const addButton = laneEl.createEl('button', {
+        text: isReadOnlyFormulaLane ? 'Formula lane (read-only)' : createCommandOverride ? `+ ${createCommandOverride.name}` : laneAdd.buttonText,
+        cls: 'tps-kanban-add-card',
+        attr: { title: isReadOnlyFormulaLane ? formulaLaneReadOnlyTitle : createCommandOverride ? `Run ${createCommandOverride.name}` : laneAdd.title },
+      });
+      addButton.disabled = isReadOnlyFormulaLane;
+      addButton.addEventListener('click', async () => {
+        await handleLaneAdd();
+      });
     }
     this.syncSelectionClasses();
     this.syncNativeResultsCountSoon();
