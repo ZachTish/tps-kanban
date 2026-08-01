@@ -1,7 +1,7 @@
 # TPS-Kanban (Dev) — Audit
 
 Scope
-- Reviewed files: [`src/main.ts`](/Users/zachtisherman/TishOS%20v0.1/.obsidian/plugins/TPS-Kanban%20(Dev)/src/main.ts), [`src/task-creation-utils.ts`](/Users/zachtisherman/TishOS%20v0.1/.obsidian/plugins/TPS-Kanban%20(Dev)/src/task-creation-utils.ts), [`src/views/KanbanView.ts`](/Users/zachtisherman/TishOS%20v0.1/.obsidian/plugins/TPS-Kanban%20(Dev)/src/views/KanbanView.ts), [`src/tps-contracts.ts`](/Users/zachtisherman/TishOS%20v0.1/.obsidian/plugins/TPS-Kanban%20(Dev)/src/tps-contracts.ts).
+- Reviewed files: [`src/main.ts`](src/main.ts), [`src/task-creation-utils.ts`](src/task-creation-utils.ts), [`src/views/KanbanView.ts`](src/views/KanbanView.ts), [`src/tps-contracts.ts`](src/tps-contracts.ts).
 
 Where issues are
 - High: Root-task creation resolution currently merges multiple default layers in a precedence chain where filter-derived defaults can override user intent; this can send cards to unexpected notes.
