@@ -727,6 +727,8 @@ test('card task previews are bounded and use source markdown labels', () => {
 test('one all-task parse derives the same bounded open previews as direct parsing', async () => {
   const { KanbanView } = await importKanbanView();
   const view = Object.create(KanbanView.prototype);
+  view.app = {};
+  provideGcmProtocolApi(view);
   const defaultStatusByState = {
     '[ ]': 'todo',
     '[x]': 'complete',
@@ -780,6 +782,8 @@ test('one all-task parse derives the same bounded open previews as direct parsin
 test('markdown item parsing classifies each source line once in both inclusion modes', async () => {
   const { KanbanView } = await importKanbanView();
   const view = Object.create(KanbanView.prototype);
+  view.app = {};
+  provideGcmProtocolApi(view);
   view.getDoneStatuses = () => new Set(['complete']);
   view.getStatusForCheckboxState = (state) => state === '[x]' ? 'complete' : 'todo';
 
@@ -837,6 +841,244 @@ test('markdown item parsing classifies each source line once in both inclusion m
       { itemKind: 'task', line: 5, parentLine: undefined, checkboxState: '[/]', text: 'Working task' },
     ],
   );
+});
+
+test('canonical document scanning excludes protected Markdown while preserving physical nested line identities', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  view.app = {};
+  view.getDoneStatuses = () => new Set(['complete']);
+  view.getStatusForCheckboxState = (state) => state === '[x]' ? 'complete' : 'todo';
+  const content = [
+    '---',
+    'kind: task',
+    '---',
+    '- [ ] Parent [owner:: Ada]',
+    '  - Nested bullet #project',
+    '    - [ ] Nested task [kind:: deep]',
+    '```md',
+    '- [ ] fenced fake',
+    '```',
+    '    - [ ] indented fake',
+    '- [ ] Final task',
+  ].join('\n');
+  const excludedIndexes = new Set([0, 1, 2, 6, 7, 8, 9]);
+  const lineMetadataMock = createLineMetadataApiMock({
+    scanDocument: (source) => scanPhysicalDocumentLines(source)
+      .filter((line) => !excludedIndexes.has(line.index)),
+  });
+  provideGcmProtocolApi(view, { lineMetadata: lineMetadataMock.api });
+  const parseLineItem = view.parseLineItem.bind(view);
+  view.parseLineItem = (line, ...args) => {
+    assert.doesNotMatch(line, /fake/u, 'excluded source text must never reach Kanban line parsing');
+    return parseLineItem(line, ...args);
+  };
+
+  const parsed = view.parseOpenTasks(content, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER, true, true);
+  assert.equal(lineMetadataMock.getScanCount(), 1, 'one canonical document scan owns the discovery pass');
+  assert.deepEqual(
+    parsed.openTasks.map(({ itemKind, internalId, line, parentLine, text }) => ({
+      itemKind,
+      internalId,
+      line,
+      parentLine,
+      text,
+    })),
+    [
+      { itemKind: 'task', internalId: 'Inbox/Tasks.md:4', line: 4, parentLine: undefined, text: 'Parent [owner:: Ada]' },
+      { itemKind: 'bullet', internalId: 'Inbox/Tasks.md:5', line: 5, parentLine: 4, text: 'Nested bullet #project' },
+      { itemKind: 'task', internalId: 'Inbox/Tasks.md:6', line: 6, parentLine: 5, text: 'Nested task [kind:: deep]' },
+      { itemKind: 'task', internalId: 'Inbox/Tasks.md:11', line: 11, parentLine: undefined, text: 'Final task' },
+    ],
+  );
+  assert.deepEqual(parsed.openTasks[2].inlineFields, [{ key: 'kind', value: 'deep' }]);
+  assert.equal(lineMetadataMock.getParseCount(), 4, 'each discovered item receives one canonical metadata parse');
+});
+
+test('protected document gaps break only the hierarchy level owned by their Markdown indentation', async () => {
+  const { KanbanView } = await importKanbanView();
+  const parseFixture = (content, excludedIndexes) => {
+    const view = Object.create(KanbanView.prototype);
+    view.app = {};
+    view.getDoneStatuses = () => new Set(['complete']);
+    view.getStatusForCheckboxState = () => 'todo';
+    const lineMetadata = createLineMetadataApiMock({
+      scanDocument: (source) => scanPhysicalDocumentLines(source)
+        .filter((line) => !excludedIndexes.has(line.index)),
+    }).api;
+    provideGcmProtocolApi(view, { lineMetadata });
+    return view.parseOpenTasks(content, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER, true, true).openTasks;
+  };
+
+  for (const { label, parent, fenceIndent, laterIndent } of [
+    { label: 'unindented bullet fence', parent: '- [ ] Parent', fenceIndent: 0, laterIndent: 2 },
+    { label: 'one-space top-level bullet fence', parent: '- [ ] Parent', fenceIndent: 1, laterIndent: 1 },
+    { label: 'two-space top-level ordered fence', parent: '1. [ ] Parent', fenceIndent: 2, laterIndent: 2 },
+    { label: 'three-space top-level wide-ordered fence', parent: '10. [ ] Parent', fenceIndent: 3, laterIndent: 3 },
+  ]) {
+    const fencePadding = ' '.repeat(fenceIndent);
+    const topLevelFence = [
+      parent,
+      `${fencePadding}\`\`\`md`,
+      `${fencePadding}- [ ] fenced fake`,
+      `${fencePadding}\`\`\``,
+      `${' '.repeat(laterIndent)}- [ ] Detached after fence`,
+    ].join('\n');
+    assert.deepEqual(
+      parseFixture(topLevelFence, new Set([1, 2, 3]))
+        .map(({ line, parentLine, text }) => ({ line, parentLine, text })),
+      [
+        { line: 1, parentLine: undefined, text: 'Parent' },
+        { line: 5, parentLine: undefined, text: 'Detached after fence' },
+      ],
+      `${label} cannot bridge an earlier task parent to a later indented task`,
+    );
+  }
+
+  const listContainedFence = [
+    '- [ ] Parent',
+    '  ```md',
+    '  code',
+    '  ```',
+    '  - [ ] Legitimate child',
+  ].join('\n');
+  assert.deepEqual(
+    parseFixture(listContainedFence, new Set([1, 2, 3]))
+      .map(({ line, parentLine, text }) => ({ line, parentLine, text })),
+    [
+      { line: 1, parentLine: undefined, text: 'Parent' },
+      { line: 5, parentLine: 1, text: 'Legitimate child' },
+    ],
+    'a list-contained protected block preserves its legitimate outer list parent',
+  );
+
+  const orderedListContainedFence = [
+    '10. [ ] Parent',
+    '    ```md',
+    '    code',
+    '    ```',
+    '    - [ ] Legitimate child',
+  ].join('\n');
+  assert.deepEqual(
+    parseFixture(orderedListContainedFence, new Set([1, 2, 3]))
+      .map(({ line, parentLine, text }) => ({ line, parentLine, text })),
+    [
+      { line: 1, parentLine: undefined, text: 'Parent' },
+      { line: 5, parentLine: 1, text: 'Legitimate child' },
+    ],
+    'wide ordered markers preserve blocks and children at their true continuation indentation',
+  );
+});
+
+test('canonical CR-only descriptors preserve physical identities and hierarchy', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  view.app = {};
+  view.getDoneStatuses = () => new Set(['complete']);
+  view.getStatusForCheckboxState = () => 'todo';
+  const lineMetadataMock = createLineMetadataApiMock();
+  provideGcmProtocolApi(view, { lineMetadata: lineMetadataMock.api });
+  const content = '- [ ] Parent\r  - [ ] Child\r- [ ] Tail';
+
+  const tasks = view.parseOpenTasks(content, 'Inbox/CR.md', Number.MAX_SAFE_INTEGER, true, true).openTasks;
+  assert.deepEqual(
+    tasks.map(({ internalId, line, parentLine, text }) => ({ internalId, line, parentLine, text })),
+    [
+      { internalId: 'Inbox/CR.md:1', line: 1, parentLine: undefined, text: 'Parent' },
+      { internalId: 'Inbox/CR.md:2', line: 2, parentLine: 1, text: 'Child' },
+      { internalId: 'Inbox/CR.md:3', line: 3, parentLine: undefined, text: 'Tail' },
+    ],
+  );
+  assert.equal(lineMetadataMock.getScanCount(), 1);
+});
+
+test('task and bullet discovery fails closed without a complete document-scanning contract', async (t) => {
+  const { KanbanView } = await importKanbanView();
+  const createView = () => {
+    const view = Object.create(KanbanView.prototype);
+    view.app = {};
+    view.getDoneStatuses = () => new Set(['complete']);
+    view.getStatusForCheckboxState = () => 'todo';
+    return view;
+  };
+  const content = '- [ ] Must not be synthesized';
+
+  await t.test('missing scanDocument rejects the advertised v1 snapshot and deduplicates the diagnostic', () => {
+    globalThis.__KanbanFormulaNotices = [];
+    const view = createView();
+    const incompleteLineMetadata = { ...createLineMetadataApiMock().api };
+    delete incompleteLineMetadata.scanDocument;
+    provideGcmProtocolApi(view, { lineMetadata: incompleteLineMetadata });
+    let parseCalls = 0;
+    view.parseLineItem = () => { parseCalls += 1; return null; };
+    assert.deepEqual(view.parseOpenTasks(content, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER), { openTasks: [], overflowCount: 0 });
+    assert.deepEqual(view.parseOpenTasks(content, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER), { openTasks: [], overflowCount: 0 });
+    assert.equal(parseCalls, 0, 'an incomplete API cannot trigger raw-line discovery');
+    assert.equal(globalThis.__KanbanFormulaNotices.length, 1);
+    assert.match(globalThis.__KanbanFormulaNotices[0], /document scanning is required/i);
+  });
+
+  for (const [label, source, mutateApi, expectedMessage] of [
+    [
+      'throwing scanner',
+      content,
+      (api) => { api.scanDocument = () => { throw new Error('document scan failed'); }; },
+      /document scan failed/i,
+    ],
+    [
+      'invalid coordinates',
+      content,
+      (api) => { api.scanDocument = () => [{ index: 0, lineNumber: 1, text: 'wrong', start: 0, end: 5 }]; },
+      /inconsistent physical document line coordinates/i,
+    ],
+    [
+      'mislabeled physical index',
+      `Heading\n${content}`,
+      (api) => {
+        api.scanDocument = (source) => [{
+          index: 0,
+          lineNumber: 1,
+          text: content,
+          start: 'Heading\n'.length,
+          end: source.length,
+        }];
+      },
+      /inconsistent physical document line coordinates/i,
+    ],
+    [
+      'CRLF-half descriptor',
+      `${content}\r\nTail`,
+      (api) => {
+        api.scanDocument = () => [{
+          index: 0,
+          lineNumber: 1,
+          text: `${content}\r`,
+          start: 0,
+          end: content.length + 1,
+        }];
+      },
+      /inconsistent physical document line coordinates/i,
+    ],
+    [
+      'throwing metadata parser',
+      content,
+      (api) => { api.parseLine = () => { throw new Error('line metadata parse failed'); }; },
+      /line metadata parse failed/i,
+    ],
+  ]) {
+    await t.test(label, () => {
+      globalThis.__KanbanFormulaNotices = [];
+      const view = createView();
+      const lineMetadata = createLineMetadataApiMock().api;
+      mutateApi(lineMetadata);
+      provideGcmProtocolApi(view, { lineMetadata });
+      assert.deepEqual(view.parseOpenTasks(source, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER), { openTasks: [], overflowCount: 0 });
+      assert.deepEqual(view.parseOpenTasks(source, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER), { openTasks: [], overflowCount: 0 });
+      assert.equal(globalThis.__KanbanFormulaNotices.length, 1, 'document-level failures remain visible and deduplicated');
+      assert.match(globalThis.__KanbanFormulaNotices[0], expectedMessage);
+    });
+  }
+  delete globalThis.__KanbanFormulaNotices;
 });
 
 test('task preview reads reject stale owners and deduplicate bullet work', async (t) => {
@@ -2613,8 +2855,35 @@ test('kanban does not register vault-wide or Notebook Navigator open interceptio
   assert.doesNotMatch(mainSource, /this\.registerNotebookNavigatorPreviewClicks\(\)/);
 });
 
-function createLineMetadataApiMock() {
+function scanPhysicalDocumentLines(content) {
+  const source = String(content ?? '');
+  const lines = [];
+  const newline = /\r\n|\n|\r/gu;
+  let cursor = 0;
+  let match;
+  while ((match = newline.exec(source)) !== null) {
+    lines.push({
+      index: lines.length,
+      lineNumber: lines.length + 1,
+      text: source.slice(cursor, match.index),
+      start: cursor,
+      end: match.index,
+    });
+    cursor = match.index + match[0].length;
+  }
+  lines.push({
+    index: lines.length,
+    lineNumber: lines.length + 1,
+    text: source.slice(cursor),
+    start: cursor,
+    end: source.length,
+  });
+  return lines;
+}
+
+function createLineMetadataApiMock({ scanDocument = scanPhysicalDocumentLines } = {}) {
   let parseCount = 0;
+  let scanCount = 0;
   const scanFields = (line) => {
     const source = String(line || '');
     const fields = [];
@@ -2747,8 +3016,12 @@ function createLineMetadataApiMock() {
       return parseLine(line).displayTitle;
     },
     parseLine,
+    scanDocument(content) {
+      scanCount += 1;
+      return scanDocument(content);
+    },
   };
-  return { api, getParseCount: () => parseCount };
+  return { api, getParseCount: () => parseCount, getScanCount: () => scanCount };
 }
 
 function createFormulaApiMock() {
@@ -3434,6 +3707,19 @@ test('public GCM capability handshake supports either load order and clears atom
     taskLinesVersion: null,
     taskCheckboxesVersion: null,
   });
+
+  const incompleteLineMetadata = { ...api.lineMetadata };
+  delete incompleteLineMetadata.scanDocument;
+  consumerFirstApp.workspace.trigger(bridge.TPS_GCM_API_CHANGED_EVENT, createExactEvent({
+    ...api,
+    lineMetadata: incompleteLineMetadata,
+  }));
+  assert.equal(
+    bridge.getGcmApi(consumerFirstApp),
+    null,
+    'line metadata v1 without document scanning rejects the complete capability snapshot',
+  );
+  assert.match(gcmApiSource, /typeof lineMetadata\.scanDocument === 'function'/u);
   assert.doesNotMatch(gcmApiSource, /app\s*as any\)\?\.plugins|getPlugin\?\.|plugins\?\.plugins/);
 });
 

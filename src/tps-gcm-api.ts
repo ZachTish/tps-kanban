@@ -49,6 +49,18 @@ export type GcmParsedLineMetadata = {
   displayTitle: string;
 };
 
+export type GcmDocumentLine = {
+  /** Zero-based physical line index in the source document. */
+  readonly index: number;
+  /** One-based physical line number in the source document. */
+  readonly lineNumber: number;
+  readonly text: string;
+  /** UTF-16 offset at the start of the physical line. */
+  readonly start: number;
+  /** UTF-16 offset immediately after the line text, before its newline. */
+  readonly end: number;
+};
+
 export type GcmLineMetadataApi = {
   version: number;
   readInlineFields: (line: string) => GcmLineMetadataField[];
@@ -58,6 +70,7 @@ export type GcmLineMetadataApi = {
   parseTags: (value: unknown) => string[];
   getDisplayTitle: (line: string) => string;
   parseLine: (line: string) => GcmParsedLineMetadata;
+  scanDocument: (content: string) => readonly GcmDocumentLine[];
 };
 
 export type GcmEntityIndexRecord = {
@@ -173,7 +186,8 @@ function isGcmLineMetadataApi(value: unknown): value is GcmLineMetadataApi {
     && typeof lineMetadata.parseStringList === 'function'
     && typeof lineMetadata.parseTags === 'function'
     && typeof lineMetadata.getDisplayTitle === 'function'
-    && typeof lineMetadata.parseLine === 'function';
+    && typeof lineMetadata.parseLine === 'function'
+    && typeof lineMetadata.scanDocument === 'function';
 }
 
 function isGcmEntityIndexApi(value: unknown): value is GcmEntityIndexApi {

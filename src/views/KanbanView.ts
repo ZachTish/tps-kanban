@@ -41,7 +41,7 @@ import {
   TPS_ENTITY_INDEX_API_VERSION,
   TPS_LINE_METADATA_API_VERSION,
 } from '../tps-gcm-api';
-import type { GcmApiChangedEvent, GcmEntityIndexApi, GcmFormulaApi, GcmFormulaResult, GcmFormulaSession, GcmLineMetadataApi, GcmParsedLineMetadata } from '../tps-gcm-api';
+import type { GcmApiChangedEvent, GcmDocumentLine, GcmEntityIndexApi, GcmFormulaApi, GcmFormulaResult, GcmFormulaSession, GcmLineMetadataApi, GcmParsedLineMetadata } from '../tps-gcm-api';
 import { flow, flowError, flowWarn } from '../logger';
 import { composeEffectiveFilterRoots, extractPersistedFilterRoots } from '../base-filter-roots';
 import { getMarkdownIndentColumns } from '../task-indent-utils';
@@ -2183,61 +2183,211 @@ export class KanbanView extends BasesView {
     includeDone = false,
     includeBullets = false,
   ): { openTasks: OpenTaskSubitem[]; overflowCount: number } {
-    const tasks: OpenTaskSubitem[] = [];
-    const lines = content.split(/\r?\n/);
     const lineMetadata = getGcmLineMetadataApi(this.app);
-    const doneStatuses = includeDone ? null : this.getDoneStatuses();
-    const hierarchyStack: Array<{ line: number; indent: number }> = [];
-    lines.forEach((line, index) => {
-      const lineNumber = index + 1;
-      const parsed = this.parseLineItem(line, true);
-      const indent = getMarkdownIndentColumns(line);
-      let parentLine: number | undefined;
-      if (parsed) {
-        while (hierarchyStack.length && hierarchyStack[hierarchyStack.length - 1].indent >= indent) hierarchyStack.pop();
-        parentLine = hierarchyStack[hierarchyStack.length - 1]?.line;
-        hierarchyStack.push({ line: lineNumber, indent });
-      } else if (line.trim() && indent === 0) {
-        hierarchyStack.length = 0;
-      }
-      if (!parsed || (!includeBullets && parsed.itemKind === 'bullet')) return;
-      const checkboxState = parsed.checkboxState;
-      if (
-        parsed.itemKind === 'task'
-        && doneStatuses?.has(this.getStatusForCheckboxState(checkboxState || '[ ]'))
-      ) return;
-      let parsedLineMetadata: GcmParsedLineMetadata | null = null;
-      if (lineMetadata) {
-        try {
-          parsedLineMetadata = this.parseGcmLineMetadata(lineMetadata, line);
-        } catch {
-          parsedLineMetadata = null;
+    if (!lineMetadata) {
+      const apiStatus = getGcmApiStatus(this.app);
+      const advertisedVersion = apiStatus?.available ? apiStatus.lineMetadataVersion : null;
+      this.reportFormulaDiagnostic(
+        advertisedVersion != null ? 'incompatible-line-metadata-api' : 'missing-line-metadata-api',
+        advertisedVersion != null
+          ? `TPS Global Context Menu line metadata API version ${TPS_LINE_METADATA_API_VERSION} with document scanning is required for task and bullet discovery (found ${advertisedVersion}).`
+          : 'TPS Global Context Menu line metadata API with document scanning is required for task and bullet discovery.',
+        undefined,
+        undefined,
+        '',
+        'line metadata',
+      );
+      return { openTasks: [], overflowCount: 0 };
+    }
+
+    try {
+      const lines = this.validateGcmDocumentLines(lineMetadata.scanDocument(content), content);
+      const tasks: OpenTaskSubitem[] = [];
+      const doneStatuses = includeDone ? null : this.getDoneStatuses();
+      const hierarchyStack: Array<{ line: number; indent: number; continuationIndent: number }> = [];
+      let previousDocumentLine: GcmDocumentLine | null = null;
+      for (const documentLine of lines) {
+        this.pruneHierarchyAcrossDocumentGap(content, previousDocumentLine, documentLine, hierarchyStack);
+        previousDocumentLine = documentLine;
+        const line = documentLine.text;
+        const lineNumber = documentLine.lineNumber;
+        const parsed = this.parseLineItem(line, true);
+        const indent = getMarkdownIndentColumns(line);
+        let parentLine: number | undefined;
+        if (parsed) {
+          while (hierarchyStack.length && hierarchyStack[hierarchyStack.length - 1].indent >= indent) hierarchyStack.pop();
+          parentLine = hierarchyStack[hierarchyStack.length - 1]?.line;
+          hierarchyStack.push({
+            line: lineNumber,
+            indent,
+            continuationIndent: this.getMarkdownListContinuationIndent(line),
+          });
+        } else if (line.trim() && indent === 0) {
+          hierarchyStack.length = 0;
         }
+        if (!parsed || (!includeBullets && parsed.itemKind === 'bullet')) continue;
+        const checkboxState = parsed.checkboxState;
+        if (
+          parsed.itemKind === 'task'
+          && doneStatuses?.has(this.getStatusForCheckboxState(checkboxState || '[ ]'))
+        ) continue;
+        const parsedLineMetadata = this.parseGcmLineMetadata(lineMetadata, line);
+        if (!parsedLineMetadata) {
+          throw new Error(`TPS Global Context Menu returned invalid parsed metadata for physical line ${lineNumber}.`);
+        }
+        const inlineFields = this.appendCanonicalTaskTagFields(parsedLineMetadata.fields, parsedLineMetadata.tags);
+        const text = this.cleanTaskText(parsed.text);
+        if (!text) continue;
+        tasks.push({
+          itemKind: parsed.itemKind,
+          internalId: `${filePath}:${lineNumber}`,
+          line: lineNumber,
+          indent,
+          parentLine,
+          checkboxState,
+          text,
+          sourceText: parsed.text,
+          rawLine: line,
+          lineMetadata: parsedLineMetadata,
+          displayText: parsedLineMetadata.displayTitle || this.cleanTaskDisplayText(this.stripTaskInlineFields(text)),
+          inlineFields,
+        });
       }
-      const inlineFields = parsedLineMetadata
-        ? this.appendCanonicalTaskTagFields(parsedLineMetadata.fields, parsedLineMetadata.tags)
-        : this.extractTaskInlineFields(parsed.text);
-      const text = this.cleanTaskText(parsed.text);
-      if (!text) return;
-      tasks.push({
-        itemKind: parsed.itemKind,
-        internalId: `${filePath}:${lineNumber}`,
-        line: lineNumber,
-        indent,
-        parentLine,
-        checkboxState,
+      const finiteLimit = Number.isFinite(Number(limit)) ? Number(limit) : tasks.length;
+      const normalizedLimit = Math.max(0, Math.min(tasks.length, Math.floor(finiteLimit || 0)));
+      const openTasks = tasks.slice(0, normalizedLimit);
+      return { openTasks, overflowCount: Math.max(0, tasks.length - openTasks.length) };
+    } catch (error) {
+      this.reportFormulaDiagnostic(
+        'canonical-line-discovery-failed',
+        error instanceof Error ? error.message : String(error),
+        undefined,
+        undefined,
+        '',
+        'line metadata',
+      );
+      return { openTasks: [], overflowCount: 0 };
+    }
+  }
+
+  private pruneHierarchyAcrossDocumentGap(
+    content: string,
+    previousLine: GcmDocumentLine | null,
+    currentLine: GcmDocumentLine,
+    hierarchyStack: Array<{ line: number; indent: number; continuationIndent: number }>,
+  ): void {
+    if (
+      !previousLine
+      || currentLine.index === previousLine.index + 1
+      || hierarchyStack.length === 0
+    ) return;
+    const firstOmittedContentLine = String(content ?? '')
+      .slice(previousLine.end, currentLine.start)
+      .split(/\r\n|\n|\r/u)
+      .find((line) => line.trim().length > 0);
+    if (firstOmittedContentLine == null) {
+      hierarchyStack.length = 0;
+      return;
+    }
+    const boundaryIndent = getMarkdownIndentColumns(firstOmittedContentLine);
+    while (
+      hierarchyStack.length
+      && boundaryIndent < hierarchyStack[hierarchyStack.length - 1].continuationIndent
+    ) hierarchyStack.pop();
+  }
+
+  private getMarkdownListContinuationIndent(line: string): number {
+    const match = String(line ?? '').match(/^[\t ]*(?:[-*+]|\d+[.)])[\t ]+/u);
+    if (!match) {
+      throw new Error('Kanban parsed a list item without a supported Markdown continuation prefix.');
+    }
+    let column = 0;
+    for (const character of match[0]) {
+      column = character === '\t'
+        ? column + (4 - (column % 4))
+        : column + 1;
+    }
+    return column;
+  }
+
+  private validateGcmDocumentLines(value: unknown, content: string): GcmDocumentLine[] {
+    if (!Array.isArray(value)) {
+      throw new Error('TPS Global Context Menu returned an invalid document scan result.');
+    }
+    const source = String(content ?? '');
+    const claims: GcmDocumentLine[] = [];
+    let previousIndex = -1;
+    for (const item of value) {
+      if (!item || typeof item !== 'object') {
+        throw new Error('TPS Global Context Menu returned an invalid document line record.');
+      }
+      const record = item as Partial<GcmDocumentLine>;
+      const index = record.index;
+      const lineNumber = record.lineNumber;
+      const text = record.text;
+      const start = record.start;
+      const end = record.end;
+      if (
+        !Number.isInteger(index)
+        || Number(index) < 0
+        || !Number.isInteger(lineNumber)
+        || Number(lineNumber) !== Number(index) + 1
+        || typeof text !== 'string'
+        || !Number.isInteger(start)
+        || Number(start) < 0
+        || !Number.isInteger(end)
+        || Number(end) < Number(start)
+        || Number(end) > source.length
+        || Number(index) <= previousIndex
+      ) {
+        throw new Error('TPS Global Context Menu returned inconsistent physical document line coordinates.');
+      }
+      claims.push({
+        index: Number(index),
+        lineNumber: Number(lineNumber),
         text,
-        sourceText: parsed.text,
-        rawLine: line,
-        lineMetadata: parsedLineMetadata ?? undefined,
-        displayText: parsedLineMetadata?.displayTitle || this.cleanTaskDisplayText(this.stripTaskInlineFields(text)),
-        inlineFields,
+        start: Number(start),
+        end: Number(end),
       });
-    });
-    const finiteLimit = Number.isFinite(Number(limit)) ? Number(limit) : tasks.length;
-    const normalizedLimit = Math.max(0, Math.min(tasks.length, Math.floor(finiteLimit || 0)));
-    const openTasks = tasks.slice(0, normalizedLimit);
-    return { openTasks, overflowCount: Math.max(0, tasks.length - openTasks.length) };
+      previousIndex = Number(index);
+    }
+
+    const lines: GcmDocumentLine[] = [];
+    const newline = /\r\n|\n|\r/gu;
+    let claimCursor = 0;
+    let physicalIndex = 0;
+    let physicalStart = 0;
+    while (claimCursor < claims.length) {
+      const match = newline.exec(source);
+      const physicalEnd = match?.index ?? source.length;
+      const claim = claims[claimCursor];
+      if (claim.index === physicalIndex) {
+        const physicalText = source.slice(physicalStart, physicalEnd);
+        if (
+          claim.lineNumber !== physicalIndex + 1
+          || claim.start !== physicalStart
+          || claim.end !== physicalEnd
+          || claim.text !== physicalText
+        ) {
+          throw new Error('TPS Global Context Menu returned inconsistent physical document line coordinates.');
+        }
+        lines.push({
+          index: physicalIndex,
+          lineNumber: physicalIndex + 1,
+          text: physicalText,
+          start: physicalStart,
+          end: physicalEnd,
+        });
+        claimCursor += 1;
+      }
+      if (!match) break;
+      physicalStart = match.index + match[0].length;
+      physicalIndex += 1;
+    }
+    if (claimCursor !== claims.length) {
+      throw new Error('TPS Global Context Menu returned inconsistent physical document line coordinates.');
+    }
+    return lines;
   }
 
   private parseLineItem(line: string, includeBullets = true): { itemKind: 'task' | 'bullet'; checkboxState?: string; text: string } | null {

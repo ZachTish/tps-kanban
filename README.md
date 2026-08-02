@@ -1,5 +1,11 @@
 # TPS Kanban
 
+## 0.2.1
+
+- Synthesized task and bullet discovery now consumes GCM's document-aware line scan before parsing rows. YAML frontmatter and fenced, indented, HTML, or comment blocks cannot become Kanban cards; valid nested rows keep their physical line identity, hierarchy, filters, formulas, and editing routes.
+- Missing, incompatible, throwing, or malformed line metadata fails synthetic discovery closed with a deduplicated diagnostic. The former raw-line and copied inline-metadata fallback paths are removed, so Kanban cannot silently reinterpret quarantined examples.
+- Existing settings, Base definitions, notes, tasks, lanes, and minimum Obsidian 1.10.0 remain unchanged. No migration is required. Install TPS Global Context Menu 1.17.0 before this coordinated patch.
+
 ## 0.2.0
 
 - Custom Base formulas now work on synthesized checkbox-task and bullet rows across card properties, lanes/grouping, filters, sort, search, and style rules. Kanban consumes GCM's exact version-1 formula and canonical line-metadata APIs; it does not copy an evaluator, create temporary notes, or reach into private Bases internals.
@@ -300,6 +306,7 @@ Run `npm run test:settings` for the focused settings source contract. It checks 
 
 ## Version notes
 
+- 0.2.1: Excluded protected Markdown blocks from synthesized task/bullet discovery through GCM's authoritative document scanner and removed raw-line metadata fallbacks.
 - 0.2.0: Added supported formula/entity behavior for synthesized rows, additive Kind identity, typed boolean display, public GCM lifecycle capabilities, exact Base authority, and fail-closed read-only formula lanes.
 - 0.1.7: Reused one Markdown line classification for hierarchy and emitted task/bullet data, halving parser calls without changing released output.
 - 0.1.6: Short-circuited note/task card style-rule conditions without changing selected rules, worst-case work, or the released style-rule contract.
