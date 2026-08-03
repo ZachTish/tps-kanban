@@ -572,6 +572,7 @@ test('root task creation utilities normalize targets and build lane-matching tas
   const {
     buildKanbanRootTaskLine,
     getKanbanRootTaskCheckboxMarker,
+    getKanbanRootTaskDesiredStatus,
     normalizeKanbanTaskTargetPath,
     resolveKanbanLaneAddPresentation,
     resolveKanbanRootTaskTargetPath,
@@ -639,6 +640,14 @@ test('root task creation utilities normalize targets and build lane-matching tas
     }),
     '/',
   );
+  assert.equal(
+    getKanbanRootTaskDesiredStatus({
+      propName: 'task.status',
+      laneValue: 'complete',
+      defaults,
+    }),
+    'complete',
+  );
 
   assert.equal(
     buildKanbanRootTaskLine({
@@ -673,39 +682,112 @@ test('root task creation utilities normalize targets and build lane-matching tas
     '- [/] Write summary #work [area:: Ops]',
     'lane inline property should win over matching Base default field',
   );
+  assert.equal(
+    buildKanbanRootTaskLine({
+      title: 'Unknown status',
+      propName: 'task.status',
+      laneValue: 'waiting-on-map',
+      defaults,
+      getCheckboxStateForStatus: checkboxForStatus,
+    }),
+    null,
+    'an explicit unmapped lane status must not silently create a todo task',
+  );
+  assert.equal(
+    buildKanbanRootTaskLine({
+      title: 'Missing GCM',
+      propName: null,
+      laneValue: null,
+      defaults: { ...defaults, status: null },
+      getCheckboxStateForStatus: () => null,
+    }),
+    null,
+    'task creation must fail closed when the canonical mapping capability is unavailable',
+  );
 });
 
-test('task checkbox utilities toggle mapped statuses and update only task checkbox markers', async () => {
+test('root task creation revalidates the exact mapping and workflow ownership inside the atomic write', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const file = { path: 'Inbox/Creation Mapping Race.md' };
+  let content = '# Tasks\n';
+  let beforeUpdater = () => {};
+  let workflowKey = 'taskStatus';
+  const stateByStatus = { todo: '[ ]', complete: '[x]' };
+  const statusByState = { '[ ]': 'todo', '[x]': 'complete' };
+  view.app = {
+    vault: {
+      async process(receivedFile, updater) {
+        assert.equal(receivedFile, file);
+        beforeUpdater();
+        content = updater(content);
+      },
+    },
+  };
+  view.getGcmServices = () => ({
+    status: {
+      getStatusPropertyKey: () => workflowKey,
+      getRelationalStatusPropertyKey: () => 'status',
+    },
+  });
+  view.getCheckboxStateForStatus = (status) => stateByStatus[String(status || '').toLowerCase()] || null;
+  view.getStatusForCheckboxState = (state) => statusByState[state] || '';
+  const defaults = {
+    status: 'todo',
+    inlineFields: new Map(),
+    tags: new Set(),
+    excludedStatuses: new Set(),
+    excludedTags: new Set(),
+  };
+
+  let plan = view.getRootTaskCreationMappingPlan('task.status', 'complete', defaults);
+  assert.deepEqual(
+    { desiredStatus: plan.desiredStatus, checkboxState: plan.checkboxState, canonicalStatus: plan.canonicalStatus },
+    { desiredStatus: 'complete', checkboxState: '[x]', canonicalStatus: 'complete' },
+  );
+  assert.equal(view.taskLineMatchesCreationMappingPlan('- [x] Ship release', plan), true);
+
+  beforeUpdater = () => {
+    stateByStatus.complete = '[!]';
+  };
+  assert.equal(await view.writeRootTaskLineWithMappingGuard(file, '- [x] Ship release', plan, false), false);
+  assert.equal(content, '# Tasks\n', 'a status-to-marker change at the write boundary leaves the note byte-identical');
+
+  stateByStatus.complete = '[x]';
+  plan = view.getRootTaskCreationMappingPlan('task.status', 'complete', defaults);
+  beforeUpdater = () => {
+    workflowKey = 'workflowState';
+  };
+  assert.equal(await view.writeRootTaskLineWithMappingGuard(file, '- [x] Ship release', plan, false), false);
+  assert.equal(content, '# Tasks\n', 'a workflow ownership change at the write boundary also produces zero note changes');
+
+  workflowKey = 'taskStatus';
+  plan = view.getRootTaskCreationMappingPlan('task.status', 'complete', defaults);
+  beforeUpdater = () => {};
+  assert.equal(await view.writeRootTaskLineWithMappingGuard(file, '- [x] Ship release', plan, false), true);
+  assert.equal(content, '# Tasks\n- [x] Ship release\n');
+});
+
+test('task checkbox utilities validate exact markers and update only task checkbox markers', async () => {
   assert.match(taskCheckboxUtilsSource, /export function replaceKanbanTaskLineCheckboxState/);
   assert.match(viewSource, /replaceKanbanTaskLineCheckboxState\(current, nextState\)/);
   const {
-    getKanbanCheckboxStateForStatus,
-    getKanbanStatusForCheckboxState,
-    getKanbanToggleCheckboxState,
+    normalizeKanbanCheckboxState,
     replaceKanbanTaskLineCheckboxState,
   } = await importTaskCheckboxUtils();
-  const mappings = [
-    { checkboxState: '[ ]', statuses: ['todo'], toggleTargetStatus: 'complete' },
-    { checkboxState: '[x]', statuses: ['complete'], toggleTargetStatus: 'todo' },
-    { checkboxState: '[/]', statuses: ['next'], toggleTargetStatus: 'complete' },
-    { checkboxState: '[?]', statuses: ['holding'], toggleTargetStatus: 'todo' },
-  ];
-
-  assert.equal(getKanbanStatusForCheckboxState('[/]', mappings), 'next');
-  assert.equal(getKanbanStatusForCheckboxState('[~]', mappings), 'wont-do');
-  assert.equal(getKanbanCheckboxStateForStatus('next', mappings), '[/]');
-  assert.equal(getKanbanCheckboxStateForStatus('working', mappings), '[\\]');
-  assert.equal(getKanbanToggleCheckboxState('[/]', mappings, new Set(['complete'])), '[x]');
-  assert.equal(getKanbanToggleCheckboxState('[x]', mappings, new Set(['complete'])), '[ ]');
-  assert.equal(getKanbanToggleCheckboxState('[?]', mappings, new Set(['complete'])), '[ ]');
-  assert.equal(getKanbanToggleCheckboxState('[!]', mappings, new Set(['complete', 'done'])), '[x]');
-  assert.equal(getKanbanToggleCheckboxState('[x]', [{ checkboxState: '[x]', statuses: ['done'] }], new Set(['done'])), '[ ]');
+  assert.equal(normalizeKanbanCheckboxState('x'), '[x]');
+  assert.equal(normalizeKanbanCheckboxState('[ ]'), '[ ]');
+  assert.equal(normalizeKanbanCheckboxState('[X]'), '[x]');
+  assert.equal(normalizeKanbanCheckboxState('[custom]'), '');
+  assert.equal(normalizeKanbanCheckboxState('[😀]'), '');
+  assert.equal(normalizeKanbanCheckboxState(''), '');
 
   assert.equal(replaceKanbanTaskLineCheckboxState('- [ ] Write tests', '[x]'), '- [x] Write tests');
   assert.equal(replaceKanbanTaskLineCheckboxState('  1. [/] Ordered task [area:: GCP]', '[x]'), '  1. [x] Ordered task [area:: GCP]');
   assert.equal(replaceKanbanTaskLineCheckboxState('* [ ] Bullet marker task', 'x'), '* [x] Bullet marker task');
   assert.equal(replaceKanbanTaskLineCheckboxState('- plain bullet', '[x]'), '- plain bullet');
   assert.equal(replaceKanbanTaskLineCheckboxState('Not a task [ ] line', '[x]'), 'Not a task [ ] line');
+  assert.equal(replaceKanbanTaskLineCheckboxState('- [ ] Keep safe', '[custom]'), '- [ ] Keep safe');
 });
 
 test('card task previews are bounded and use source markdown labels', () => {
@@ -777,6 +859,63 @@ test('one all-task parse derives the same bounded open previews as direct parsin
       );
     }
   }
+});
+
+test('valid unmapped checkbox rows remain structural tasks in discovery and bounded previews', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  view.app = {};
+  provideGcmProtocolApi(view);
+  view.getDoneStatuses = () => new Set(['complete']);
+  view.getStatusForCheckboxState = (state) => ({ '[ ]': 'todo', '[x]': 'complete' })[state] || '';
+
+  const content = [
+    '- [ ] Mapped open task',
+    '- [*] Quarantined structural task #qa [owner:: Ada]',
+    '- [x] Mapped completed task',
+  ].join('\n');
+  const allTasks = view.parseOpenTasks(content, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER, true).openTasks;
+  assert.deepEqual(
+    allTasks.map(({ internalId, line, checkboxState, rawLine, text }) => ({ internalId, line, checkboxState, rawLine, text })),
+    [
+      {
+        internalId: 'Inbox/Tasks.md:1',
+        line: 1,
+        checkboxState: '[ ]',
+        rawLine: '- [ ] Mapped open task',
+        text: 'Mapped open task',
+      },
+      {
+        internalId: 'Inbox/Tasks.md:2',
+        line: 2,
+        checkboxState: '[*]',
+        rawLine: '- [*] Quarantined structural task #qa [owner:: Ada]',
+        text: 'Quarantined structural task #qa [owner:: Ada]',
+      },
+      {
+        internalId: 'Inbox/Tasks.md:3',
+        line: 3,
+        checkboxState: '[x]',
+        rawLine: '- [x] Mapped completed task',
+        text: 'Mapped completed task',
+      },
+    ],
+  );
+
+  assert.deepEqual(
+    view.parseOpenTasks(content, 'Inbox/Tasks.md', Number.MAX_SAFE_INTEGER).openTasks.map((task) => task.checkboxState),
+    ['[ ]', '[*]'],
+    'only mapped terminal rows are omitted from the default preview population',
+  );
+  assert.deepEqual(
+    view.selectOpenTaskPreview(allTasks, 1),
+    { openTasks: [allTasks[0]], overflowCount: 1 },
+    'unmapped structural rows participate in the authoritative local overflow count',
+  );
+  assert.deepEqual(
+    view.selectOpenTaskPreview(allTasks, 2).openTasks.map((task) => task.checkboxState),
+    ['[ ]', '[*]'],
+  );
 });
 
 test('markdown item parsing classifies each source line once in both inclusion modes', async () => {
@@ -975,7 +1114,7 @@ test('canonical CR-only descriptors preserve physical identities and hierarchy',
   const view = Object.create(KanbanView.prototype);
   view.app = {};
   view.getDoneStatuses = () => new Set(['complete']);
-  view.getStatusForCheckboxState = () => 'todo';
+  view.getStatusForCheckboxState = (state) => state === '[ ]' ? 'todo' : '';
   const lineMetadataMock = createLineMetadataApiMock();
   provideGcmProtocolApi(view, { lineMetadata: lineMetadataMock.api });
   const content = '- [ ] Parent\r  - [ ] Child\r- [ ] Tail';
@@ -1096,6 +1235,43 @@ test('task preview reads reject stale owners and deduplicate bullet work', async
     assert.equal(harness.view.openTasksByPath.get(file.path)?.[0]?.text, 'one-pass');
     assert.equal(harness.view.allTasksByPath.get(file.path)?.[0]?.text, 'one-pass');
     assert.equal(harness.refreshCount(), 1);
+  });
+
+  await t.test('GCM preview enrichment cannot erase unmapped structural rows or replace the local count', async () => {
+    const harness = createTaskReadHarness(KanbanView);
+    const file = { path: 'Inbox/Structural.md' };
+    harness.filesByPath.set(file.path, file);
+    harness.view.getOpenTaskPreviewLimit = () => 2;
+    harness.view.getStatusForCheckboxState = (state) => ({ '[ ]': 'todo', '[x]': 'complete' })[state] || '';
+    harness.view.parseOpenTasks = () => ({
+      openTasks: [
+        { itemKind: 'task', internalId: `${file.path}:1`, line: 1, checkboxState: '[ ]', text: 'Mapped', rawLine: '- [ ] Mapped' },
+        { itemKind: 'task', internalId: `${file.path}:2`, line: 2, checkboxState: '[*]', text: 'Structural', rawLine: '- [*] Structural' },
+        { itemKind: 'task', internalId: `${file.path}:3`, line: 3, checkboxState: '[x]', text: 'Done', rawLine: '- [x] Done' },
+      ],
+      overflowCount: 0,
+    });
+    harness.view.getGcmServices = () => ({
+      cardContent: {
+        extractOpenTasksFromMarkdown: () => ({
+          openTasks: [{ itemKind: 'task', line: 1, checkboxState: '[ ]', text: 'Provider mapped row' }],
+          overflowCount: 99,
+        }),
+      },
+    });
+
+    harness.view.loadOpenTasksForFile(file);
+    harness.pendingReads[0].gate.resolve('ignored');
+    await flushDeferredWork();
+
+    assert.deepEqual(
+      harness.view.openTasksByPath.get(file.path).map(({ internalId, checkboxState, rawLine }) => ({ internalId, checkboxState, rawLine })),
+      [
+        { internalId: `${file.path}:1`, checkboxState: '[ ]', rawLine: '- [ ] Mapped' },
+        { internalId: `${file.path}:2`, checkboxState: '[*]', rawLine: '- [*] Structural' },
+      ],
+    );
+    assert.equal(harness.view.openTaskOverflowByPath.get(file.path), 0, 'the local structural selection owns the preview count');
   });
 
   await t.test('a modify can start a fresh read and the older success cannot overwrite it', async () => {
@@ -1788,7 +1964,7 @@ test('completed tasks are hidden by default and can be shown per view for manipu
   assert.match(viewSource, /taskEl\.classList\.toggle\('tps-kanban-card-task--completed', this\.isDoneTask\(task\)\)/);
   assert.match(viewSource, /cardEl\.classList\.toggle\('tps-kanban-task-card--completed', this\.isDoneTask\(task\)\)/);
   assert.match(viewSource, /this\.getAllTasksForFile\(file\)/);
-  assert.match(viewSource, /void this\.updateTaskCheckboxState\(entry\.file, task\.line, this\.getToggleCheckboxStateForTask\(task\)\)/);
+  assert.match(viewSource, /this\.requestTaskCheckboxToggle\(entry\.file, task, checkboxEl\)/);
   assert.match(stylesSource, /\.tps-kanban-view-toggle\[aria-pressed="true"\]/);
   assert.match(stylesSource, /\.tps-kanban-card-task--completed \.tps-kanban-card-task-text\s*\{[\s\S]*text-decoration:line-through;/);
 });
@@ -1798,11 +1974,457 @@ test('root task cards expose native checkbox completion controls', () => {
   assert.match(viewSource, /cls: 'tps-kanban-card-task-checkbox tps-kanban-task-card-checkbox'/);
   assert.match(viewSource, /type: 'checkbox'/);
   assert.match(viewSource, /'aria-label': `Toggle task: \$\{taskTitle\}`/);
-  assert.match(viewSource, /checkboxEl\.checked = this\.getDoneStatuses\(\)\.has\(this\.getStatusForCheckboxState\(task\.checkboxState \|\| '\[ \]'\)\)/);
+  assert.match(viewSource, /const currentState = this\.normalizeCheckboxState\(task\.checkboxState \|\| ''\)/);
+  assert.match(viewSource, /checkboxEl\.checked = !!currentStatus && this\.getDoneStatuses\(\)\.has\(currentStatus\)/);
+  assert.doesNotMatch(viewSource, /getGcmTaskCheckboxToggleState\(this\.app, task\.checkboxState \|\| '\[ \]'\)/);
   assert.match(viewSource, /checkboxEl\.addEventListener\('pointerdown', \(e: PointerEvent\) => \{\s*e\.stopPropagation\(\);/);
   assert.match(viewSource, /checkboxEl\.addEventListener\('click', \(e: MouseEvent\) => \{\s*e\.stopPropagation\(\);/);
-  assert.match(viewSource, /void this\.updateTaskCheckboxState\(file, task\.line, this\.getToggleCheckboxStateForTask\(task\)\)/);
+  assert.match(viewSource, /this\.requestTaskCheckboxToggle\(file, task, checkboxEl\)/);
   assert.match(stylesSource, /\.tps-kanban-task-card > \.tps-kanban-card-inner > \.tps-kanban-card-title-row\s*\{[\s\S]*grid-template-columns:14px 18px minmax\(0, 1fr\);/);
+});
+
+test('task checkbox toggles perform no mutation when the captured GCM mapping is unavailable', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const file = { path: 'Inbox/Tasks.md' };
+  const task = { line: 3, checkboxState: '[?]' };
+  const checkboxEl = { checked: true };
+  let updateCalls = 0;
+  let updateArgs = null;
+
+  view.getToggleCheckboxStateForTask = () => null;
+  view.getDoneStatuses = () => new Set(['complete']);
+  view.getStatusForCheckboxState = () => '';
+  view.updateTaskCheckboxState = async (...args) => {
+    updateCalls += 1;
+    updateArgs = args;
+  };
+
+  view.requestTaskCheckboxToggle(file, task, checkboxEl);
+  await flushDeferredWork();
+
+  assert.equal(updateCalls, 0);
+  assert.equal(checkboxEl.checked, false, 'the native control must return to the authoritative mapped state');
+
+  view.getStatusForCheckboxState = () => 'holding';
+  view.getToggleCheckboxStateForTask = () => '[x]';
+  view.requestTaskCheckboxToggle(file, task, checkboxEl);
+  await flushDeferredWork();
+  assert.equal(updateCalls, 1);
+  assert.deepEqual(updateArgs, [file, 3, '[x]', '[?]']);
+});
+
+test('task checkbox writes reject stale, malformed, and unmapped states before overwrite', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const file = { path: 'Inbox/Tasks.md' };
+  let content = '- [/] Task';
+  let processCalls = 0;
+  view.app = {
+    vault: {
+      async process(receivedFile, updater) {
+        assert.equal(receivedFile, file);
+        processCalls += 1;
+        content = updater(content);
+      },
+    },
+    workspace: { trigger() {} },
+  };
+  view.getStatusForCheckboxState = (state) => ({ '[ ]': 'todo', '[/]': 'working', '[x]': 'complete' })[state] || '';
+  view.getCheckboxStateForStatus = (status) => ({ todo: '[ ]', working: '[/]', complete: '[x]' })[status] || null;
+  view.clearTaskCachesForPath = () => {};
+
+  await view.updateTaskCheckboxState(file, 1, '[x]', '[ ]');
+  assert.equal(content, '- [/] Task', 'a confirmation based on an old state must not overwrite the current line');
+
+  await view.updateTaskCheckboxState(file, 1, '[z]', '[/]');
+  assert.equal(processCalls, 1, 'an unmapped target must be rejected before vault.process');
+  assert.equal(content, '- [/] Task');
+
+  await view.updateTaskCheckboxState(file, 1, '[x]', '[/]');
+  assert.equal(content, '- [x] Task');
+
+  content = '- [ab] Task';
+  await view.updateTaskCheckboxState(file, 1, '[ ]');
+  assert.equal(content, '- [ab] Task', 'malformed current tokens must never be promoted to todo');
+});
+
+test('task checkbox writes revalidate source and target mappings inside the atomic update', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const file = { path: 'Inbox/Mapping Race.md' };
+  let content = '- [ ] Task';
+  let beforeUpdater = () => {};
+  let processCalls = 0;
+  const statusByState = { '[ ]': 'todo', '[x]': 'complete' };
+  view.app = {
+    vault: {
+      async process(receivedFile, updater) {
+        assert.equal(receivedFile, file);
+        processCalls += 1;
+        beforeUpdater();
+        content = updater(content);
+      },
+    },
+    workspace: { trigger() {} },
+  };
+  view.getStatusForCheckboxState = (state) => statusByState[state] || '';
+  view.getCheckboxStateForStatus = (status) => Object.entries(statusByState)
+    .find(([, mappedStatus]) => mappedStatus === status)?.[0] ?? null;
+  view.clearTaskCachesForPath = () => {};
+
+  beforeUpdater = () => {
+    statusByState['[x]'] = 'review';
+  };
+  await view.updateTaskCheckboxState(file, 1, '[x]', '[ ]');
+  assert.equal(content, '- [ ] Task', 'a target mapping changed at the write boundary must produce zero note changes');
+
+  statusByState['[x]'] = 'complete';
+  beforeUpdater = () => {
+    statusByState['[ ]'] = 'backlog';
+  };
+  await view.updateTaskCheckboxState(file, 1, '[x]', '[ ]');
+  assert.equal(content, '- [ ] Task', 'a source mapping changed at the write boundary must produce zero note changes');
+  assert.equal(processCalls, 2, 'both races are rejected by the updater that owns the atomic write');
+});
+
+test('task drops reject mapping errors before confirmation and write one captured valid plan atomically', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const file = { path: 'Inbox/Tasks.md' };
+  let content = '- [ ] Task';
+  let processCalls = 0;
+  let confirmationCalls = 0;
+
+  view.app = {
+    vault: {
+      async process(receivedFile, updater) {
+        assert.equal(receivedFile, file);
+        processCalls += 1;
+        content = updater(content);
+      },
+    },
+    workspace: { trigger() {} },
+  };
+  view.parseLineItem = () => ({ itemKind: 'task' });
+  view.clearTaskCachesForPath = () => {};
+  view.confirmTaskDrop = async () => {
+    confirmationCalls += 1;
+    return true;
+  };
+  view.buildTaskDropPlan = async () => ({
+    changes: ['Task: Inbox/Tasks.md:1'],
+    filterTags: [],
+    filterStatus: null,
+    mappingError: 'No valid mapping.',
+    currentLine: '- [ ] Task',
+    nextLine: '- [ ] Task',
+    itemKind: 'task',
+  });
+
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'status', 'working'), false);
+  assert.equal(confirmationCalls, 0);
+  assert.equal(processCalls, 0);
+  assert.equal(content, '- [ ] Task');
+
+  view.buildTaskDropPlan = async () => ({
+    changes: ['Task: Inbox/Tasks.md:1', 'Set checkbox state to [/].'],
+    filterTags: [],
+    filterStatus: null,
+    mappingError: null,
+    currentLine: '- [ ] Task',
+    nextLine: '- [/] Task',
+    itemKind: 'task',
+  });
+
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'status', 'working'), true);
+  assert.equal(confirmationCalls, 1);
+  assert.equal(processCalls, 1);
+  assert.equal(content, '- [/] Task');
+
+  content = '- [?] Concurrent edit';
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'status', 'working'), false);
+  assert.equal(confirmationCalls, 2);
+  assert.equal(processCalls, 2);
+  assert.equal(content, '- [?] Concurrent edit');
+});
+
+test('task drops revalidate source and target mappings after confirmation and at the atomic write boundary', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const file = { path: 'Inbox/Drop Mapping Race.md' };
+  let content = '- [ ] Task';
+  let processCalls = 0;
+  let duringConfirmation = () => {};
+  let beforeUpdater = () => {};
+  let statusByState;
+  let stateByStatus;
+
+  const resetMappings = () => {
+    statusByState = { '[ ]': 'todo', '[x]': 'complete' };
+    stateByStatus = { todo: '[ ]', complete: '[x]' };
+  };
+  resetMappings();
+  view.app = {
+    vault: {
+      async cachedRead(receivedFile) {
+        assert.equal(receivedFile, file);
+        return content;
+      },
+      async process(receivedFile, updater) {
+        assert.equal(receivedFile, file);
+        processCalls += 1;
+        beforeUpdater();
+        content = updater(content);
+      },
+    },
+    workspace: { trigger() {} },
+  };
+  view.getTaskRootFilterFromBaseFilters = () => ({
+    mode: 'tasks',
+    hasTaskDirective: true,
+    includeDone: false,
+    statuses: new Set(),
+    excludeStatuses: new Set(),
+    tags: new Set(),
+    excludeTags: new Set(),
+  });
+  view.isStatusPropertyName = (property) => property === 'task.status';
+  view.getStatusForCheckboxState = (state) => statusByState[state] || '';
+  view.getCheckboxStateForStatus = (status) => stateByStatus[String(status || '').toLowerCase()] || null;
+  view.getWorkflowStatusFieldKeysToClear = () => [];
+  view.clearTaskCachesForPath = () => {};
+  view.confirmTaskDrop = async () => {
+    duringConfirmation();
+    return true;
+  };
+
+  duringConfirmation = () => {
+    statusByState['[ ]'] = 'backlog';
+  };
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'task.status', 'complete'), false);
+  assert.equal(content, '- [ ] Task');
+  assert.equal(processCalls, 0, 'a source mapping changed during confirmation is rejected before vault.process');
+
+  resetMappings();
+  duringConfirmation = () => {
+    stateByStatus.complete = '[!]';
+  };
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'task.status', 'complete'), false);
+  assert.equal(content, '- [ ] Task');
+  assert.equal(processCalls, 0, 'a target mapping changed during confirmation is rejected before vault.process');
+
+  resetMappings();
+  duringConfirmation = () => {};
+  beforeUpdater = () => {
+    statusByState['[ ]'] = 'backlog';
+  };
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'task.status', 'complete'), false);
+  assert.equal(content, '- [ ] Task');
+  assert.equal(processCalls, 1, 'a source mapping changed at the write boundary reaches one no-op atomic updater');
+
+  resetMappings();
+  beforeUpdater = () => {
+    stateByStatus.complete = '[!]';
+  };
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'task.status', 'complete'), false);
+  assert.equal(content, '- [ ] Task');
+  assert.equal(processCalls, 2, 'a target mapping changed at the write boundary also leaves the source byte-identical');
+});
+
+test('task drops reject workflow-field ownership changes after confirmation and inside the atomic write', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const file = { path: 'Inbox/Drop Ownership Race.md' };
+  let content = '- [ ] Task [status:: [[Statuses/Holding]]] [taskStatus:: stale] [task.checkboxStatus:: stale]';
+  let processCalls = 0;
+  let duringConfirmation = () => {};
+  let beforeUpdater = () => {};
+  let workflowKey = 'taskStatus';
+  let relationalKey = 'status';
+  view.app = {
+    vault: {
+      async cachedRead(receivedFile) {
+        assert.equal(receivedFile, file);
+        return content;
+      },
+      async process(receivedFile, updater) {
+        assert.equal(receivedFile, file);
+        processCalls += 1;
+        beforeUpdater();
+        content = updater(content);
+      },
+    },
+    workspace: { trigger() {} },
+  };
+  view.getGcmServices = () => ({
+    status: {
+      getStatusPropertyKey: () => workflowKey,
+      getRelationalStatusPropertyKey: () => relationalKey,
+    },
+  });
+  view.getTaskRootFilterFromBaseFilters = () => ({
+    mode: 'tasks',
+    hasTaskDirective: true,
+    includeDone: false,
+    statuses: new Set(),
+    excludeStatuses: new Set(),
+    tags: new Set(),
+    excludeTags: new Set(),
+  });
+  view.getStatusForCheckboxState = (state) => state === '[ ]' ? 'todo' : state === '[x]' ? 'complete' : '';
+  view.getCheckboxStateForStatus = (status) => status === 'todo' ? '[ ]' : status === 'complete' ? '[x]' : null;
+  view.clearTaskCachesForPath = () => {};
+  view.confirmTaskDrop = async () => {
+    duringConfirmation();
+    return true;
+  };
+
+  duringConfirmation = () => {
+    workflowKey = 'workflowState';
+  };
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'task.status', 'complete'), false);
+  assert.equal(processCalls, 0);
+  assert.match(content, /\[taskStatus:: stale\]/u, 'ownership changes after confirmation cannot apply a stale cleanup plan');
+
+  workflowKey = 'taskStatus';
+  relationalKey = 'status';
+  duringConfirmation = () => {};
+  beforeUpdater = () => {
+    relationalKey = 'workflowState';
+  };
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'task.status', 'complete'), false);
+  assert.equal(processCalls, 1);
+  assert.match(content, /^- \[ \] Task/u, 'ownership changes at the write boundary leave the source line byte-identical');
+});
+
+test('unmapped structural tasks allow non-workflow drops but block status drops before confirmation or mutation', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  const file = { path: 'Inbox/Quarantine.md' };
+  let content = '- [*] Quarantined task';
+  let processCalls = 0;
+  let confirmationCalls = 0;
+  view.app = {
+    vault: {
+      async cachedRead(receivedFile) {
+        assert.equal(receivedFile, file);
+        return content;
+      },
+      async process(receivedFile, updater) {
+        assert.equal(receivedFile, file);
+        processCalls += 1;
+        content = updater(content);
+      },
+    },
+    workspace: { trigger() {} },
+  };
+  view.getTaskRootFilterFromBaseFilters = () => ({
+    mode: 'tasks',
+    hasTaskDirective: true,
+    includeDone: false,
+    statuses: new Set(),
+    excludeStatuses: new Set(),
+    tags: new Set(),
+    excludeTags: new Set(),
+  });
+  view.isStatusPropertyName = (property) => property === 'task.status';
+  view.getStatusForCheckboxState = (state) => state === '[ ]' ? 'todo' : state === '[x]' ? 'complete' : '';
+  view.getCheckboxStateForStatus = (status) => status === 'complete' ? '[x]' : null;
+  view.getWorkflowStatusFieldKeysToClear = () => [];
+  view.confirmTaskDrop = async () => {
+    confirmationCalls += 1;
+    return true;
+  };
+
+  const nonWorkflowPlan = await view.buildTaskDropPlan(file, 1, 'area', 'Operations');
+  assert.equal(nonWorkflowPlan.mappingError, null);
+  assert.equal(nonWorkflowPlan.currentLine, '- [*] Quarantined task');
+  assert.equal(nonWorkflowPlan.nextLine, '- [*] Quarantined task [area:: Operations]');
+
+  const statusPlan = await view.buildTaskDropPlan(file, 1, 'task.status', 'complete');
+  assert.match(statusPlan.mappingError, /current checkbox state is not mapped by GCM/u);
+  assert.equal(statusPlan.nextLine, statusPlan.currentLine);
+  assert.equal(await view.confirmAndApplyInlineTaskDrop(file, 1, 'task.status', 'complete'), false);
+  assert.equal(confirmationCalls, 0, 'a status drop on an unmapped marker never opens a confirmation path');
+  assert.equal(processCalls, 0, 'a status drop on an unmapped marker never reaches vault.process');
+  assert.equal(content, '- [*] Quarantined task');
+});
+
+test('workflow status ownership clears only explicit GCM fields and preserves relational status', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+
+  view.getGcmServices = () => ({
+    status: {
+      getStatusPropertyKey: () => 'taskStatus',
+      getRelationalStatusPropertyKey: () => 'status',
+    },
+  });
+  assert.equal(view.isRelationalStatusPropertyReference('status'), true);
+  assert.equal(view.isStatusPropertyName('status'), false, 'bare relational status is not routed to checkbox mutation');
+  assert.equal(view.isStatusPropertyName('task.status'), true);
+  assert.equal(view.isStatusPropertyName('task.checkboxStatus'), true);
+  assert.equal(view.isStatusPropertyName('taskStatus'), true);
+  assert.deepEqual(
+    view.getWorkflowStatusFieldKeysToClear(),
+    ['taskStatus', 'task.status', 'task.checkboxStatus', 'checkboxStatus'],
+    'the exact relational key is excluded from workflow cleanup',
+  );
+  const relationalFilter = {
+    mode: 'mixed',
+    hasTaskDirective: false,
+    hasFormulaFilter: false,
+    mayMatchBullets: false,
+    includeDone: false,
+    statuses: new Set(),
+    excludeStatuses: new Set(),
+    tags: new Set(),
+    excludeTags: new Set(),
+  };
+  view.collectTaskRootFilterString('status == "[[Statuses/Holding]]"', relationalFilter);
+  assert.deepEqual([...relationalFilter.statuses], [], 'bare relational status never leaks into workflow checkbox filter sets');
+  view.collectTaskRootFilterString('task.status == "working"', relationalFilter);
+  assert.deepEqual([...relationalFilter.statuses], ['working'], 'the explicit task namespace still contributes workflow defaults');
+  view.collectTaskRootFilterObject({ property: 'taskStatus', operator: 'is', value: 'holding' }, relationalFilter, false);
+  assert.deepEqual([...relationalFilter.statuses], ['working', 'holding'], 'the exact configured workflow key is routed to checkbox filters');
+
+  view.getGcmServices = () => ({
+    status: {
+      getStatusPropertyKey: () => 'workflowState',
+      getRelationalStatusPropertyKey: () => 'status',
+    },
+  });
+  assert.equal(view.isStatusPropertyName('taskStatus'), true, 'a stale legacy workflow carrier remains checkbox-owned after the configured key changes');
+  assert.deepEqual(
+    view.getWorkflowStatusFieldKeysToClear(),
+    ['workflowState', 'taskStatus', 'task.status', 'task.checkboxStatus', 'checkboxStatus'],
+  );
+
+  view.getGcmServices = () => ({
+    status: {
+      getStatusPropertyKey: () => 'status',
+      getRelationalStatusPropertyKey: () => '',
+    },
+  });
+  assert.equal(view.isStatusPropertyName('status'), true);
+  assert.deepEqual(
+    view.getWorkflowStatusFieldKeysToClear(),
+    ['status', 'taskStatus', 'task.status', 'task.checkboxStatus', 'checkboxStatus'],
+    'bare status is cleared only when GCM explicitly owns it as workflow state',
+  );
+
+  view.getGcmServices = () => null;
+  assert.equal(view.isStatusPropertyName('status'), false, 'missing GCM ownership never guesses that bare status is workflow state');
+  assert.equal(view.isStatusPropertyName('task.status'), true, 'the explicit virtual task namespace remains unambiguous');
+  assert.deepEqual(view.getWorkflowStatusFieldKeysToClear(), ['task.status', 'task.checkboxStatus', 'checkboxStatus']);
+});
+
+test('task-drop revision resolution follows one exact shifted line and rejects ambiguity', async () => {
+  const { resolveKanbanTaskDropRevisionIndex } = await importTaskDropUtils();
+  assert.equal(resolveKanbanTaskDropRevisionIndex(['heading', '- [ ] Task'], 0, '- [ ] Task'), 1);
+  assert.equal(resolveKanbanTaskDropRevisionIndex(['- [ ] Task', '- [ ] Task'], 3, '- [ ] Task'), -1);
+  assert.equal(resolveKanbanTaskDropRevisionIndex(['- [/] Changed'], 0, '- [ ] Task'), -1);
 });
 
 test('collapsing task previews preserves kanban scroll position', () => {
@@ -2079,10 +2701,10 @@ test('status kanban renders tasks as lane items and keeps done tasks addressable
   assert.match(viewSource, /private allTasksByPath = new Map<string, OpenTaskSubitem\[\]>\(\)/);
   assert.match(viewSource, /buildTaskRenderItemsByLane\(\s*groups: BasesEntryGroup\[\],\s*propName: string \| null,/);
   assert.match(viewSource, /this\.parseOpenTasks\(content, path, Number\.MAX_SAFE_INTEGER, true, true\)/);
-  assert.match(viewSource, /getLaneIdForStatus\(this\.getStatusForCheckboxState\(task\.checkboxState/);
+  assert.match(viewSource, /const status = this\.getMappedStatusForTask\(task\);\s*return status \? \[this\.getLaneIdForStatus\(status\)\] : \['ungrouped'\];/);
   assert.match(viewSource, /isStatusPropertyName\(propName\)/);
   assert.match(viewSource, /if \(this\.isStatusPropertyName\(propName\)\)/);
-  assert.match(viewSource, /nextLine = buildKanbanTaskDropLine\(\{\s*line: currentLine,\s*propName,\s*value,\s*sourceLaneValues,\s*filterTags,\s*filterStatus,/);
+  assert.match(viewSource, /nextLine = mappingError[\s\S]*?buildKanbanTaskDropLine\(\{[\s\S]*?statusCheckboxState,[\s\S]*?filterCheckboxState,/);
   assert.match(viewSource, /createTaskLaneCard\(mixedItem\.item, propName, taskGroupPropId, displayLane\)/);
   assert.match(viewSource, /role: 'button', tabindex: '0'/);
   assert.doesNotMatch(viewSource, /cls: 'tps-kanban-card-title tps-kanban-task-card-title',[\\s\\S]{0,120}type: 'button'/);
@@ -2107,13 +2729,14 @@ test('status kanban renders tasks as lane items and keeps done tasks addressable
   assert.match(viewSource, /if \(task\.itemKind === 'bullet'\) \{/);
   assert.match(viewSource, /setIconWithFallback\(iconEl, 'list'\)/);
   assert.match(viewSource, /cls: 'tps-kanban-card-task-checkbox tps-kanban-task-card-checkbox'/);
-  assert.match(viewSource, /'data-checkbox-state': task\.checkboxState \|\| '\[ \]'/);
-  assert.match(viewSource, /getCheckboxMarker\(task\.checkboxState \|\| '\[ \]'\)/);
+  assert.match(viewSource, /'data-checkbox-state': checkboxState/);
+  assert.match(viewSource, /getCheckboxMarker\(checkboxState\)/);
   assert.match(viewSource, /draggable: 'true'/);
   assert.match(viewSource, /'aria-label': `Drag \$\{task\.itemKind === 'bullet' \? 'bullet' : 'task'\}:/);
   assert.match(viewSource, /title: task\.itemKind === 'bullet' \? 'Drag bullet' : 'Drag task'/);
-  assert.match(viewSource, /checkboxState: task\.itemKind === 'bullet' \? undefined : task\.checkboxState \|\| '\[ \]'/);
-  assert.match(viewSource, /checkboxState: active\.itemKind === 'bullet' \? undefined : active\.checkboxState \|\| '\[ \]'/);
+  assert.match(viewSource, /private buildTaskLineDropPayload\(/);
+  assert.match(viewSource, /checkboxState: this\.getStructuralCheckboxStateForTask\(task\) \|\| undefined/);
+  assert.match(viewSource, /checkboxState: active\.itemKind === 'bullet' \? undefined : active\.checkboxState/);
   assert.match(viewSource, /dragHandle\.draggable = canReorderLane/);
   assert.match(viewSource, /position: 'before' \| 'after' = 'before'/);
   assert.match(viewSource, /laneEl\.hasClass\('tps-kanban-lane--drop-after'\) \? 'after' : 'before'/);
@@ -2161,10 +2784,57 @@ test('status kanban renders tasks as lane items and keeps done tasks addressable
   assert.doesNotMatch(viewSource, /\(\?:\\\[\\\|\\\(\)\(\[A-Za-z\]\[\\w -\]\{0,40\}\)::\\s\*\(\[\^\\\]\\\)\]\+\)/);
 });
 
+test('task render payloads preserve an unmapped structural marker and exact line identity', async () => {
+  const { KanbanView } = await importKanbanView();
+  const view = Object.create(KanbanView.prototype);
+  view.getStatusForCheckboxState = (state) => state === '[ ]' ? 'todo' : '';
+  const file = { path: 'Inbox/Quarantine.md' };
+  const task = {
+    itemKind: 'task',
+    internalId: 'Inbox/Quarantine.md:12',
+    line: 12,
+    checkboxState: '[*]',
+    text: 'Quarantined task #qa [owner:: Ada]',
+    displayText: 'Quarantined task',
+    rawLine: '- [*] Quarantined task #qa [owner:: Ada]',
+  };
+
+  assert.equal(view.getStructuralCheckboxStateForTask(task), '[*]');
+  assert.equal(view.getMappedCheckboxStateForTask(task), '');
+  assert.deepEqual(
+    view.buildTaskLineDropPayload(file, task, ['Quarantine']),
+    {
+      type: 'task-line',
+      source: 'tps-kanban',
+      itemKind: 'task',
+      path: 'Inbox/Quarantine.md',
+      line: 12,
+      rawLine: '- [*] Quarantined task #qa [owner:: Ada]',
+      checkboxState: '[*]',
+      text: 'Quarantined task',
+      sourceLaneValues: ['Quarantine'],
+    },
+  );
+  assert.deepEqual(
+    view.buildPointerTaskDropPayload({
+      itemKind: 'task',
+      path: file.path,
+      line: task.line,
+      rawLine: task.rawLine,
+      checkboxState: view.getStructuralCheckboxStateForTask(task),
+      text: task.displayText,
+      sourceLaneValues: ['Quarantine'],
+    }),
+    view.buildTaskLineDropPayload(file, task, ['Quarantine']),
+    'pointer and native drag payloads expose the same structural identity',
+  );
+});
+
 test('dragging a linked task writes only to the checklist source line', async () => {
   const {
     buildKanbanTaskDropLine,
     parseKanbanLineItem,
+    removeKanbanInlineTaskProperties,
     updateKanbanInlineTaskTag,
   } = await importTaskDropUtils();
   const checkboxForStatus = (status) => {
@@ -2187,13 +2857,15 @@ test('dragging a linked task writes only to the checklist source line', async ()
     text: 'Draft notes [area:: office]',
   });
   assert.equal(parseKanbanLineItem('- Draft notes [area:: office]', false), null);
+  assert.equal(parseKanbanLineItem('- [] Empty task marker', true), null);
+  assert.equal(parseKanbanLineItem('- [ab] Malformed task marker', true), null, 'malformed task markers must not be reclassified as bullets');
 
   assert.equal(
     buildKanbanTaskDropLine({
       line: '- [ ] Call vendor [area:: office] #home',
       propName: 'status',
       value: 'complete',
-      getCheckboxStateForStatus: checkboxForStatus,
+      statusCheckboxState: checkboxForStatus('complete'),
       isStatusPropertyName,
     }),
     '- [x] Call vendor [area:: office] #home',
@@ -2204,7 +2876,6 @@ test('dragging a linked task writes only to the checklist source line', async ()
       propName: 'tags',
       value: '#waiting on vendor',
       sourceLaneValues: ['#todo'],
-      getCheckboxStateForStatus: checkboxForStatus,
       isStatusPropertyName,
     }),
     '- [ ] Call vendor #home #waiting-on-vendor',
@@ -2215,8 +2886,7 @@ test('dragging a linked task writes only to the checklist source line', async ()
       propName: 'area',
       value: 'errands',
       filterTags: ['#project/home'],
-      filterStatus: 'working',
-      getCheckboxStateForStatus: checkboxForStatus,
+      filterCheckboxState: checkboxForStatus('working'),
       isStatusPropertyName,
     }),
     '- [/] Call vendor #home [area:: errands] #project/home',
@@ -2226,8 +2896,8 @@ test('dragging a linked task writes only to the checklist source line', async ()
       line: '- Draft notes [area:: office] #todo',
       propName: 'status',
       value: 'complete',
-      filterStatus: 'working',
-      getCheckboxStateForStatus: checkboxForStatus,
+      statusCheckboxState: checkboxForStatus('complete'),
+      filterCheckboxState: checkboxForStatus('working'),
       isStatusPropertyName,
     }),
     '- Draft notes [area:: office] #todo',
@@ -2236,15 +2906,49 @@ test('dragging a linked task writes only to the checklist source line', async ()
     updateKanbanInlineTaskTag('- [ ] Call vendor #todo #home', 'todo', ['todo']),
     '- [ ] Call vendor #todo #home',
   );
+  assert.equal(
+    removeKanbanInlineTaskProperties(
+      '- [/] Call vendor [status:: [[Statuses/Old]]] [taskStatus:: old] [task.status:: old] [task.checkboxStatus:: old] [checkboxStatus:: old] `example [status:: keep]` [area:: office]',
+      ['status', 'taskStatus', 'task.status', 'task.checkboxStatus', 'checkboxStatus'],
+    ),
+    '- [/] Call vendor `example [status:: keep]` [area:: office]',
+    'checkbox-owned status cleanup removes nested persisted fields but not code examples',
+  );
+  assert.equal(
+    buildKanbanTaskDropLine({
+      line: '- [ ] Relational [status:: [[Statuses/Holding]]] [taskStatus:: todo] [task.status:: todo] [task.checkboxStatus:: todo] [checkboxStatus:: todo]',
+      propName: 'task.status',
+      value: 'complete',
+      statusCheckboxState: checkboxForStatus('complete'),
+      statusFieldKeysToRemove: ['taskStatus', 'task.status', 'task.checkboxStatus', 'checkboxStatus'],
+      isStatusPropertyName: (name) => String(name || '').trim().toLowerCase() === 'task.status',
+    }),
+    '- [x] Relational [status:: [[Statuses/Holding]]]',
+    'workflow checkbox drops preserve the explicitly relational status field while removing stale workflow fields',
+  );
+  assert.equal(
+    buildKanbanTaskDropLine({
+      line: '- [ ] Nonrelational [status:: stale] [taskStatus:: stale]',
+      propName: 'status',
+      value: 'working',
+      statusCheckboxState: checkboxForStatus('working'),
+      statusFieldKeysToRemove: ['status', 'taskStatus', 'checkboxStatus'],
+      isStatusPropertyName,
+    }),
+    '- [/] Nonrelational',
+    'non-relational inline status carriers are removed once the checkbox owns workflow status',
+  );
 
-  assert.match(viewSource, /type: 'task-line',\s*source: 'tps-kanban',\s*itemKind: task\.itemKind \|\| 'task',\s*path: entry\.file\.path,\s*line: task\.line,/);
+  assert.match(viewSource, /const buildNestedTaskPayload = \(\) => JSON\.stringify\(this\.buildTaskLineDropPayload\(\s*entry\.file,\s*task,/);
+  assert.match(viewSource, /private buildTaskLineDropPayload\([\s\S]*?type: 'task-line',[\s\S]*?path: file\.path,[\s\S]*?line: task\.line,[\s\S]*?rawLine: task\.rawLine \|\| '',/);
   assert.match(viewSource, /e\.dataTransfer\.setData\(KANBAN_TASK_MIME, payload\)/);
   assert.match(viewSource, /e\.dataTransfer\.setData\(TPS_TASK_LINE_MIME, payload\)/);
   assert.match(viewSource, /const taskFile = parsed\?\.path \? this\.app\.vault\.getFileByPath\(parsed\.path\) : null;/);
   assert.match(viewSource, /await this\.confirmAndApplyInlineTaskDrop\(\s*taskFile,\s*parsed\.line,/);
-  assert.match(viewSource, /nextLine = buildKanbanTaskDropLine\(\{/);
+  assert.match(viewSource, /nextLine = mappingError[\s\S]*?buildKanbanTaskDropLine\(\{/);
   assert.match(viewSource, /parseKanbanLineItem\(line, includeBullets\)/);
   assert.match(viewSource, /private async buildTaskDropPlan/);
+  assert.match(viewSource, /if \(plan\.mappingError\) \{[\s\S]*?return false;/);
   assert.match(taskDropUtilsSource, /export function buildKanbanTaskDropLine/);
   assert.match(viewSource, /cls: 'tps-kanban-task-drop-preview'/);
   assert.match(viewSource, /cls: 'tps-kanban-task-drop-preview-line'/);
@@ -2330,7 +3034,7 @@ test('task-only kanban creation and matching preserve complex boolean filters', 
   assert.match(viewSource, /private taskFilePathMatches\(file: TFile \| null, rawValue: string\): boolean/);
   assert.match(viewSource, /isEmpty/);
   assert.match(settingsTabSource, /task\.tags\.isEmpty\(\)/);
-  assert.match(viewSource, /evaluateTaskValueFilterExpression\(expr, 'status', \[status\], false\)/);
+  assert.match(viewSource, /evaluateTaskValueFilterExpression\(expr, 'status', status \? \[status\] : \[\], false\)/);
   assert.match(viewSource, /evaluateTaskValueFilterExpression\(expr, 'tags', this\.getTaskInlineValues\(task, 'tags'\), false\)/);
   assert.match(viewSource, /private evaluateGenericTaskValueFilterExpression\(expr: string, task: OpenTaskSubitem\): boolean \| null/);
   assert.match(viewSource, /private getGenericTaskComparableValues\(task: OpenTaskSubitem, propRaw: string\): string\[\] \| null/);
@@ -2338,6 +3042,8 @@ test('task-only kanban creation and matching preserve complex boolean filters', 
   assert.match(settingsTabSource, /Bare tags, status, and custom fields are shared/);
   assert.match(viewSource, /const propPattern = `\$\{requireTaskPrefix \? 'task\\\\\.' : '\(\?:task\\\\\.\)\?'\}/);
   assert.match(settingsTabSource, /Use note\.tags\/note\.status for note frontmatter only/);
+  assert.match(settingsTabSource, /task\.status: checkbox-derived workflow status from the ordered checkbox mappings configured in TPS Global Context Menu/);
+  assert.doesNotMatch(settingsTabSource, /Unchecked maps to todo; checked maps to complete/);
   assert.match(viewSource, /taskFileExtensionPattern/);
   assert.match(viewSource, /const itemExtensionPattern = `\(\?:extension\|ext\|file\[/);
   assert.doesNotMatch(viewSource, /const fileExtensionPattern = `\(\?:task\\\\\.\)\?file/);
@@ -2370,8 +3076,12 @@ test('task-only kanban creation and matching preserve complex boolean filters', 
   assert.match(taskCreationUtilsSource, /const writableLaneTag = normalizeWritableTaskTag\(laneTag\)/);
   assert.match(taskCreationUtilsSource, /for \(const \[defaultProp, field\] of options\.defaults\.inlineFields\)/);
   assert.match(taskCreationUtilsSource, /defaultProp === normalizedProp/);
-  assert.match(viewSource, /const taskLine = this\.buildRootTaskLine\(title, propName, targetSelection\.value, taskFilter, defaults\)/);
+  assert.match(viewSource, /const mappingPlan = this\.getRootTaskCreationMappingPlan\(propName, targetSelection\.value, defaults\)/);
+  assert.match(viewSource, /this\.buildRootTaskLine\(title, propName, targetSelection\.value, taskFilter, defaults\)/);
+  assert.match(viewSource, /if \(!mappingPlan \|\| !taskLine \|\| !this\.taskLineMatchesCreationMappingPlan\(taskLine, mappingPlan\)\) \{[\s\S]*?'unmapped-status'[\s\S]*?has no checkbox mapping in GCM/);
+  assert.match(viewSource, /writeRootTaskLineWithMappingGuard/);
   assert.doesNotMatch(viewSource, /const taskLine = `- \[ \] \$\{title\}`/);
+  assert.doesNotMatch(taskCreationUtilsSource, /\|\| '\[ \]'/);
   assert.doesNotMatch(viewSource, /for \(const tag of tags\) parts\.push\(`#\$\{tag\}`\)[\s\S]{0,120}normalizeTaskTag\(laneValue\)/);
 });
 
@@ -2693,7 +3403,8 @@ test('kanban diagnostics trace drag/drop mutation decisions', () => {
     "flow('TaskDrop', 'confirm:start'",
     "flow('TaskDrop', 'confirm:cancelled'",
     "flow('TaskDrop', 'apply:start'",
-    "flow('TaskDrop', changed ? 'apply:done' : 'apply:no-change'",
+    "flow('TaskDrop', mutation.outcome === 'changed' ? 'apply:done' : 'apply:no-change'",
+    "flowWarn('TaskDrop', 'apply:stale-target'",
     "flowWarn('CardNest', 'blocked'",
     "flow('CardNest', 'drop:start'",
     "flow('CardNest', 'drop:done'",
@@ -2762,10 +3473,24 @@ test('Kanban task interactions and checkbox mappings use only exact public GCM c
   const contextEvents = [];
   const editorCalls = [];
   const sourceMappings = [
-    { checkboxState: '!', statuses: [' Review ', ''], toggleTargetStatus: 'Complete', icon: 'eye', label: 'Review' },
+    { checkboxState: '!', statuses: [' Review '], toggleTargetStatus: 'Complete', icon: 'eye', label: 'Review' },
     { checkboxState: '[x]', statuses: ['complete'], toggleTargetStatus: 'todo', icon: 'check', label: 'Complete' },
     { checkboxState: '[ ]', statuses: ['todo'], toggleTargetStatus: 'complete', icon: 'square', label: 'Todo' },
   ];
+  let stateForStatus = (status) => String(status).toLowerCase() === 'review'
+    ? '[!]'
+    : String(status).toLowerCase() === 'complete'
+      ? '[x]'
+      : String(status).toLowerCase() === 'todo'
+        ? '[ ]'
+        : '';
+  let statusForState = (state) => String(state) === '[!]'
+    ? 'review'
+    : String(state).toLowerCase() === '[x]'
+      ? 'complete'
+      : String(state) === '[ ]'
+        ? 'todo'
+        : '';
   provideGcmProtocolApi(view, {
     api: {
       services: {
@@ -2786,9 +3511,10 @@ test('Kanban task interactions and checkbox mappings use only exact public GCM c
       },
       taskCheckboxes: {
         version: 1,
+        contract: 'ordered-strict-v1',
         getMappings: () => sourceMappings,
-        stateForStatus: (status) => String(status) === 'review' ? '[!]' : '[ ]',
-        statusForState: (state) => String(state) === '[!]' ? 'review' : 'todo',
+        stateForStatus: (status) => stateForStatus(status),
+        statusForState: (state) => statusForState(state),
       },
     },
   });
@@ -2810,13 +3536,26 @@ test('Kanban task interactions and checkbox mappings use only exact public GCM c
   assert.deepEqual(editorCalls, [{ taskEl, sourceEl }]);
 
   assert.deepEqual(view.getGcmCheckboxMappings(), [
-    { checkboxState: '[!]', statuses: ['review'], toggleTargetStatus: 'Complete', icon: 'eye', label: 'Review' },
+    { checkboxState: '[!]', statuses: ['review'], toggleTargetStatus: 'complete', icon: 'eye', label: 'Review' },
     { checkboxState: '[x]', statuses: ['complete'], toggleTargetStatus: 'todo', icon: 'check', label: 'Complete' },
     { checkboxState: '[ ]', statuses: ['todo'], toggleTargetStatus: 'complete', icon: 'square', label: 'Todo' },
   ]);
   assert.equal(view.getStatusForCheckboxState('[!]'), 'review');
   assert.equal(view.getCheckboxStateForStatus('review'), '[!]');
   assert.equal(view.getToggleCheckboxStateForTask({ checkboxState: '[!]' }), '[x]');
+  assert.equal(view.getToggleCheckboxStateForTask({ checkboxState: '[X]' }), '[ ]');
+  assert.equal(view.getStatusForCheckboxState('[custom]'), '', 'malformed states do not become invented statuses');
+  stateForStatus = (status) => String(status).toLowerCase() === 'review' ? '[x]' : '[ ]';
+  assert.equal(view.getCheckboxStateForStatus('review'), null, 'a live resolver cannot return a different valid marker than the ordered mapping assigns');
+  stateForStatus = (status) => String(status).toLowerCase() === 'review'
+    ? '[!]'
+    : String(status).toLowerCase() === 'complete'
+      ? '[x]'
+      : '[ ]';
+  statusForState = (state) => String(state) === '[!]' ? 'complete' : String(state).toLowerCase() === '[x]' ? 'complete' : 'todo';
+  assert.equal(view.getStatusForCheckboxState('[!]'), '', 'a live reverse resolver cannot change a mapped marker to another valid status');
+  statusForState = (state) => String(state) === '[!]' ? 'review' : String(state).toLowerCase() === '[x]' ? 'complete' : 'todo';
+  assert.equal(view.getStatusForCheckboxState('[!]'), 'review');
   assert.deepEqual(view.getChildLinkKeys(), ['offspring', 'parentOf'], 'custom relationship keys come from the public parent service');
   assert.equal(sourceMappings[0].checkboxState, '!', 'Kanban normalizes a local copy instead of mutating provider state');
 
@@ -2829,6 +3568,7 @@ test('Kanban task interactions and checkbox mappings use only exact public GCM c
       },
       taskCheckboxes: {
         version: 2,
+        contract: 'ordered-strict-v1',
         getMappings: () => sourceMappings,
         stateForStatus: () => '[!]',
         statusForState: () => 'review',
@@ -2838,12 +3578,32 @@ test('Kanban task interactions and checkbox mappings use only exact public GCM c
   assert.equal(view.openTaskLineContextMenu({}), false, 'an unsupported task-lines version fails closed');
   assert.equal(view.openTaskQuickEditor(editorEvent, taskEl, sourceEl), false, 'an unsupported task-lines version does not consume the click');
   assert.equal(view.getCheckboxStateForStatus('review'), null, 'an unsupported checkbox capability cannot leak custom mappings');
+  assert.deepEqual(view.getGcmCheckboxMappings(), [], 'an unsupported checkbox capability has no private default table');
+  assert.equal(view.getToggleCheckboxStateForTask({ checkboxState: '[!]' }), null, 'unsupported toggles fail before mutation');
+
+  provideGcmProtocolApi(view, {
+    api: {
+      taskCheckboxes: {
+        version: 1,
+        contract: 'ordered-strict-v1',
+        getMappings: () => sourceMappings,
+        stateForStatus: (status) => String(status).toLowerCase() === 'review' ? '[!]' : '[ ]',
+        statusForState: () => 'todo',
+      },
+    },
+  });
+  assert.deepEqual(view.getGcmCheckboxMappings(), [], 'cross-method inconsistencies invalidate the complete snapshot');
+  assert.equal(view.getCheckboxStateForStatus('review'), null);
+  assert.equal(view.getStatusForCheckboxState('[!]'), '');
 
   assert.doesNotMatch(viewSource, /getGcmPlugin|getGcmSettings|contextTargetService|taskLineContextMenuService|linkedSubitemCheckboxMappings/);
   assert.doesNotMatch(viewSource, /tps-global-context-menu|TPS-Global-Context-Menu|gcmPlugin/);
   assert.match(viewSource, /this\.getGcmServices\(\)\?\.parents\?\.getChildKeys\?\.\(\)/);
   assert.match(gcmApiSource, /taskLines\.version === TPS_TASK_LINES_API_VERSION/);
   assert.match(gcmApiSource, /taskCheckboxes\.version === TPS_TASK_CHECKBOXES_API_VERSION/);
+  assert.match(gcmApiSource, /taskCheckboxes\.contract === TPS_TASK_CHECKBOXES_CONTRACT/);
+  assert.doesNotMatch(viewSource, /getDefaultCheckboxMappings/);
+  assert.doesNotMatch(taskCheckboxUtilsSource, /return 'todo'|return '\[x\]'|return '\[\\\\\]'/);
 });
 
 test('kanban does not register vault-wide or Notebook Navigator open interception', () => {
@@ -3278,9 +4038,16 @@ async function createFormulaViewHarness({
   view.getBaseFile = () => null;
   view.createFormulaThisValue = () => ({ scheduled: '2026-07-31' });
   view.getTaskVisibleTitle = (task) => task.displayText || task.text;
-  view.getStatusForCheckboxState = () => 'todo';
+  view.getStatusForCheckboxState = (state) => state === '[ ]' ? 'todo' : '';
   view.getDoneStatuses = () => new Set(['complete']);
-  view.getGcmServices = () => null;
+  view.getGcmServices = () => ({
+    status: {
+      getStatusPropertyKey: () => 'taskStatus',
+      getRelationalStatusPropertyKey: () => 'status',
+      getDoneStatuses: () => ['complete'],
+      isDoneStatus: (status) => String(status || '').trim().toLowerCase() === 'complete',
+    },
+  });
   const task = {
     itemKind: 'task',
     line: 7,
@@ -3341,9 +4108,12 @@ test('synthesized Kanban rows use the GCM formula session across context, depend
   assert.equal(context.row.line, 7, 'line numbers must remain 1-based');
   assert.equal(context.row.status, 'relational', 'row.status remains the semantic inline field');
   assert.equal(context.task.status, 'todo', 'task.status remains checkbox workflow state');
+  assert.equal(context.row.taskStatus, 'todo', 'the configured workflow carrier is derived from the ordered checkbox mapping');
   assert.equal(context.row.checkboxState, '[ ]', 'row.checkboxState preserves the raw checkbox marker');
   assert.equal(context.task.checkboxState, '[ ]', 'task.checkboxState preserves the raw checkbox marker');
   assert.equal(context.row.checkboxStatus, 'todo', 'row.checkboxStatus remains the normalized workflow status');
+  assert.equal(context.row.open, true, 'completion aliases come from GCM completion authority');
+  assert.equal(context.row.done, false);
   assert.equal(context.row.blank, '', 'blank canonical fields remain addressable');
   assert.equal(context.row.project, '[[Projects/Alpha]]');
   assert.deepEqual(context.row.kinds, ['task', 'project']);
@@ -3356,10 +4126,134 @@ test('synthesized Kanban rows use the GCM formula session across context, depend
   assert.match(context.line.raw, /^- \[ \] Formula task/);
   assert.deepEqual(context.file.tags, ['source'], 'file.tags uses canonical unprefixed metadata tags');
   assert.equal(context.line.number, 7);
+  assert.equal(view.evaluateTaskFilterString('status == "relational"', task, file), true, 'bare relational status filters read the inline entity field');
+  assert.equal(view.evaluateTaskFilterString('task.status == "todo"', task, file), true, 'task.status filters read checkbox workflow state');
+  assert.equal(view.evaluateTaskFilterString('taskStatus == "todo"', task, file), true, 'the configured workflow key reads the same mapped state');
+  assert.equal(view.evaluateTaskFilterString('open == true', task, file), true);
+  assert.equal(view.evaluateTaskFilterString('open == false', task, file), false);
+  assert.equal(view.evaluateTaskFilterString('done == false', task, file), true);
+  assert.equal(view.evaluateTaskFilterObject({ property: 'done', operator: 'is', value: false }, task, file), true);
+  assert.equal(view.getTaskPropertyValue(file, task, 'status', new Set()).text, 'relational');
+  assert.equal(view.getTaskPropertyValue(file, task, 'task.status', new Set()).text, 'todo');
+  assert.equal(view.getTaskPropertyValue(file, task, 'taskStatus', new Set()).text, 'todo');
   assert.equal(context.file.path, file.path);
   assert.equal(context.now, view.formulaNow, 'all formula sessions in one render share one frozen now value');
   assert.equal(view.createFormulaFileContext(file), view.createFormulaFileContext(file), 'one render reuses immutable source-file formula context');
   assert.equal(lineMetadataMock.getParseCount(), parseCountBeforeRow + 1, 'one canonical parsed-line bundle is cached for every formula consumer on the row');
+  const staleWorkflowAliasTask = {
+    ...task,
+    line: 69,
+    rawLine: `${task.rawLine} [taskStatus:: stale] [task.status:: stale] [task.checkboxStatus:: stale] [checkboxStatus:: stale] [isDone:: true] [complete:: true]`,
+    sourceText: `${task.sourceText} [taskStatus:: stale] [task.status:: stale] [task.checkboxStatus:: stale] [checkboxStatus:: stale] [isDone:: true] [complete:: true]`,
+    lineMetadata: undefined,
+  };
+  const staleWorkflowAliasContext = view.createTaskFormulaContext(file, staleWorkflowAliasTask);
+  assert.equal(staleWorkflowAliasContext.row.status, 'relational', 'the exact relational Status value survives workflow alias scrubbing');
+  assert.equal(staleWorkflowAliasContext.row.taskStatus, 'todo');
+  assert.equal(staleWorkflowAliasContext.row['task.status'], undefined);
+  assert.equal(staleWorkflowAliasContext.row['task.checkboxStatus'], undefined);
+  assert.equal(staleWorkflowAliasContext.row.checkboxStatus, 'todo');
+  assert.equal(staleWorkflowAliasContext.row.isDone, undefined, 'authored completion aliases cannot impersonate derived workflow state');
+  assert.equal(staleWorkflowAliasContext.row.complete, undefined);
+  const unavailableStateTask = {
+    ...staleWorkflowAliasTask,
+    line: 70,
+    checkboxState: '[?]',
+    rawLine: staleWorkflowAliasTask.rawLine.replace('- [ ]', '- [?]'),
+    inlineFields: [...task.inlineFields, { key: 'tag', value: '#work' }],
+    lineMetadata: undefined,
+  };
+  const unavailableStateContext = view.createTaskFormulaContext(file, unavailableStateTask);
+  assert.equal(unavailableStateContext.row.status, 'relational', 'an unavailable workflow state never overwrites relational row.status');
+  assert.equal(unavailableStateContext.row.checkboxState, '[?]', 'row context retains the valid structural checkbox marker');
+  assert.equal(unavailableStateContext.row.checkboxStatus, undefined);
+  assert.equal(unavailableStateContext.row.taskStatus, undefined, 'an unmapped structural task exposes no stale configured workflow carrier');
+  assert.equal(unavailableStateContext.row['task.status'], undefined);
+  assert.equal(unavailableStateContext.row['task.checkboxStatus'], undefined);
+  assert.equal(unavailableStateContext.row.open, undefined);
+  assert.equal(unavailableStateContext.task.status, undefined);
+  assert.equal(unavailableStateContext.task.checkboxState, '[?]', 'task context retains structure without inventing workflow state');
+  assert.equal(unavailableStateContext.task.done, undefined);
+  assert.equal(view.getTaskPropertyValue(file, unavailableStateTask, 'status', new Set()).text, 'relational');
+  assert.equal(view.getTaskPropertyValue(file, unavailableStateTask, 'task.status', new Set()), null);
+  assert.deepEqual(view.getTaskLaneIds(file, unavailableStateTask, 'task.status'), ['ungrouped']);
+  assert.equal(view.evaluateTaskFilterString('task.status.isEmpty()', unavailableStateTask, file), false, 'missing mappings fail closed instead of matching an empty-status filter');
+  assert.equal(view.evaluateTaskFilterString('task.status != "todo"', unavailableStateTask, file), false, 'negative status predicates cannot invert an unavailable workflow state');
+
+  const authoritativeServices = view.getGcmServices;
+  view.getGcmServices = () => ({
+    status: {
+      getStatusPropertyKey: () => 'taskStatus',
+      getRelationalStatusPropertyKey: () => 'status',
+    },
+  });
+  const missingCompletionContext = view.createTaskFormulaContext(file, {
+    ...task,
+    line: 71,
+    lineMetadata: undefined,
+  });
+  assert.equal(missingCompletionContext.task.status, 'todo', 'mapped workflow status stays available without completion authority');
+  assert.equal(missingCompletionContext.row.open, undefined, 'missing completion authority cannot invent open=true');
+  assert.equal(missingCompletionContext.row.done, undefined);
+  assert.equal(view.evaluateTaskFilterString('open == true', task, file), false, 'completion filters fail closed without authority');
+  assert.equal(view.evaluateTaskFilterString('!open == true', task, file), false, 'negation cannot invert unavailable completion state');
+  assert.equal(view.evaluateTaskFilterObject({ property: 'done', operator: '!is', value: true }, task, file), false);
+  const unavailableCompletionStyle = {
+    active: true,
+    match: 'all',
+    conditions: [{ field: 'open', operator: '!is', value: 'true' }],
+    color: '#f00',
+  };
+  view.plugin.settings.cardStyleRules = [unavailableCompletionStyle];
+  assert.equal(
+    view.resolveTaskCardStyleRule(file, staleWorkflowAliasTask, null),
+    null,
+    'negative style predicates cannot match a scrubbed, unavailable completion alias',
+  );
+  view.getGcmServices = () => ({
+    status: {
+      getStatusPropertyKey: () => 'taskStatus',
+      getRelationalStatusPropertyKey: () => 'status',
+      getDoneStatuses: () => ['complete'],
+      isDoneStatus: () => true,
+    },
+  });
+  const contradictoryCompletionContext = view.createTaskFormulaContext(file, {
+    ...task,
+    line: 72,
+    lineMetadata: undefined,
+  });
+  assert.equal(contradictoryCompletionContext.task.status, 'todo');
+  assert.equal(contradictoryCompletionContext.task.open, undefined, 'contradictory GCM completion methods are rejected');
+  view.getGcmServices = authoritativeServices;
+  const structuralOnlyFilter = {
+    mode: 'tasks',
+    hasTaskDirective: true,
+    includeDone: false,
+    statuses: new Set(),
+    excludeStatuses: new Set(),
+    tags: new Set(),
+    excludeTags: new Set(),
+  };
+  for (const [filterRoot, label] of [
+    ['kind == "task"', 'kind'],
+    ['tags.contains("#work")', 'tag'],
+    ['title == "Formula task"', 'title'],
+    ['formula.flag', 'formula'],
+  ]) {
+    view.getBaseFilterRoots = () => [filterRoot];
+    assert.equal(
+      view.taskMatchesRootFilter(unavailableStateTask, structuralOnlyFilter, file),
+      true,
+      `an unmapped structural task remains visible to a non-workflow ${label} query`,
+    );
+  }
+  view.getBaseFilterRoots = () => [{ not: 'task.status == "todo"' }];
+  assert.equal(
+    view.taskMatchesRootFilter(unavailableStateTask, structuralOnlyFilter, file),
+    false,
+    'NOT cannot turn a missing workflow mapping into a visible status match',
+  );
   const caseTask = {
     itemKind: 'task',
     line: 12,
@@ -3435,7 +4329,7 @@ test('synthesized Kanban rows use the GCM formula session across context, depend
     active: true,
     match: 'any',
     conditions: [
-      { field: 'status', operator: 'is', value: 'todo' },
+      { field: 'task.status', operator: 'is', value: 'todo' },
       { field: 'formula.bad', operator: '!exists', value: '' },
     ],
     color: '#000',

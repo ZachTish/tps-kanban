@@ -414,7 +414,7 @@ export class KanbanSettingTab extends PluginSettingTab {
     variables.createEl('li', { text: 'note.tags, file.tags: note frontmatter/cache tags only.' });
     variables.createEl('li', { text: 'note.status and note.<frontmatterKey>: note frontmatter only.' });
     variables.createEl('li', { text: 'task.tags, task.tag: inline tags on checkbox task lines only.' });
-    variables.createEl('li', { text: 'task.status: checkbox-derived task status. Unchecked maps to todo; checked maps to complete; custom checkbox states use your status mapping.' });
+    variables.createEl('li', { text: 'task.status: checkbox-derived workflow status from the ordered checkbox mappings configured in TPS Global Context Menu.' });
     variables.createEl('li', { text: 'task.open, task.done, task.completed, task.complete: boolean task completion helpers.' });
     variables.createEl('li', { text: 'file.path, path, task.path, task.file.path, task.file: note path for note cards and containing note path for task cards.' });
     variables.createEl('li', { text: 'file.ext, file.extension, ext, extension: item extension. Note cards are md; task cards are empty for this check.' });

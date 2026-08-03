@@ -8,14 +8,12 @@ import {
 } from '../kanban-utils';
 import {
   buildKanbanRootTaskLine,
+  getKanbanRootTaskDesiredStatus,
   normalizeKanbanTaskTargetPath,
   resolveKanbanLaneAddPresentation,
   resolveKanbanRootTaskTargetPath,
 } from '../task-creation-utils';
 import {
-  getKanbanCheckboxStateForStatus,
-  getKanbanStatusForCheckboxState,
-  getKanbanToggleCheckboxState,
   normalizeKanbanCheckboxState,
   replaceKanbanTaskLineCheckboxState,
 } from '../task-checkbox-utils';
@@ -23,6 +21,7 @@ import {
   buildKanbanTaskDropLine,
   normalizeKanbanWritableTaskTag,
   parseKanbanLineItem,
+  resolveKanbanTaskDropRevisionIndex,
 } from '../task-drop-utils';
 import {
   acceptGcmApiChanged,
@@ -32,7 +31,10 @@ import {
   getGcmEntityIndexApi,
   getGcmFormulaApi,
   getGcmLineMetadataApi,
-  getGcmTaskCheckboxesApi,
+  getGcmTaskCheckboxMappings,
+  getGcmTaskCheckboxStateForStatus,
+  getGcmTaskCheckboxToggleState,
+  getGcmTaskStatusForCheckboxState,
   getGcmTaskLinesApi,
   requestGcmApi,
   shouldForceBaseLinkPreview,
@@ -197,6 +199,15 @@ type TaskDropPlan = {
   changes: string[];
   filterTags: string[];
   filterStatus: string | null;
+  filterCheckboxState: string | null;
+  statusValue: string | null;
+  statusCheckboxState: string | null;
+  currentCheckboxState: string | null;
+  currentStatus: string | null;
+  requiresWorkflowMapping: boolean;
+  workflowOwnershipSignature?: string;
+  workflowOwnershipProperty?: string;
+  mappingError: string | null;
   currentLine: string;
   nextLine: string;
   itemKind: 'task' | 'bullet';
@@ -211,6 +222,14 @@ type TaskCreationDefaults = {
   tags: Set<string>;
   excludedStatuses: Set<string>;
   excludedTags: Set<string>;
+};
+
+type TaskCreationMappingPlan = {
+  desiredStatus: string;
+  checkboxState: string;
+  canonicalStatus: string;
+  workflowOwnershipSignature: string;
+  workflowOwnershipProperty: string | null;
 };
 
 type FormulaDefinitions = Record<string, string>;
@@ -781,31 +800,11 @@ export class KanbanView extends BasesView {
     return true;
   }
 
-  private getDefaultCheckboxMappings(): Array<{ checkboxState: string; statuses: string[]; toggleTargetStatus?: string; icon?: string; label?: string }> {
-    return [
-      { checkboxState: '[ ]', statuses: ['todo'], toggleTargetStatus: 'complete', icon: 'square', label: 'Todo' },
-      { checkboxState: '[x]', statuses: ['complete'], toggleTargetStatus: 'todo', icon: 'check', label: 'Complete' },
-      { checkboxState: '[\\]', statuses: ['working'], toggleTargetStatus: 'complete', icon: 'slash', label: 'Working' },
-      { checkboxState: '[?]', statuses: ['holding'], toggleTargetStatus: 'todo', icon: 'help-circle', label: 'Holding' },
-      { checkboxState: '[-]', statuses: ['wont-do'], toggleTargetStatus: 'todo', icon: 'minus', label: 'Wont do' },
-    ];
-  }
-
   private getGcmCheckboxMappings(): Array<{ checkboxState: string; statuses: string[]; toggleTargetStatus?: string; icon?: string; label?: string }> {
-    const taskCheckboxes = getGcmTaskCheckboxesApi(this.app);
-    const configured = taskCheckboxes?.getMappings();
-    const source = Array.isArray(configured) && configured.length > 0 ? configured : this.getDefaultCheckboxMappings();
-    return source
-      .map((entry: any) => ({
-        checkboxState: this.normalizeCheckboxState(String(entry?.checkboxState || '[ ]')),
-        statuses: Array.isArray(entry?.statuses)
-          ? entry.statuses.map((status: unknown) => String(status ?? '').trim().toLowerCase()).filter(Boolean)
-          : [],
-        toggleTargetStatus: String(entry?.toggleTargetStatus || '').trim() || undefined,
-        icon: String(entry?.icon || '').trim() || undefined,
-        label: String(entry?.label || '').trim() || undefined,
-      }))
-      .filter((entry) => entry.checkboxState && entry.statuses.length > 0);
+    return getGcmTaskCheckboxMappings(this.app).map((entry) => ({
+      ...entry,
+      statuses: [...entry.statuses],
+    }));
   }
 
   private normalizeCheckboxState(rawState: string): string {
@@ -813,7 +812,82 @@ export class KanbanView extends BasesView {
   }
 
   private getStatusForCheckboxState(rawState: string): string {
-    return getKanbanStatusForCheckboxState(rawState, this.getGcmCheckboxMappings());
+    return getGcmTaskStatusForCheckboxState(this.app, rawState) || '';
+  }
+
+  private getStructuralCheckboxStateForTask(task: OpenTaskSubitem): string {
+    if (task.itemKind === 'bullet') return '';
+    return this.normalizeCheckboxState(task.checkboxState || '');
+  }
+
+  private getMappedCheckboxStateForTask(task: OpenTaskSubitem): string {
+    const checkboxState = this.getStructuralCheckboxStateForTask(task);
+    return checkboxState && this.getStatusForCheckboxState(checkboxState)
+      ? checkboxState
+      : '';
+  }
+
+  private getMappedStatusForTask(task: OpenTaskSubitem): string {
+    const checkboxState = this.getMappedCheckboxStateForTask(task);
+    return checkboxState ? this.getStatusForCheckboxState(checkboxState) : '';
+  }
+
+  private getWorkflowStatusPropertyKey(): string {
+    return String(this.getGcmServices()?.status?.getStatusPropertyKey?.() || '').trim();
+  }
+
+  private getRelationalStatusPropertyKey(): string {
+    return String(this.getGcmServices()?.status?.getRelationalStatusPropertyKey?.() || '').trim();
+  }
+
+  private isRelationalStatusPropertyReference(propName: string | null | undefined): boolean {
+    const raw = String(propName || '').trim();
+    if (!raw || /^task\./iu.test(raw)) return false;
+    const normalized = raw
+      .replace(/^(?:tps|kanban|property|properties)\./iu, '')
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_-]+/gu, '');
+    const relationalKey = this.normalizeInlinePropertyKey(this.getRelationalStatusPropertyKey());
+    return !!relationalKey && normalized === relationalKey;
+  }
+
+  private getWorkflowStatusFieldKeysToClear(): string[] {
+    const statusService = this.getGcmServices()?.status;
+    const workflowKey = this.getWorkflowStatusPropertyKey();
+    const relationalKey = this.normalizeInlinePropertyKey(this.getRelationalStatusPropertyKey());
+    return Array.from(new Set([
+      workflowKey,
+      ...(statusService ? ['status', 'taskStatus'] : []),
+      'task.status',
+      'task.checkboxStatus',
+      'checkboxStatus',
+    ].map((key) => String(key || '').trim()).filter((key) => (
+      !!key && this.normalizeInlinePropertyKey(key) !== relationalKey
+    ))));
+  }
+
+  private getTaskDerivedWorkflowFieldKeys(): string[] {
+    const relationalKey = this.normalizeInlinePropertyKey(this.getRelationalStatusPropertyKey());
+    return Array.from(new Set([
+      ...this.getWorkflowStatusFieldKeysToClear(),
+      'open',
+      'isOpen',
+      'done',
+      'isDone',
+      'completed',
+      'complete',
+    ].filter((key) => this.normalizeInlinePropertyKey(key) !== relationalKey)));
+  }
+
+  private getTaskWorkflowOwnershipSignature(propName: string | null | undefined): string {
+    return JSON.stringify({
+      statusProperty: this.isStatusPropertyName(propName),
+      workflowKey: this.normalizeInlinePropertyKey(this.getWorkflowStatusPropertyKey()),
+      relationalKey: this.normalizeInlinePropertyKey(this.getRelationalStatusPropertyKey()),
+      ownedFields: this.getWorkflowStatusFieldKeysToClear()
+        .map((key) => this.normalizeInlinePropertyKey(key)),
+    });
   }
 
   private getLaneIdForStatus(status: string | null): string {
@@ -822,11 +896,32 @@ export class KanbanView extends BasesView {
   }
 
   private getCheckboxStateForStatus(rawStatus: string | null): string | null {
-    return getKanbanCheckboxStateForStatus(rawStatus, this.getGcmCheckboxMappings());
+    return getGcmTaskCheckboxStateForStatus(this.app, rawStatus);
   }
 
-  private getToggleCheckboxStateForTask(task: OpenTaskSubitem): string {
-    return getKanbanToggleCheckboxState(task.checkboxState || '[ ]', this.getGcmCheckboxMappings(), this.getDoneStatuses());
+  private getToggleCheckboxStateForTask(task: OpenTaskSubitem): string | null {
+    const currentState = this.normalizeCheckboxState(task.checkboxState || '');
+    return currentState && this.getStatusForCheckboxState(currentState)
+      ? getGcmTaskCheckboxToggleState(this.app, currentState)
+      : null;
+  }
+
+  private requestTaskCheckboxToggle(file: TFile, task: OpenTaskSubitem, checkboxEl: HTMLInputElement): void {
+    const currentState = this.normalizeCheckboxState(task.checkboxState || '');
+    const currentStatus = currentState ? this.getStatusForCheckboxState(currentState) : '';
+    const nextState = this.getToggleCheckboxStateForTask(task);
+    if (!currentState || !currentStatus || !nextState) {
+      checkboxEl.checked = !!currentStatus && this.getDoneStatuses().has(currentStatus);
+      flowWarn('TaskCheckbox', 'toggle:blocked', {
+        path: file.path,
+        line: task.line,
+        checkboxState: currentState || '',
+        reason: 'unmapped-toggle-target',
+      });
+      new Notice('Could not toggle this task because GCM has no valid target mapping.');
+      return;
+    }
+    void this.updateTaskCheckboxState(file, task.line, nextState, currentState);
   }
 
   private async ensureParentSelfLink(parentFile: TFile): Promise<void> {
@@ -1928,7 +2023,8 @@ export class KanbanView extends BasesView {
 
   private isDoneTask(task: OpenTaskSubitem): boolean {
     if (task.itemKind === 'bullet') return false;
-    return this.getDoneStatuses().has(this.getStatusForCheckboxState(task.checkboxState || '[ ]'));
+    const status = this.getMappedStatusForTask(task);
+    return !!status && this.getDoneStatuses().has(status);
   }
 
   private clearTaskCachesForPath(path: string): void {
@@ -2119,9 +2215,10 @@ export class KanbanView extends BasesView {
       );
       const openTasks = localPreview.openTasks.map((task: OpenTaskSubitem) => {
         const enriched = gcmTasksByLine.get(task.line);
+        const checkboxState = this.getStructuralCheckboxStateForTask(task) || undefined;
         const merged = {
           ...task,
-          checkboxState: task.checkboxState || enriched?.checkboxState || '[ ]',
+          checkboxState,
           inlineFields: task.inlineFields?.length ? task.inlineFields : enriched?.inlineFields,
         };
         return {
@@ -2132,10 +2229,11 @@ export class KanbanView extends BasesView {
       const openByLine = new Map<number, OpenTaskSubitem>(openTasks.map((task: OpenTaskSubitem) => [task.line, task]));
       const enrichedAllTasks = allTasks.map((task: OpenTaskSubitem) => {
         const openTask = openByLine.get(task.line);
+        const checkboxState = this.getStructuralCheckboxStateForTask(task) || undefined;
         const merged = {
           ...task,
           ...(openTask ?? {}),
-          checkboxState: task.checkboxState || openTask?.checkboxState || '[ ]',
+          checkboxState,
           inlineFields: task.inlineFields?.length ? task.inlineFields : openTask?.inlineFields,
         };
         return {
@@ -2147,7 +2245,7 @@ export class KanbanView extends BasesView {
       const enrichedAllLineItems = allLineItems.map((item) => item.itemKind === 'bullet'
         ? { ...item, displayText: this.getTaskVisibleTitle(item) }
         : tasksByLine.get(item.line) ?? item);
-      const overflowCount = Number(parsed?.overflowCount ?? localPreview.overflowCount);
+      const overflowCount = localPreview.overflowCount;
       if (!this.ownsTaskRead(owner)) return;
       this.clearTaskReadFailure(owner.key);
       this.openTasksByPath.set(path, openTasks);
@@ -2169,7 +2267,8 @@ export class KanbanView extends BasesView {
     const openTasks: OpenTaskSubitem[] = [];
     let openTaskCount = 0;
     for (const task of tasks) {
-      if (task.itemKind === 'task' && doneStatuses.has(this.getStatusForCheckboxState(task.checkboxState || '[ ]'))) continue;
+      const status = this.getMappedStatusForTask(task);
+      if (task.itemKind === 'task' && status && doneStatuses.has(status)) continue;
       if (openTasks.length < normalizedLimit) openTasks.push(task);
       openTaskCount += 1;
     }
@@ -2227,10 +2326,11 @@ export class KanbanView extends BasesView {
         }
         if (!parsed || (!includeBullets && parsed.itemKind === 'bullet')) continue;
         const checkboxState = parsed.checkboxState;
-        if (
-          parsed.itemKind === 'task'
-          && doneStatuses?.has(this.getStatusForCheckboxState(checkboxState || '[ ]'))
-        ) continue;
+        if (parsed.itemKind === 'task' && doneStatuses) {
+          const normalizedState = this.normalizeCheckboxState(checkboxState || '');
+          const status = normalizedState ? this.getStatusForCheckboxState(normalizedState) : '';
+          if (status && doneStatuses.has(status)) continue;
+        }
         const parsedLineMetadata = this.parseGcmLineMetadata(lineMetadata, line);
         if (!parsedLineMetadata) {
           throw new Error(`TPS Global Context Menu returned invalid parsed metadata for physical line ${lineNumber}.`);
@@ -3180,12 +3280,15 @@ export class KanbanView extends BasesView {
   }
 
   private isStatusPropertyName(propName: string | null | undefined): boolean {
-    const normalized = this.normalizeInlinePropertyKey(this.getTaskInlinePropertyName(propName));
-    if (!normalized) return false;
-    if (normalized === 'status' || normalized === 'checkboxstatus') return true;
-    const configuredKey = this.getGcmServices()?.status?.getStatusPropertyKey?.()
-      ?? '';
-    return normalized === this.normalizeInlinePropertyKey(String(configuredKey || ''));
+    if (this.isRelationalStatusPropertyReference(propName)) return false;
+    const raw = String(propName || '').trim();
+    const normalizedRaw = this.normalizeInlinePropertyKey(raw);
+    const normalizedTaskProperty = this.normalizeInlinePropertyKey(this.getTaskInlinePropertyName(propName));
+    if (!normalizedRaw || !normalizedTaskProperty) return false;
+    const ownedKeys = new Set(
+      this.getWorkflowStatusFieldKeysToClear().map((key) => this.normalizeInlinePropertyKey(key)),
+    );
+    return ownedKeys.has(normalizedRaw) || ownedKeys.has(normalizedTaskProperty);
   }
 
   private async openOrFocusFile(file: TFile): Promise<WorkspaceLeaf | null> {
@@ -3775,10 +3878,13 @@ export class KanbanView extends BasesView {
       return true;
     }
 
-    const status = this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
-    if (!filter.includeDone && this.getDoneStatuses().has(status)) return false;
-    if (filter.excludeStatuses.has(status)) return false;
-    if (filter.statuses.size && !filter.statuses.has(status)) return false;
+    const status = this.getMappedStatusForTask(task);
+    if (!status && (filter.statuses.size || filter.excludeStatuses.size)) return false;
+    if (status) {
+      if (!filter.includeDone && this.getDoneStatuses().has(status)) return false;
+      if (filter.excludeStatuses.has(status)) return false;
+      if (filter.statuses.size && !filter.statuses.has(status)) return false;
+    }
     const taskTags = new Set(this.getTaskInlineValues(task, 'tags').map((tag) => tag.toLowerCase()));
     for (const tag of filter.excludeTags) {
       if (taskTags.has(tag)) return false;
@@ -4075,11 +4181,39 @@ export class KanbanView extends BasesView {
     }
     const isNegated = raw.startsWith('!');
     const expr = (isNegated ? raw.slice(1) : raw).trim();
-    const result = this.evaluatePositiveTaskFilterString(expr, task, file);
+    const filterProperty = this.readFilterExpressionProperty(expr);
+    const relationalStatusReference = this.isRelationalStatusPropertyReference(filterProperty);
+    const workflowProp = this.normalizeInlinePropertyKey(
+      filterProperty.replace(/^(?:task|tps|kanban)\./iu, ''),
+    );
+    const completionProps = ['open', 'isopen', 'done', 'isdone', 'completed', 'complete'];
+    const referencesCompletionState = completionProps.includes(workflowProp);
+    const referencesWorkflowState = referencesCompletionState
+      || (!relationalStatusReference && this.isStatusPropertyName(filterProperty));
+    const mappedStatus = referencesWorkflowState ? this.getMappedStatusForTask(task) : '';
+    let completionState: boolean | undefined;
+    if (referencesWorkflowState && (task.itemKind === 'bullet' || !mappedStatus)) {
+      if (state) state.unsupportedFailure = true;
+      return false;
+    }
+    if (referencesCompletionState) {
+      const classified = this.classifyTaskStatusCompletion(mappedStatus);
+      if (classified == null) {
+        if (state) state.unsupportedFailure = true;
+        return false;
+      }
+      completionState = classified;
+    }
+    const result = this.evaluatePositiveTaskFilterString(expr, task, file, completionState);
     return result == null ? null : isNegated ? !result : result;
   }
 
-  private evaluatePositiveTaskFilterString(expr: string, task: OpenTaskSubitem, file: TFile | null = null): boolean | null {
+  private evaluatePositiveTaskFilterString(
+    expr: string,
+    task: OpenTaskSubitem,
+    file: TFile | null = null,
+    completionState?: boolean,
+  ): boolean | null {
     if (this.parseAdditiveKindExpression(expr)) {
       return this.evaluateAdditiveKindExpression(expr, this.getTaskAdditiveKinds(task, file));
     }
@@ -4092,13 +4226,27 @@ export class KanbanView extends BasesView {
       return value === 'all' || value === 'mixed';
     }
 
-    const status = this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
-    if (/^(?:task\.)?(?:open|isopen)\s*(?:==|=)\s*(true|1)$/i.test(expr)) return !this.getDoneStatuses().has(status);
-    if (/^(?:task\.)?(?:done|isdone|completed|complete)\s*(?:==|=)\s*(false|0)$/i.test(expr)) return !this.getDoneStatuses().has(status);
-    if (/^(?:task\.)?(?:done|isdone|completed|complete)\s*(?:==|=)\s*(true|1)$/i.test(expr)) return this.getDoneStatuses().has(status);
+    const relationalStatusReference = this.isRelationalStatusPropertyReference(
+      this.readFilterExpressionProperty(expr),
+    );
+    const status = this.getMappedStatusForTask(task);
+    const hasMappedStatus = !!status;
+    const completionMatch = expr.match(
+      /^(?:task\.)?(open|isopen|done|isdone|completed|complete)\s*(?:==|=)\s*(true|false|1|0)$/i,
+    );
+    if (completionMatch) {
+      if (!hasMappedStatus || completionState == null) return null;
+      const propertyValue = /^(?:open|isopen)$/i.test(completionMatch[1])
+        ? !completionState
+        : completionState;
+      const expected = /^(?:true|1)$/i.test(completionMatch[2]);
+      return propertyValue === expected;
+    }
 
-    const statusResult = this.evaluateTaskValueFilterExpression(expr, 'status', [status], false);
-    if (statusResult != null) return statusResult;
+    const statusResult = relationalStatusReference
+      ? null
+      : this.evaluateTaskValueFilterExpression(expr, 'status', status ? [status] : [], false);
+    if (statusResult != null) return hasMappedStatus ? statusResult : false;
     const tagsResult = this.evaluateTaskValueFilterExpression(expr, 'tags', this.getTaskInlineValues(task, 'tags'), false);
     if (tagsResult != null) return tagsResult;
     const fileResult = this.evaluateTaskFileFilterExpression(expr, file);
@@ -4194,9 +4342,18 @@ export class KanbanView extends BasesView {
       return this.getTaskAdditiveKinds(task)?.map((value) => value.toLocaleLowerCase()) ?? null;
     }
     if (['itemtype', 'itemkind'].includes(normalized)) return [task.itemKind === 'bullet' ? 'bullet' : 'task'];
+    if (['title', 'text'].includes(normalized)) return [this.getTaskVisibleTitle(task).toLowerCase()];
+    if (normalized === 'checkboxstate') {
+      const checkboxState = this.getStructuralCheckboxStateForTask(task);
+      return checkboxState ? [checkboxState.toLowerCase()] : [];
+    }
     if (['open', 'isopen', 'done', 'isdone', 'completed', 'complete'].includes(normalized)) return null;
-    if (['status', 'checkboxstatus'].includes(normalized)) {
-      return [this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo'];
+    if (this.isRelationalStatusPropertyReference(raw)) {
+      return this.getTaskInlineValues(task, this.getRelationalStatusPropertyKey()).map((value) => value.toLowerCase());
+    }
+    if (this.isStatusPropertyName(raw)) {
+      const status = this.getMappedStatusForTask(task);
+      return status ? [status] : null;
     }
     if (['tag', 'tags'].includes(normalized)) {
       return this.getTaskInlineValues(task, 'tags').map((tag) => tag.toLowerCase());
@@ -4456,33 +4613,44 @@ export class KanbanView extends BasesView {
           return normalized === 'all' || normalized === 'mixed';
         });
       }
-    } else if (['open', 'isopen'].includes(normalizedProp)) {
+    } else if (['open', 'isopen', 'done', 'isdone', 'completed', 'complete'].includes(normalizedProp)) {
       if (!this.isSupportedTaskFilterOperator(operator, { presence: true })) {
         return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
       }
-      const status = this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
-      const isOpen = !this.getDoneStatuses().has(status);
+      const status = this.getMappedStatusForTask(task);
+      const hasMappedStatus = !!status;
+      const completionState = hasMappedStatus ? this.classifyTaskStatusCompletion(status) : null;
+      if (!hasMappedStatus || completionState == null) {
+        if (state) state.unsupportedFailure = true;
+        return false;
+      }
+      const propertyValue = ['open', 'isopen'].includes(normalizedProp)
+        ? !completionState
+        : completionState;
       if (this.isImplicitEmptyValueFilter(operator, values) || this.isEmptyFilterOperator(operator)) {
         result = false;
       } else if (this.isImplicitNotEmptyValueFilter(operator, values) || this.isExistsFilterOperator(operator)) {
-        result = true;
+        result = hasMappedStatus;
       } else {
-        result = values.some((value) => {
+        result = hasMappedStatus && values.some((value) => {
           const normalized = value.toLowerCase();
-          if (normalized === 'true' || normalized === '1') return isOpen;
-          if (normalized === 'false' || normalized === '0') return !isOpen;
+          if (normalized === 'true' || normalized === '1') return propertyValue;
+          if (normalized === 'false' || normalized === '0') return !propertyValue;
           return false;
         });
       }
-    } else if ((propRaw.toLowerCase().startsWith('task.') || normalizedProp === 'status' || normalizedProp === 'checkboxstatus') && ['status', 'checkboxstatus'].includes(normalizedProp)) {
+    } else if (this.isStatusPropertyName(propRaw)) {
       if (!this.isSupportedTaskFilterOperator(operator, { presence: true })) {
         return this.rejectUnsupportedTaskFilterOperator(propRaw, operator, file, task, state);
       }
-      const status = this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
-      if (this.isImplicitEmptyValueFilter(operator, values)) {
+      const status = this.getMappedStatusForTask(task);
+      if (!status) {
+        if (state) state.unsupportedFailure = true;
+        return false;
+      } else if (this.isImplicitEmptyValueFilter(operator, values) || this.isEmptyFilterOperator(operator)) {
         result = false;
-      } else if (this.isImplicitNotEmptyValueFilter(operator, values)) {
-        result = true;
+      } else if (this.isImplicitNotEmptyValueFilter(operator, values) || this.isExistsFilterOperator(operator)) {
+        result = !!status;
       } else {
         result = values.some((value) => value.toLowerCase() === status);
       }
@@ -4624,7 +4792,8 @@ export class KanbanView extends BasesView {
     const normalized = this.normalizeInlinePropertyKey(this.getTaskInlinePropertyName(propName));
     if (this.isStatusPropertyName(propName)) {
       if (task.itemKind === 'bullet') return ['ungrouped'];
-      return [this.getLaneIdForStatus(this.getStatusForCheckboxState(task.checkboxState || '[ ]'))];
+      const status = this.getMappedStatusForTask(task);
+      return status ? [this.getLaneIdForStatus(status)] : ['ungrouped'];
     }
     const additiveKinds = normalized === 'kind' ? this.getTaskAdditiveKinds(task, file) : null;
     if (normalized === 'kind' && !additiveKinds) return ['ungrouped'];
@@ -4882,20 +5051,50 @@ export class KanbanView extends BasesView {
     return Array.from(keys);
   }
 
-  /** Returns the set of "done" status values from GCM settings (or defaults). */
+  /** Returns only the authoritative done statuses exposed by GCM. */
   private getDoneStatuses(): Set<string> {
     const gcmDoneStatuses = this.getGcmServices()?.status?.getDoneStatuses?.();
     if (Array.isArray(gcmDoneStatuses) && gcmDoneStatuses.length > 0) {
       return new Set(gcmDoneStatuses.map((s: unknown) => String(s || '').trim().toLowerCase()).filter(Boolean));
     }
+    return new Set();
+  }
 
-    const firstWithDoneStatuses = this.getRelationshipSettingsSources().find(
-      (settings) => Array.isArray(settings?.recurrenceCompletionStatuses) && settings.recurrenceCompletionStatuses.length > 0,
-    );
-    const raw: string[] = firstWithDoneStatuses?.recurrenceCompletionStatuses?.length
-      ? firstWithDoneStatuses.recurrenceCompletionStatuses
-      : ['complete', 'wont-do'];
-    return new Set(raw.map((s: string) => String(s || '').trim().toLowerCase()));
+  /**
+   * Classifies a mapped workflow status only when GCM exposes a coherent
+   * completion authority. Missing, malformed, or contradictory service
+   * results stay unavailable rather than implicitly treating every status as
+   * open.
+   */
+  private classifyTaskStatusCompletion(rawStatus: unknown): boolean | null {
+    const status = String(rawStatus ?? '').trim().toLowerCase();
+    const statusService = this.getGcmServices()?.status;
+    if (!status || !statusService) return null;
+    try {
+      let listResult: boolean | null = null;
+      if (typeof statusService.getDoneStatuses === 'function') {
+        const rawDoneStatuses = statusService.getDoneStatuses();
+        if (!Array.isArray(rawDoneStatuses)) return null;
+        const doneStatuses = new Set(
+          rawDoneStatuses
+            .map((value: unknown) => String(value ?? '').trim().toLowerCase())
+            .filter(Boolean),
+        );
+        listResult = doneStatuses.has(status);
+      }
+
+      let predicateResult: boolean | null = null;
+      if (typeof statusService.isDoneStatus === 'function') {
+        const rawPredicateResult = statusService.isDoneStatus(status);
+        if (typeof rawPredicateResult !== 'boolean') return null;
+        predicateResult = rawPredicateResult;
+      }
+
+      if (listResult != null && predicateResult != null && listResult !== predicateResult) return null;
+      return predicateResult ?? listResult;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -5033,6 +5232,18 @@ export class KanbanView extends BasesView {
     sourceLaneValues: string[] = [],
   ): Promise<boolean> {
     const plan = await this.buildTaskDropPlan(file, line, propName, value, sourceLaneValues);
+    if (plan.mappingError) {
+      flowWarn('TaskDrop', 'blocked', {
+        reason: 'unmapped-status',
+        error: plan.mappingError,
+        path: file.path,
+        line,
+        propName,
+        value,
+      });
+      new Notice(plan.mappingError);
+      return false;
+    }
     if (!plan.changes.length) {
       flowWarn('TaskDrop', 'no-change', {
         reason: 'empty-plan',
@@ -5075,8 +5286,20 @@ export class KanbanView extends BasesView {
       });
       return false;
     }
-    await this.applyInlineTaskDropPlan(file, line, propName, value, sourceLaneValues, plan);
-    return true;
+    const revisedMappingError = this.validateTaskDropMappingRevision(plan);
+    if (revisedMappingError) {
+      flowWarn('TaskDrop', 'apply:blocked', {
+        reason: 'mapping-changed-after-confirmation',
+        error: revisedMappingError,
+        path: file.path,
+        line,
+        propName,
+        value,
+      });
+      new Notice(revisedMappingError);
+      return false;
+    }
+    return this.applyInlineTaskDropPlan(file, line, propName, value, sourceLaneValues, plan);
   }
 
   private async buildTaskDropPlan(
@@ -5089,24 +5312,49 @@ export class KanbanView extends BasesView {
     const filter = this.getTaskRootFilterFromBaseFilters();
     const filterTags = Array.from(filter.tags).filter((tag) => !filter.excludeTags.has(tag));
     const normalizedProp = this.normalizeInlinePropertyKey(propName);
-    const filterStatus = !this.isStatusPropertyName(propName) && filter.statuses.size === 1
-      ? Array.from(filter.statuses)[0] ?? null
-      : null;
     const changes: string[] = [];
     const displayValue = value == null || value === '' ? '(empty)' : String(value);
     const targetLine = Math.max(1, Math.floor(Number(line || 1)));
     const content = await this.app.vault.cachedRead(file);
+    const workflowOwnershipSignature = this.getTaskWorkflowOwnershipSignature(propName);
+    const isStatusDropProperty = this.isStatusPropertyName(propName);
+    const filterStatus = !isStatusDropProperty && filter.statuses.size === 1
+      ? Array.from(filter.statuses)[0] ?? null
+      : null;
     const currentLine = content.split(/\r?\n/)[targetLine - 1] ?? '';
     const parsedLine = this.parseLineItem(currentLine, true);
     const itemKind = parsedLine?.itemKind ?? 'task';
+    const currentCheckboxState = itemKind === 'task'
+      ? this.normalizeCheckboxState(parsedLine?.checkboxState || '')
+      : '';
+    const currentStatus = currentCheckboxState
+      ? this.getStatusForCheckboxState(currentCheckboxState)
+      : '';
+    const requestsStatusChange = isStatusDropProperty && itemKind !== 'bullet';
+    const statusValue = requestsStatusChange ? String(value ?? '').trim() : null;
+    const statusCheckboxState = requestsStatusChange
+      ? this.getCheckboxStateForStatus(statusValue)
+      : null;
+    const filterCheckboxState = filterStatus && itemKind !== 'bullet'
+      ? this.getCheckboxStateForStatus(filterStatus)
+      : null;
+    const requiresWorkflowMapping = itemKind === 'task' && (requestsStatusChange || !!filterStatus);
+    const mappingError = !parsedLine
+      ? 'Could not move this item because the source line is no longer a valid task or bullet.'
+      : requiresWorkflowMapping && (!currentCheckboxState || !currentStatus)
+        ? 'Could not move this task because its current checkbox state is not mapped by GCM.'
+        : requestsStatusChange && !statusCheckboxState
+          ? `Could not move this task: GCM has no checkbox mapping for status "${statusValue || '(empty)'}".`
+          : filterStatus && itemKind !== 'bullet' && !filterCheckboxState
+            ? `Could not move this task: GCM has no checkbox mapping for Base status "${filterStatus}".`
+            : null;
     let nextLine = currentLine;
 
-    if (this.isStatusPropertyName(propName)) {
+    if (isStatusDropProperty) {
       if (itemKind === 'bullet') {
         changes.push('Leave status unchanged because bullets do not have checkbox status.');
       } else {
-        const checkbox = this.getCheckboxStateForStatus(value);
-        changes.push(`Set checkbox state for status "${displayValue}"${checkbox ? ` to ${checkbox}` : ''}.`);
+        changes.push(`Set checkbox state for status "${displayValue}"${statusCheckboxState ? ` to ${statusCheckboxState}` : ''}.`);
       }
     } else if (normalizedProp === 'tags') {
       changes.push(`Move task tag lane to #${this.normalizeWritableTaskTag(String(value ?? '')) || displayValue}.`);
@@ -5124,23 +5372,25 @@ export class KanbanView extends BasesView {
       changes.push(`Add Base filter tag ${displayTag}.`);
     }
     if (filterStatus && itemKind !== 'bullet') {
-      const checkbox = this.getCheckboxStateForStatus(filterStatus);
-      changes.push(`Set checkbox state for Base status filter "${filterStatus}"${checkbox ? ` to ${checkbox}` : ''}.`);
+      changes.push(`Set checkbox state for Base status filter "${filterStatus}"${filterCheckboxState ? ` to ${filterCheckboxState}` : ''}.`);
     } else if (filterStatus && itemKind === 'bullet') {
       changes.push(`Base status filter "${filterStatus}" applies to tasks only; bullet status will remain empty.`);
-    } else if (!this.isStatusPropertyName(propName) && filter.statuses.size > 1) {
+    } else if (!isStatusDropProperty && filter.statuses.size > 1) {
       changes.push(`Base allows multiple statuses (${Array.from(filter.statuses).join(', ')}), so status will not be guessed.`);
     }
-    nextLine = buildKanbanTaskDropLine({
-      line: currentLine,
-      propName,
-      value,
-      sourceLaneValues,
-      filterTags,
-      filterStatus,
-      getCheckboxStateForStatus: (status) => this.getCheckboxStateForStatus(status),
-      isStatusPropertyName: (name) => this.isStatusPropertyName(name),
-    });
+    nextLine = mappingError
+      ? currentLine
+      : buildKanbanTaskDropLine({
+          line: currentLine,
+          propName,
+          value,
+          sourceLaneValues,
+          filterTags,
+          statusCheckboxState,
+          filterCheckboxState,
+          statusFieldKeysToRemove: this.getWorkflowStatusFieldKeysToClear(),
+          isStatusPropertyName: () => isStatusDropProperty,
+        });
 
     changes.unshift(`${itemKind === 'bullet' ? 'Bullet' : 'Task'}: ${file.path}:${targetLine}`);
     changes.push(`Current line: ${currentLine}`);
@@ -5149,6 +5399,15 @@ export class KanbanView extends BasesView {
       changes,
       filterTags,
       filterStatus: itemKind === 'bullet' ? null : filterStatus,
+      filterCheckboxState: itemKind === 'bullet' ? null : filterCheckboxState,
+      statusValue,
+      statusCheckboxState,
+      currentCheckboxState: requiresWorkflowMapping ? currentCheckboxState : null,
+      currentStatus: requiresWorkflowMapping ? currentStatus : null,
+      requiresWorkflowMapping,
+      workflowOwnershipSignature,
+      workflowOwnershipProperty: propName,
+      mappingError,
       currentLine,
       nextLine,
       itemKind,
@@ -5161,16 +5420,71 @@ export class KanbanView extends BasesView {
     });
   }
 
+  private validateTaskDropMappingRevision(
+    plan: Pick<TaskDropPlan,
+      | 'filterStatus'
+      | 'filterCheckboxState'
+      | 'statusValue'
+      | 'statusCheckboxState'
+      | 'currentCheckboxState'
+      | 'currentStatus'
+      | 'requiresWorkflowMapping'
+      | 'workflowOwnershipSignature'
+      | 'workflowOwnershipProperty'>,
+  ): string | null {
+    if (
+      plan.workflowOwnershipSignature
+      && plan.workflowOwnershipSignature !== this.getTaskWorkflowOwnershipSignature(
+        plan.workflowOwnershipProperty,
+      )
+    ) {
+      return 'Could not move this task because GCM workflow-field ownership changed while the drop was pending.';
+    }
+    if (!plan.requiresWorkflowMapping) return null;
+    const currentState = this.normalizeCheckboxState(plan.currentCheckboxState || '');
+    const currentStatus = currentState ? this.getStatusForCheckboxState(currentState) : '';
+    if (!currentState || !currentStatus || currentStatus !== plan.currentStatus) {
+      return 'Could not move this task because its source checkbox mapping changed while the drop was pending.';
+    }
+    if (plan.statusValue != null) {
+      const targetState = this.getCheckboxStateForStatus(plan.statusValue);
+      if (!targetState || targetState !== plan.statusCheckboxState) {
+        return `Could not move this task because the checkbox mapping for status "${plan.statusValue || '(empty)'}" changed while the drop was pending.`;
+      }
+    }
+    if (plan.filterStatus) {
+      const filterState = this.getCheckboxStateForStatus(plan.filterStatus);
+      if (!filterState || filterState !== plan.filterCheckboxState) {
+        return `Could not move this task because the checkbox mapping for Base status "${plan.filterStatus}" changed while the drop was pending.`;
+      }
+    }
+    return null;
+  }
+
   private async applyInlineTaskDropPlan(
     file: TFile,
     line: number,
     propName: string,
     value: string | null,
     sourceLaneValues: string[] = [],
-    plan: Pick<TaskDropPlan, 'filterTags' | 'filterStatus' | 'nextLine'>,
-  ): Promise<void> {
+    plan: Pick<TaskDropPlan,
+      | 'filterTags'
+      | 'filterStatus'
+      | 'filterCheckboxState'
+      | 'statusValue'
+      | 'statusCheckboxState'
+      | 'currentCheckboxState'
+      | 'currentStatus'
+      | 'requiresWorkflowMapping'
+      | 'workflowOwnershipSignature'
+      | 'workflowOwnershipProperty'
+      | 'currentLine'
+      | 'nextLine'>,
+  ): Promise<boolean> {
     const targetLine = Math.max(1, Math.floor(Number(line || 1)));
-    let changed = false;
+    const mutation: { outcome: 'changed' | 'unchanged' | 'stale' | 'mapping-changed' } = { outcome: 'unchanged' };
+    let mappingRevisionError = '';
+    let resolvedLine = targetLine;
     flow('TaskDrop', 'apply:start', {
       path: file.path,
       line: targetLine,
@@ -5182,28 +5496,64 @@ export class KanbanView extends BasesView {
     });
 
     await this.app.vault.process(file, (content) => {
+      const newline = content.includes('\r\n') ? '\r\n' : '\n';
+      const endsWithNewline = /\r?\n$/u.test(content);
       const lines = content.split(/\r?\n/);
-      const index = targetLine - 1;
-      if (index < 0 || index >= lines.length) return content;
-      const current = lines[index];
+      if (endsWithNewline) lines.pop();
+      const index = resolveKanbanTaskDropRevisionIndex(lines, targetLine - 1, plan.currentLine);
+      if (index < 0) {
+        mutation.outcome = 'stale';
+        return content;
+      }
+      const current = lines[index] || '';
       if (!this.parseLineItem(current, true)) return content;
+      mappingRevisionError = this.validateTaskDropMappingRevision(plan) || '';
+      if (mappingRevisionError) {
+        mutation.outcome = 'mapping-changed';
+        return content;
+      }
       const next = plan.nextLine;
       if (next === current) return content;
       lines[index] = next;
-      changed = true;
-      return lines.join('\n');
+      resolvedLine = index + 1;
+      mutation.outcome = 'changed';
+      return `${lines.join(newline)}${endsWithNewline ? newline : ''}`;
     });
 
-    if (changed) {
+    if (mutation.outcome === 'stale') {
+      flowWarn('TaskDrop', 'apply:stale-target', {
+        path: file.path,
+        requestedLine: targetLine,
+        propName,
+        value,
+      });
+      new Notice('The source line changed while the task drop confirmation was open.');
+      return false;
+    }
+    if (mutation.outcome === 'mapping-changed') {
+      flowWarn('TaskDrop', 'apply:blocked', {
+        reason: 'mapping-changed-at-write',
+        error: mappingRevisionError,
+        path: file.path,
+        requestedLine: targetLine,
+        propName,
+        value,
+      });
+      new Notice(mappingRevisionError);
+      return false;
+    }
+    if (mutation.outcome === 'changed') {
       this.clearTaskCachesForPath(file.path);
       emitFilesUpdated(this.app, [file.path], 'tps-kanban');
     }
-    flow('TaskDrop', changed ? 'apply:done' : 'apply:no-change', {
+    flow('TaskDrop', mutation.outcome === 'changed' ? 'apply:done' : 'apply:no-change', {
       path: file.path,
-      line: targetLine,
+      requestedLine: targetLine,
+      resolvedLine,
       propName,
       value,
     });
+    return mutation.outcome === 'changed';
   }
 
   private getDisplayLaneWritableValues(displayLane: DisplayLaneGroup | null | undefined): string[] {
@@ -5306,8 +5656,8 @@ export class KanbanView extends BasesView {
       itemKind: task.itemKind || 'task',
       path: file.path,
       line: task.line,
-      rawLine: '',
-      checkboxState: task.itemKind === 'bullet' ? undefined : task.checkboxState || '[ ]',
+      rawLine: task.rawLine || '',
+      checkboxState: this.getStructuralCheckboxStateForTask(task) || undefined,
       text: this.getTaskVisibleTitle(task),
       sourceLaneValues: this.getDisplayLaneWritableValues(displayLane),
       propName,
@@ -5401,9 +5751,27 @@ export class KanbanView extends BasesView {
       path: active.path,
       line: active.line,
       rawLine: active.rawLine || '',
-      checkboxState: active.itemKind === 'bullet' ? undefined : active.checkboxState || '[ ]',
+      checkboxState: active.itemKind === 'bullet' ? undefined : active.checkboxState,
       text: active.text || '',
       sourceLaneValues: active.sourceLaneValues,
+    };
+  }
+
+  private buildTaskLineDropPayload(
+    file: TFile,
+    task: OpenTaskSubitem,
+    sourceLaneValues: string[],
+  ): TaskDropPayload & { type: 'task-line'; source: 'tps-kanban' } {
+    return {
+      type: 'task-line',
+      source: 'tps-kanban',
+      itemKind: task.itemKind || 'task',
+      path: file.path,
+      line: task.line,
+      rawLine: task.rawLine || '',
+      checkboxState: this.getStructuralCheckboxStateForTask(task) || undefined,
+      text: this.getTaskVisibleTitle(task),
+      sourceLaneValues,
     };
   }
 
@@ -5436,9 +5804,33 @@ export class KanbanView extends BasesView {
     return this.buildDisplayLaneGroups(groups).find((lane) => lane.id === displayLaneId) ?? null;
   }
 
-  private async updateTaskCheckboxState(file: TFile, line: number, checkboxState: string): Promise<void> {
+  private async updateTaskCheckboxState(
+    file: TFile,
+    line: number,
+    checkboxState: string,
+    expectedCurrentState?: string,
+  ): Promise<void> {
     const targetLine = Math.max(1, Math.floor(Number(line || 1)));
     const nextState = this.normalizeCheckboxState(checkboxState);
+    const expectedState = expectedCurrentState == null
+      ? null
+      : this.normalizeCheckboxState(expectedCurrentState);
+    const nextStatus = nextState ? this.getStatusForCheckboxState(nextState) : '';
+    const canonicalNextState = nextStatus ? this.getCheckboxStateForStatus(nextStatus) : null;
+    const expectedStatus = expectedState ? this.getStatusForCheckboxState(expectedState) : '';
+    if (
+      !nextState
+      || !nextStatus
+      || canonicalNextState !== nextState
+      || (expectedCurrentState != null && (!expectedState || !expectedStatus))
+    ) {
+      flowWarn('TaskCheckbox', 'update:blocked', {
+        path: file.path,
+        line: targetLine,
+        reason: 'unmapped-checkbox-state',
+      });
+      return;
+    }
     let changed = false;
     let blockedReason = '';
     flow('TaskCheckbox', 'update:start', {
@@ -5448,6 +5840,13 @@ export class KanbanView extends BasesView {
     });
 
     await this.app.vault.process(file, (content) => {
+      if (
+        this.getStatusForCheckboxState(nextState) !== nextStatus
+        || this.getCheckboxStateForStatus(nextStatus) !== nextState
+      ) {
+        blockedReason = 'changed-target-mapping';
+        return content;
+      }
       const lines = content.split(/\r?\n/);
       const index = targetLine - 1;
       if (index < 0 || index >= lines.length) {
@@ -5455,8 +5854,23 @@ export class KanbanView extends BasesView {
         return content;
       }
       const current = lines[index];
-      if (!/^\s*(?:[-*+]|\d+[.)])\s+\[[^\]]*\]\s+/.test(current)) {
+      const taskMatch = current.match(/^\s*(?:[-*+]|\d+[.)])\s+(\[[^\]\r\n]*\])\s+/u);
+      if (!taskMatch) {
         blockedReason = 'not-task-line';
+        return content;
+      }
+      const currentState = this.normalizeCheckboxState(taskMatch[1]);
+      const currentStatus = currentState ? this.getStatusForCheckboxState(currentState) : '';
+      if (!currentState || !currentStatus) {
+        blockedReason = 'unmapped-current-state';
+        return content;
+      }
+      if (expectedState && currentState !== expectedState) {
+        blockedReason = 'stale-checkbox-state';
+        return content;
+      }
+      if (expectedState && currentStatus !== expectedStatus) {
+        blockedReason = 'changed-current-mapping';
         return content;
       }
       const next = replaceKanbanTaskLineCheckboxState(current, nextState);
@@ -5737,9 +6151,39 @@ export class KanbanView extends BasesView {
       data[field.key] = field.value;
       data[String(field.key).trim().toLowerCase()] = field.value;
     }
-    const taskStatus = task.itemKind === 'bullet' ? 'bullet' : this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
-    data.status = taskStatus;
-    data['task.status'] = taskStatus;
+    const relationalStatus = this.isRelationalStatusPropertyReference('status');
+    const taskStatus = this.getMappedStatusForTask(task);
+    const workflowFieldKeys = new Set(
+      this.getTaskDerivedWorkflowFieldKeys().map((key) => this.normalizeInlinePropertyKey(key)),
+    );
+    for (const key of Object.keys(data)) {
+      if (workflowFieldKeys.has(this.normalizeInlinePropertyKey(key))) delete data[key];
+    }
+    if (taskStatus) {
+      const done = this.classifyTaskStatusCompletion(taskStatus);
+      if (!relationalStatus) data.status = taskStatus;
+      data['task.status'] = taskStatus;
+      data.checkboxStatus = taskStatus;
+      data.checkboxstatus = taskStatus;
+      if (done != null) {
+        data.open = !done;
+        data.isopen = !done;
+        data.done = done;
+        data.isdone = done;
+        data.completed = done;
+        data.complete = done;
+      }
+      const workflowKey = this.getWorkflowStatusPropertyKey();
+      const normalizedWorkflowKey = this.normalizeInlinePropertyKey(workflowKey);
+      const relationalKey = this.normalizeInlinePropertyKey(this.getRelationalStatusPropertyKey());
+      if (workflowKey && normalizedWorkflowKey && normalizedWorkflowKey !== relationalKey) {
+        data[workflowKey] = taskStatus;
+        data[normalizedWorkflowKey] = taskStatus;
+      }
+    }
+    const availableWorkflowFieldKeys = new Set(
+      Object.keys(data).map((key) => this.normalizeInlinePropertyKey(key)),
+    );
     const structuralKind = task.itemKind === 'bullet' ? 'bullet' : 'task';
     data.kind = this.getTaskAdditiveKinds(task, file) ?? [];
     data.itemtype = structuralKind;
@@ -5775,6 +6219,8 @@ export class KanbanView extends BasesView {
       if (!conditions.length) continue;
       const evaluateCondition = (condition: KanbanStyleCondition) => {
         const field = String(condition.field || '').trim();
+        const normalizedField = this.normalizeInlinePropertyKey(field);
+        if (workflowFieldKeys.has(normalizedField) && !availableWorkflowFieldKeys.has(normalizedField)) return false;
         if (this.isFormulaProperty(field) && !resolveFormula(field)) return false;
         return this.evaluateStyleCondition(data, condition);
       };
@@ -6835,11 +7281,7 @@ export class KanbanView extends BasesView {
       'linenumber',
       'tags',
       'checkboxstate',
-      'checkboxstatus',
-      'open',
-      'isopen',
-      'done',
-      'completed',
+      ...this.getTaskDerivedWorkflowFieldKeys().map((key) => this.normalizeInlinePropertyKey(key)),
     ]);
     const inlineByNormalizedKey = new Map<string, { aliases: Set<string>; values: string[] }>();
     for (const field of inlineFields) {
@@ -6888,12 +7330,22 @@ export class KanbanView extends BasesView {
       .map((tag) => this.normalizeTaskTag(tag))
       .filter(Boolean)
       .map((tag) => tag.startsWith('#') ? tag : `#${tag}`)));
-    const status = task.itemKind !== 'bullet'
-      ? this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo'
-      : '';
-    const done = task.itemKind !== 'bullet' && this.getDoneStatuses().has(status);
+    const checkboxState = this.getStructuralCheckboxStateForTask(task);
+    const status = checkboxState ? this.getStatusForCheckboxState(checkboxState) : '';
+    const hasMappedStatus = task.itemKind !== 'bullet' && !!status;
+    const done = hasMappedStatus ? this.classifyTaskStatusCompletion(status) : null;
+    const relationalStatus = this.isRelationalStatusPropertyReference('status');
+    const rowInline = { ...inline };
+    if (task.itemKind !== 'bullet') {
+      const workflowFieldKeys = new Set(
+        this.getTaskDerivedWorkflowFieldKeys().map((key) => this.normalizeInlinePropertyKey(key)),
+      );
+      for (const key of Object.keys(rowInline)) {
+        if (workflowFieldKeys.has(this.normalizeInlinePropertyKey(key))) delete rowInline[key];
+      }
+    }
     const row: Record<string, unknown> = {
-      ...inline,
+      ...rowInline,
       kind: itemKind,
       kinds,
       explicitKind,
@@ -6909,11 +7361,16 @@ export class KanbanView extends BasesView {
       linenumber: task.line,
       path: file.path,
       tags,
-      ...(task.itemKind !== 'bullet' ? {
-        checkboxState: task.checkboxState || '[ ]',
-        checkboxstate: task.checkboxState || '[ ]',
+      ...(checkboxState ? {
+        checkboxState,
+        checkboxstate: checkboxState,
+      } : {}),
+      ...(hasMappedStatus ? {
+        ...(!relationalStatus ? { status } : {}),
         checkboxStatus: status,
         checkboxstatus: status,
+      } : {}),
+      ...(done != null ? {
         open: !done,
         isOpen: !done,
         isopen: !done,
@@ -6921,6 +7378,17 @@ export class KanbanView extends BasesView {
         completed: done,
       } : {}),
     };
+    if (hasMappedStatus) {
+      const workflowKey = this.getWorkflowStatusPropertyKey();
+      const normalizedWorkflowKey = this.normalizeInlinePropertyKey(workflowKey);
+      const relationalKey = this.normalizeInlinePropertyKey(this.getRelationalStatusPropertyKey());
+      if (workflowKey && normalizedWorkflowKey && normalizedWorkflowKey !== relationalKey) {
+        row[workflowKey] = status;
+        row[normalizedWorkflowKey] = status;
+      }
+    }
+    const taskRow = { ...row };
+    delete taskRow.status;
     const lineContext = {
       ...row,
       number: task.line,
@@ -6934,17 +7402,19 @@ export class KanbanView extends BasesView {
       thisValue: this.createFormulaThisValue(),
       line: lineContext,
       task: task.itemKind !== 'bullet' ? {
-        ...row,
-        status,
-        checkboxState: task.checkboxState || '[ ]',
-        checkboxstate: task.checkboxState || '[ ]',
-        checkboxStatus: status,
-        checkboxstatus: status,
-        open: !done,
-        isOpen: !done,
-        isopen: !done,
-        done,
-        completed: done,
+        ...taskRow,
+        ...(hasMappedStatus ? {
+          status,
+          checkboxStatus: status,
+          checkboxstatus: status,
+        } : {}),
+        ...(done != null ? {
+          open: !done,
+          isOpen: !done,
+          isopen: !done,
+          done,
+          completed: done,
+        } : {}),
         file: fileContext,
       } : null,
       heading: null,
@@ -7655,7 +8125,9 @@ export class KanbanView extends BasesView {
       filter.statuses.add('complete');
     }
 
-    this.collectTaskValuesFromFilterExpression(expr, 'status', filter.statuses, filter.excludeStatuses, filter, isNegated, false);
+    if (!this.isRelationalStatusPropertyReference(this.readFilterExpressionProperty(expr))) {
+      this.collectTaskValuesFromFilterExpression(expr, 'status', filter.statuses, filter.excludeStatuses, filter, isNegated, false);
+    }
     this.collectTaskValuesFromFilterExpression(expr, 'tags', filter.tags, filter.excludeTags, filter, isNegated, false);
   }
 
@@ -7741,7 +8213,7 @@ export class KanbanView extends BasesView {
       return;
     }
 
-    if ((propRaw.toLowerCase().startsWith('task.') || normalizedProp === 'status' || normalizedProp === 'checkboxstatus') && ['status', 'checkboxstatus'].includes(normalizedProp)) {
+    if (this.isStatusPropertyName(propRaw)) {
       filter.hasTaskDirective = true;
       const target = isNegated ? filter.excludeStatuses : filter.statuses;
       for (const raw of values) {
@@ -8398,6 +8870,8 @@ export class KanbanView extends BasesView {
       tasksEl.draggable = false;
       for (const task of previewTasks) {
         const taskTitle = this.getTaskVisibleTitle(task);
+        const checkboxState = this.getStructuralCheckboxStateForTask(task);
+        const mappedStatus = this.getMappedStatusForTask(task);
         const taskEl = tasksEl.createDiv({
           cls: 'tps-kanban-card-task',
           attr: {
@@ -8412,19 +8886,13 @@ export class KanbanView extends BasesView {
         taskEl.dataset.tpsGcmContext = 'kanban-task';
         taskEl.dataset.tpsKanbanPath = entry.file.path;
         taskEl.dataset.tpsKanbanLine = String(task.line);
-        taskEl.dataset.tpsKanbanCheckboxState = task.itemKind === 'bullet' ? '' : task.checkboxState || '[ ]';
+        taskEl.dataset.tpsKanbanCheckboxState = checkboxState;
         taskEl.dataset.tpsKanbanTaskText = task.text;
-        const buildNestedTaskPayload = () => JSON.stringify({
-          type: 'task-line',
-          source: 'tps-kanban',
-          itemKind: task.itemKind || 'task',
-          path: entry.file.path,
-          line: task.line,
-          rawLine: '',
-          checkboxState: task.itemKind === 'bullet' ? undefined : task.checkboxState || '[ ]',
-          text: taskTitle,
-          sourceLaneValues: this.getDisplayLaneWritableValues(displayLane),
-        });
+        const buildNestedTaskPayload = () => JSON.stringify(this.buildTaskLineDropPayload(
+          entry.file,
+          task,
+          this.getDisplayLaneWritableValues(displayLane),
+        ));
         const handleNestedTaskDragStart = (e: DragEvent) => {
           if (!e.dataTransfer) return;
           const target = e.target as HTMLElement | null;
@@ -8508,11 +8976,13 @@ export class KanbanView extends BasesView {
             type: 'checkbox',
             role: 'checkbox',
             'aria-label': `Toggle task: ${taskTitle}`,
-            'data-checkbox-state': task.checkboxState || '[ ]',
-            'data-checkbox-marker': this.getCheckboxMarker(task.checkboxState || '[ ]'),
+            'data-checkbox-state': checkboxState,
+            'data-checkbox-marker': this.getCheckboxMarker(checkboxState),
           },
         });
-        checkboxEl.checked = this.getDoneStatuses().has(this.getStatusForCheckboxState(task.checkboxState || '[ ]'));
+        checkboxEl.checked = !!mappedStatus && this.getDoneStatuses().has(mappedStatus);
+        checkboxEl.disabled = !mappedStatus;
+        if (!mappedStatus) checkboxEl.title = 'Checkbox status is unavailable because this marker is not mapped by GCM.';
         checkboxEl.draggable = false;
         checkboxEl.addEventListener('pointerdown', (e: PointerEvent) => {
           e.stopPropagation();
@@ -8523,7 +8993,7 @@ export class KanbanView extends BasesView {
         checkboxEl.addEventListener('change', (e: Event) => {
           e.preventDefault();
           e.stopPropagation();
-          void this.updateTaskCheckboxState(entry.file, task.line, this.getToggleCheckboxStateForTask(task));
+          this.requestTaskCheckboxToggle(entry.file, task, checkboxEl);
         });
         const taskContentEl = taskEl.createDiv({ cls: 'tps-kanban-card-task-content' });
         taskContentEl.createSpan({ cls: 'tps-kanban-card-task-text', text: taskTitle });
@@ -8757,6 +9227,8 @@ export class KanbanView extends BasesView {
   ): HTMLElement {
     const { file, task } = item;
     const taskTitle = this.getTaskVisibleTitle(task);
+    const checkboxState = this.getStructuralCheckboxStateForTask(task);
+    const mappedStatus = this.getMappedStatusForTask(task);
     const cardEl = document.createElement('div');
     cardEl.className = 'tps-kanban-card tps-kanban-task-card';
     cardEl.classList.toggle('tps-kanban-task-card--completed', this.isDoneTask(task));
@@ -8768,7 +9240,7 @@ export class KanbanView extends BasesView {
     cardEl.dataset.tpsGcmContext = 'kanban-task';
     cardEl.dataset.tpsKanbanPath = file.path;
     cardEl.dataset.tpsKanbanLine = String(task.line);
-    cardEl.dataset.tpsKanbanCheckboxState = task.itemKind === 'bullet' ? '' : task.checkboxState || '[ ]';
+    cardEl.dataset.tpsKanbanCheckboxState = checkboxState;
     cardEl.dataset.tpsKanbanTaskText = task.text;
     const taskStyleRule = this.resolveTaskCardStyleRule(file, task, taskGroupPropId);
     this.addTextStyleClasses(cardEl, taskStyleRule?.textStyle);
@@ -8782,17 +9254,11 @@ export class KanbanView extends BasesView {
     cardEl.addEventListener('pointerdown', (e: PointerEvent) => {
       this.beginTaskPointerDrag(e, file, task, propName, displayLane, cardEl);
     });
-    const buildRootTaskPayload = () => JSON.stringify({
-      type: 'task-line',
-      source: 'tps-kanban',
-      itemKind: task.itemKind || 'task',
-      path: file.path,
-      line: task.line,
-      rawLine: '',
-      checkboxState: task.itemKind === 'bullet' ? undefined : task.checkboxState || '[ ]',
-      text: taskTitle,
-      sourceLaneValues: this.getDisplayLaneWritableValues(displayLane),
-    });
+    const buildRootTaskPayload = () => JSON.stringify(this.buildTaskLineDropPayload(
+      file,
+      task,
+      this.getDisplayLaneWritableValues(displayLane),
+    ));
     const handleRootTaskDragStart = (e: DragEvent) => {
       if (!e.dataTransfer) return;
       const target = e.target as HTMLElement | null;
@@ -8875,11 +9341,13 @@ export class KanbanView extends BasesView {
           type: 'checkbox',
           role: 'checkbox',
           'aria-label': `Toggle task: ${taskTitle}`,
-          'data-checkbox-state': task.checkboxState || '[ ]',
-          'data-checkbox-marker': this.getCheckboxMarker(task.checkboxState || '[ ]'),
+          'data-checkbox-state': checkboxState,
+          'data-checkbox-marker': this.getCheckboxMarker(checkboxState),
         },
       });
-      checkboxEl.checked = this.getDoneStatuses().has(this.getStatusForCheckboxState(task.checkboxState || '[ ]'));
+      checkboxEl.checked = !!mappedStatus && this.getDoneStatuses().has(mappedStatus);
+      checkboxEl.disabled = !mappedStatus;
+      if (!mappedStatus) checkboxEl.title = 'Checkbox status is unavailable because this marker is not mapped by GCM.';
       checkboxEl.draggable = false;
       checkboxEl.addEventListener('pointerdown', (e: PointerEvent) => {
         e.stopPropagation();
@@ -8890,7 +9358,7 @@ export class KanbanView extends BasesView {
       checkboxEl.addEventListener('change', (e: Event) => {
         e.preventDefault();
         e.stopPropagation();
-        void this.updateTaskCheckboxState(file, task.line, this.getToggleCheckboxStateForTask(task));
+        this.requestTaskCheckboxToggle(file, task, checkboxEl);
       });
     }
     const titleEl = titleRow.createEl('span', {
@@ -9035,8 +9503,8 @@ export class KanbanView extends BasesView {
     const normalized = this.normalizeTaskPropertyId(propId);
     if (!normalized || hidden.has(normalized)) return null;
 
-    if (normalized === 'status') {
-      const status = task.itemKind === 'bullet' ? 'bullet' : this.getStatusForCheckboxState(task.checkboxState || '[ ]') || 'todo';
+    if (this.isStatusPropertyName(propId)) {
+      const status = task.itemKind === 'bullet' ? 'bullet' : this.getMappedStatusForTask(task);
       return status ? {
         text: status,
         kind: 'status',
@@ -9217,20 +9685,30 @@ export class KanbanView extends BasesView {
     }
 
     const defaults = this.getRootTaskCreationDefaults(taskFilter);
-    const taskLine = this.buildRootTaskLine(title, propName, targetSelection.value, taskFilter, defaults);
+    const mappingPlan = this.getRootTaskCreationMappingPlan(propName, targetSelection.value, defaults);
+    const taskLine = mappingPlan
+      ? this.buildRootTaskLine(title, propName, targetSelection.value, taskFilter, defaults)
+      : null;
+    if (!mappingPlan || !taskLine || !this.taskLineMatchesCreationMappingPlan(taskLine, mappingPlan)) {
+      flowWarn('CreateTask', 'unmapped-status', {
+        path: file.path,
+        propName: propName || '',
+        targetValue: targetSelection.value,
+        status: defaults.status || 'todo',
+      });
+      new Notice('Could not create task: its status has no checkbox mapping in GCM.');
+      return;
+    }
     flow('CreateTask', 'write', {
       path: file.path,
       propName: propName || '',
       lane: displayLane?.label || '',
       targetValue: targetSelection.value,
-      status: defaults.status || '',
+      status: mappingPlan.desiredStatus,
       tags: Array.from(defaults.tags || []),
       inlineKeys: Array.from(defaults.inlineFields?.keys?.() || []),
     });
-    await this.app.vault.process(file, (content) => {
-      const trimmedEnd = content.replace(/\s+$/g, '');
-      return trimmedEnd ? `${trimmedEnd}\n${taskLine}\n` : `${taskLine}\n`;
-    });
+    if (!await this.writeRootTaskLineWithMappingGuard(file, taskLine, mappingPlan, false)) return;
 
     this.clearTaskCachesForPath(file.path);
     this.expandedSubtreePaths.delete(file.path);
@@ -9259,6 +9737,25 @@ export class KanbanView extends BasesView {
     }
 
     const defaults = this.getRootTaskCreationDefaults(taskFilter);
+    const mappingPlan = this.getRootTaskCreationMappingPlan(propName, targetSelection.value, defaults);
+    const taskLine = mappingPlan
+      ? this.buildRootTaskLine(title, propName, targetSelection.value, taskFilter, defaults)
+      : null;
+    if (!mappingPlan || !taskLine || !this.taskLineMatchesCreationMappingPlan(taskLine, mappingPlan)) {
+      flowWarn('CreateRootTask', 'unmapped-status', {
+        lane: displayLane.label,
+        propName: propName || '',
+        targetValue: targetSelection.value,
+        status: defaults.status || 'todo',
+      });
+      new Notice('Could not create task: its status has no checkbox mapping in GCM.');
+      return;
+    }
+    if (!this.isRootTaskCreationMappingPlanCurrent(mappingPlan)) {
+      flowWarn('CreateRootTask', 'mapping-changed', { lane: displayLane.label });
+      new Notice('Could not create task because its GCM checkbox mapping changed.');
+      return;
+    }
     const targetFile = await this.resolveRootTaskTargetFile(defaults);
     if (!targetFile) {
       flowWarn('CreateRootTask', 'missing-target', {
@@ -9270,18 +9767,17 @@ export class KanbanView extends BasesView {
       return;
     }
 
-    const taskLine = this.buildRootTaskLine(title, propName, targetSelection.value, taskFilter, defaults);
     flow('CreateRootTask', 'write', {
       path: targetFile.path,
       lane: displayLane.label,
       propName: propName || '',
       targetValue: targetSelection.value,
-      status: defaults.status || '',
+      status: mappingPlan.desiredStatus,
       tags: Array.from(defaults.tags || []),
       inlineKeys: Array.from(defaults.inlineFields?.keys?.() || []),
       openAfterCreate: this.plugin.settings.openTaskDestinationAfterCreate !== false,
     });
-    await this.app.vault.process(targetFile, (content) => this.insertLineAfterFrontmatter(content, taskLine));
+    if (!await this.writeRootTaskLineWithMappingGuard(targetFile, taskLine, mappingPlan, true)) return;
 
     this.clearTaskCachesForPath(targetFile.path);
     emitFilesUpdated(this.app, [targetFile.path], 'tps-kanban');
@@ -9297,7 +9793,7 @@ export class KanbanView extends BasesView {
     laneValue: string | null,
     taskFilter: KanbanTaskRootFilter,
     defaults = this.getRootTaskCreationDefaults(taskFilter),
-  ): string {
+  ): string | null {
     return buildKanbanRootTaskLine({
       title,
       propName,
@@ -9306,6 +9802,77 @@ export class KanbanView extends BasesView {
       getCheckboxStateForStatus: (status) => this.getCheckboxStateForStatus(status),
       isStatusPropertyName: (name) => this.isStatusPropertyName(name),
     });
+  }
+
+  private getRootTaskCreationMappingPlan(
+    propName: string | null,
+    laneValue: string | null,
+    defaults: TaskCreationDefaults,
+  ): TaskCreationMappingPlan | null {
+    const desiredStatus = getKanbanRootTaskDesiredStatus({
+      propName,
+      laneValue,
+      defaults,
+      isStatusPropertyName: (name) => this.isStatusPropertyName(name),
+    });
+    const checkboxState = this.getCheckboxStateForStatus(desiredStatus);
+    const canonicalStatus = checkboxState ? this.getStatusForCheckboxState(checkboxState) : '';
+    if (!desiredStatus || !checkboxState || !canonicalStatus) return null;
+    return {
+      desiredStatus,
+      checkboxState,
+      canonicalStatus,
+      workflowOwnershipSignature: this.getTaskWorkflowOwnershipSignature(propName),
+      workflowOwnershipProperty: propName,
+    };
+  }
+
+  private taskLineMatchesCreationMappingPlan(
+    taskLine: string,
+    plan: TaskCreationMappingPlan,
+  ): boolean {
+    const parsed = parseKanbanLineItem(taskLine, false);
+    return this.normalizeCheckboxState(parsed?.checkboxState || '') === plan.checkboxState;
+  }
+
+  private isRootTaskCreationMappingPlanCurrent(plan: TaskCreationMappingPlan): boolean {
+    return this.getTaskWorkflowOwnershipSignature(plan.workflowOwnershipProperty) === plan.workflowOwnershipSignature
+      && this.getCheckboxStateForStatus(plan.desiredStatus) === plan.checkboxState
+      && this.getStatusForCheckboxState(plan.checkboxState) === plan.canonicalStatus;
+  }
+
+  private async writeRootTaskLineWithMappingGuard(
+    file: TFile,
+    taskLine: string,
+    plan: TaskCreationMappingPlan,
+    insertAfterFrontmatter: boolean,
+  ): Promise<boolean> {
+    const mutation: { outcome: 'changed' | 'mapping-changed' | 'unchanged' } = { outcome: 'unchanged' };
+    await this.app.vault.process(file, (content) => {
+      if (!this.isRootTaskCreationMappingPlanCurrent(plan)) {
+        mutation.outcome = 'mapping-changed';
+        return content;
+      }
+      const trimmedEnd = content.replace(/\s+$/g, '');
+      const next = insertAfterFrontmatter
+        ? this.insertLineAfterFrontmatter(content, taskLine)
+        : trimmedEnd
+          ? `${trimmedEnd}\n${taskLine}\n`
+          : `${taskLine}\n`;
+      if (next === content) return content;
+      mutation.outcome = 'changed';
+      return next;
+    });
+    if (mutation.outcome === 'mapping-changed') {
+      flowWarn('CreateTask', 'write:blocked', {
+        reason: 'mapping-changed-at-write',
+        path: file.path,
+        status: plan.desiredStatus,
+        checkboxState: plan.checkboxState,
+      });
+      new Notice('Could not create task because its GCM checkbox mapping changed.');
+    }
+    return mutation.outcome === 'changed';
   }
 
   private getRootTaskCreationDefaults(taskFilter: KanbanTaskRootFilter): TaskCreationDefaults {

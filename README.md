@@ -1,5 +1,18 @@
 # TPS Kanban
 
+## 0.2.2
+
+- Task checkbox display, status lanes, drag/drop, toggles, and task creation now consume only the rows in GCM's exact version-1 `taskCheckboxes` capability. Kanban no longer carries a private status table, supplements missing default rows, or guesses todo/complete/working/cancelled markers.
+- A Markdown list row with exactly one character inside its checkbox remains a structural task even when that character is not mapped. It stays visible in task discovery and bounded previews, can match Kind/title/tag/custom-field and custom-formula logic, and groups into **Ungrouped** when the board groups by workflow status.
+- An unmapped structural task receives no synthesized workflow aliases (`task.status`, `checkboxStatus`, `open`, `done`, or `completed`). Workflow-status/open/done filters reject it, its checkbox control is read-only, and status toggles or status-lane drops fail closed; unrelated inline-field or tag drops remain available.
+- Custom one-character markers, aliases, alternate working markers, and canonical uppercase `X` normalization follow GCM's ordered mapping snapshot. Empty or multi-character checkbox syntax is malformed, is not promoted to todo, and is not reclassified as a bullet.
+- Explicit status-lane and Base-filter task creation is blocked before the source note is written when that status has no mapping. Unfiltered creation also requires a configured GCM mapping for the canonical todo intent, and every creation rechecks the captured status-to-marker result and workflow-field ownership inside the atomic note update.
+- If creation must first make a brand-new destination note and the mapping changes before the guarded append, Kanban leaves the new empty destination in place rather than guessing that it still owns a file another process could already be using; no stale task line is written.
+- Checkbox toggles capture the source and target meanings, then compare the expected marker and revalidate both mappings at the captured physical line inside the atomic note update. Task drops re-read the source and target mappings after confirmation and again inside the atomic update, then replace only the captured exact line (or one uniquely relocated identical line); mapping changes, concurrent line edits, and duplicate ambiguity are left untouched.
+- Checkbox-owned status cleanup removes the configured workflow key plus stale `status`, `taskStatus`, `task.status`, `task.checkboxStatus`, and `checkboxStatus` carriers, understands nested inline values and closed code spans, and preserves the exact separately configured relational status property such as `[status:: [[Statuses/Holding]]]`. Synthesized formula and card-style contexts scrub the same authored carriers and completion aliases, then expose only mapping-derived workflow values (including the current configured key).
+- Kanban no longer borrows recurrence settings or a hardcoded complete/won't-do list when GCM's done-status capability is unavailable or contradictory. Mapped status remains usable, while completion-derived formula/style aliases are omitted and open/done filters fail closed.
+- This is a backward-compatible reliability patch with no settings, Base, lane, note, task, or stored-data migration. Minimum supported Obsidian remains 1.10.0 and GCM 1.17.1 is required for status-driven synthesized-task behavior.
+
 ## 0.2.1
 
 - Synthesized task and bullet discovery now consumes GCM's document-aware line scan before parsing rows. YAML frontmatter and fenced, indented, HTML, or comment blocks cannot become Kanban cards; valid nested rows keep their physical line identity, hierarchy, filters, formulas, and editing routes.
@@ -121,6 +134,7 @@ A Kanban board view that integrates with Obsidian's **Bases** plugin. It appears
   - When note creation is used, simple positive Base note filters such as `file.folder == "Projects"` or `file.path == "Projects/New card.md"` seed the creation target so the new note starts inside the board criteria instead of at the vault root.
 - **+ Add subitem** on each note card creates either a linked subitem or an inline task depending on the same defaulting rules. In task mode, the inline task is written into the selected card's note and receives the same lane value and simple task filter defaults as lane `+ Add task`.
 - Root task cards expose a real checkbox control for completion; clicking the title still opens the task, and dragging still starts from the drag handle/card gesture.
+- A valid one-character checkbox marker that is absent from GCM's mapping remains a visible task for structural Kind, title, tags, authored custom fields, and formula evaluation. It has no inferred workflow state, appears in **Ungrouped** for status grouping, and cannot be toggled or moved through a workflow-status lane until the marker is mapped in GCM.
 - Selected formula properties render on synthesized task and bullet cards with the same typed formatting used by note rows. Boolean results use native read-only checkboxes; formula-backed lanes disable add, rename, and drag mutations because computed values have no writable backing field.
 - Formula-backed task/bullet rows participate in Base filters, lane grouping, sorting, search, and style rules through GCM's bounded formula session. Native note formula values remain owned by Obsidian.
 - Bare `kind` combines structural and explicit identities: checkbox rows always include `task`, bullets include `bullet`, notes include `note`, and any authored frontmatter/inline `kind` values are added without replacing that identity. `itemKind` and `itemType` remain structural-only.
@@ -256,7 +270,7 @@ Run `npm run test:settings` for the focused settings source contract. It checks 
   - root task target normalization handles plain paths, `[[wikilinks|aliases]]`, markdown links, and heading fragments while preserving Base defaults over configured fallback paths.
   - note creation can derive a matching folder/path target from positive Base note filters.
   - root task cards expose native checkbox controls that toggle completion without opening the task.
-  - task checkbox status mapping and source-line mutation are covered as pure behavior: custom mappings, fallback statuses, ordered/indented checkbox tasks, and non-task lines are all handled deterministically.
+  - task checkbox status mapping and source-line mutation are covered as pure behavior: custom mappings, structurally valid unmapped markers, ordered/indented checkbox tasks, and non-task lines are all handled deterministically.
   - `tps list` registers as a forced-list Bases view, renders native-style grouped bullets instead of Kanban cards, hides Kanban-specific controls, derives note/task row metadata from selected Base properties, keeps selected properties separate from sorting, and applies explicit Base sort config across both note and task rows.
   - normal note clicks only use Hover Editor preview mode when GCM's forced Base preview setting is enabled, and repeated/double clicks open the note in a foreground tab.
   - column-created tasks preserve target note, status, tags, lane property, and custom inline defaults.
@@ -306,6 +320,7 @@ Run `npm run test:settings` for the focused settings source contract. It checks 
 
 ## Version notes
 
+- 0.2.2: Removed private checkbox/status guesses and made toggles, lanes, drag/drop, and task creation consume GCM's exact mapping contract or fail closed before writing.
 - 0.2.1: Excluded protected Markdown blocks from synthesized task/bullet discovery through GCM's authoritative document scanner and removed raw-line metadata fallbacks.
 - 0.2.0: Added supported formula/entity behavior for synthesized rows, additive Kind identity, typed boolean display, public GCM lifecycle capabilities, exact Base authority, and fail-closed read-only formula lanes.
 - 0.1.7: Reused one Markdown line classification for hierarchy and emitted task/bullet data, halving parser calls without changing released output.

@@ -49,19 +49,19 @@ export function resolveKanbanRootTaskTargetPath(defaultsTargetPath?: string | nu
   return normalizeKanbanTaskTargetPath(defaultsTargetPath) || normalizeKanbanTaskTargetPath(configuredTargetPath) || null;
 }
 
-export function buildKanbanRootTaskLine(options: BuildKanbanRootTaskLineOptions): string {
+export function buildKanbanRootTaskLine(options: BuildKanbanRootTaskLineOptions): string | null {
   const writablePropName = options.propName ? getTaskInlinePropertyName(options.propName) : '';
   const normalizedProp = writablePropName ? normalizeInlinePropertyKey(writablePropName) : '';
   const isStatusProperty = options.isStatusPropertyName ?? isDefaultStatusPropertyName;
-  const marker = getCheckboxMarker(
-    getLaneOrDefaultCheckboxState({
-      propName: options.propName,
-      laneValue: options.laneValue,
-      defaults: options.defaults,
-      getCheckboxStateForStatus: options.getCheckboxStateForStatus,
-      isStatusPropertyName: isStatusProperty,
-    }),
-  );
+  const checkboxState = getLaneOrDefaultCheckboxState({
+    propName: options.propName,
+    laneValue: options.laneValue,
+    defaults: options.defaults,
+    getCheckboxStateForStatus: options.getCheckboxStateForStatus,
+    isStatusPropertyName: isStatusProperty,
+  });
+  if (!checkboxState) return null;
+  const marker = getCheckboxMarker(checkboxState);
   const parts = [`- [${marker}] ${String(options.title || '').trim() || 'Untitled task'}`];
   const tags = new Set<string>();
 
@@ -99,16 +99,27 @@ export function buildKanbanRootTaskLine(options: BuildKanbanRootTaskLineOptions)
   return parts.join(' ').replace(/\s+/g, ' ').trim();
 }
 
-export function getKanbanRootTaskCheckboxMarker(options: Omit<BuildKanbanRootTaskLineOptions, 'title'>): string {
-  return getCheckboxMarker(
-    getLaneOrDefaultCheckboxState({
-      propName: options.propName,
-      laneValue: options.laneValue,
-      defaults: options.defaults,
-      getCheckboxStateForStatus: options.getCheckboxStateForStatus,
-      isStatusPropertyName: options.isStatusPropertyName ?? isDefaultStatusPropertyName,
-    }),
-  );
+export function getKanbanRootTaskCheckboxMarker(options: Omit<BuildKanbanRootTaskLineOptions, 'title'>): string | null {
+  const checkboxState = getLaneOrDefaultCheckboxState({
+    propName: options.propName,
+    laneValue: options.laneValue,
+    defaults: options.defaults,
+    getCheckboxStateForStatus: options.getCheckboxStateForStatus,
+    isStatusPropertyName: options.isStatusPropertyName ?? isDefaultStatusPropertyName,
+  });
+  return checkboxState ? getCheckboxMarker(checkboxState) : null;
+}
+
+export function getKanbanRootTaskDesiredStatus(
+  options: Pick<BuildKanbanRootTaskLineOptions, 'propName' | 'laneValue' | 'defaults' | 'isStatusPropertyName'>,
+): string {
+  const isStatusProperty = options.isStatusPropertyName ?? isDefaultStatusPropertyName;
+  const laneStatus = options.propName
+    && isStatusProperty(options.propName)
+    && String(options.laneValue || '').trim()
+      ? String(options.laneValue).trim()
+      : '';
+  return laneStatus || String(options.defaults.status || '').trim() || 'todo';
 }
 
 export function resolveKanbanLaneAddPresentation(mode: KanbanLaneAddMode, laneLabel: string): KanbanLaneAddPresentation {
@@ -129,12 +140,9 @@ function getLaneOrDefaultCheckboxState(options: {
   defaults: KanbanTaskCreationDefaultsLike;
   getCheckboxStateForStatus: (status: string | null) => string | null;
   isStatusPropertyName: (propName: string | null | undefined) => boolean;
-}): string {
-  const laneCheckbox = options.propName && options.isStatusPropertyName(options.propName)
-    ? options.getCheckboxStateForStatus(options.laneValue)
-    : null;
-  const filterStatus = !laneCheckbox ? options.defaults.status ?? null : null;
-  return laneCheckbox || options.getCheckboxStateForStatus(filterStatus) || '[ ]';
+}): string | null {
+  const desiredStatus = getKanbanRootTaskDesiredStatus(options);
+  return options.getCheckboxStateForStatus(desiredStatus);
 }
 
 function getCheckboxMarker(rawState: string): string {
