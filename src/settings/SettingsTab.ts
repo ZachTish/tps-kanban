@@ -71,10 +71,6 @@ export class KanbanSettingTab extends PluginSettingTab {
       cls: 'tps-kanban-settings-nav-heading',
       text: 'Choose what to configure',
     });
-    containerEl.createEl('p', {
-      cls: 'setting-item-description tps-kanban-settings-nav-description',
-      text: 'Pick one destination. Base-view choices stay in the board, while these pages control shared Kanban behavior.',
-    });
     const navigation = containerEl.createEl('nav', {
       cls: 'tps-kanban-settings-nav',
     });
@@ -91,10 +87,6 @@ export class KanbanSettingTab extends PluginSettingTab {
       button.createSpan({
         cls: 'tps-kanban-settings-route-label',
         text: destination.title,
-      });
-      button.createSpan({
-        cls: 'tps-kanban-settings-route-description',
-        text: destination.description,
       });
       button.addEventListener('click', () => this.navigateToPage(destination.id));
     }
@@ -114,10 +106,6 @@ export class KanbanSettingTab extends PluginSettingTab {
       text: destination.title,
     });
     pageHeading.tabIndex = -1;
-    page.createEl('p', {
-      cls: 'setting-item-description tps-kanban-settings-page-description',
-      text: destination.description,
-    });
 
     switch (this.activeSettingsPage) {
       case 'rules-creation':
@@ -184,7 +172,6 @@ export class KanbanSettingTab extends PluginSettingTab {
 
     new Setting(page)
       .setName('Open task destination after create')
-      .setDesc('After creating a root task, open the note that the task was written into.')
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.openTaskDestinationAfterCreate !== false)
         .onChange(async (value) => {
