@@ -1,5 +1,10 @@
 # TPS Kanban
 
+> **Deprecated — October 6, 2026.** TPS Kanban has been retired in favor of
+> Obsidian's native Kanban workflow. Do not install this plugin for new use.
+> This repository is archived and receives no further updates. Existing tags,
+> releases, and the documentation below are retained only as historical records.
+
 Kanban and list layouts for Obsidian Bases, with shared TPS note and task behavior.
 
 Current release: [0.2.3](https://github.com/ZachTish/tps-kanban/releases/tag/0.2.3) · Obsidian 1.10.0+ · Desktop and mobile.
